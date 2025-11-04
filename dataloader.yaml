@@ -69,10 +69,6 @@ implementation:
         print(f"Row count: {len(df)}")
 
     args:
-      - --in_file
-      - /tmp/outputs/train_data/data
-      - --preview_rows
-      - "20"
       - --processed_file
       - {outputPath: processed_file}
       - --preview_file
