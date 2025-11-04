@@ -1,71 +1,138 @@
-name: Load Data into Pandas
+name: Load Data into Pandas - from CDN
 description: |
-  Loads a local dataset file (CSV, JSON, Excel, TSV, or Parquet)
-  into a pandas DataFrame, detects format, and writes processed/preview/schema/row_count.
+  Loads a dataset file (CSV, TSV, JSON/JSONL, Excel, Parquet, Feather, ORC) produced by the
+  CDN Generic Downloader into a pandas DataFrame, then writes:
+    - processed_file (Parquet)
+    - preview_file (JSON with preview_rows)
+    - schema_file (JSON with column dtypes)
+    - row_count (text file containing the number of rows)
 inputs:
-  - {name: in_file, type: Data, description: "Path to local file to load"}
-  - {name: preview_rows, type: Integer, description: "Number of rows for preview JSON", default: "20"}
+  - {name: in_file, type: Data, description: "Path to the downloaded file (connect CDN Generic Downloader: out_file)"}
+  - {name: preview_rows, type: Integer, description: "Rows to include in preview JSON", default: "20"}
 outputs:
-  - {name: processed_file, type: Data, description: "Processed data file (Parquet format)"}
-  - {name: preview_file, type: Data, description: "Preview of top N rows (JSON)"}
-  - {name: schema_file, type: Data, description: "JSON schema of columns and dtypes"}
-  - {name: row_count, type: Integer, description: "Row count of dataset"}
+  - {name: processed_file, type: Data, description: "Processed dataset saved as Parquet"}
+  - {name: preview_file, type: Data, description: "Top-N preview saved as JSON"}
+  - {name: schema_file, type: Data, description: "Schema (columns -> dtypes) saved as JSON"}
+  - {name: row_count, type: Data, description: "File containing the row count (plain text)"}
 implementation:
   container:
-    image: python:3.10
+    image: python:3.10-slim
     command:
       - python3
       - -u
       - -c
       - |
-        import pandas as pd, os, json, sys, argparse
+        import argparse, os, sys, json, traceback, subprocess
+
+        # Try import pandas and engines, install if missing
+        try:
+            import pandas as pd
+        except Exception:
+            print("pandas not found — installing pandas and engines (pyarrow, openpyxl, fastparquet)...", file=sys.stderr)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "pandas", "pyarrow", "openpyxl", "fastparquet"])
+            import pandas as pd
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
-        parser.add_argument('--preview_rows', type=int, default=20)
+        parser.add_argument('--preview_rows', type=str, default="20")
         parser.add_argument('--processed_file', type=str, required=True)
         parser.add_argument('--preview_file', type=str, required=True)
         parser.add_argument('--schema_file', type=str, required=True)
         parser.add_argument('--row_count', type=str, required=True)
         args = parser.parse_args()
 
-        os.makedirs(os.path.dirname(args.processed_file), exist_ok=True)
+        def makedirs_for(path):
+            if not path:
+                return
+            d = os.path.dirname(path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
 
-        path = args.in_file
-        ext = os.path.splitext(path)[1].lower()
-        print(f"Loading file: {path} (detected type: {ext})")
+        def read_with_pandas(path):
+            ext = os.path.splitext(path)[1].lower()
+            # Try extension-based loading
+            try:
+                if ext == ".csv":
+                    return pd.read_csv(path)
+                if ext in (".tsv", ".tab"):
+                    return pd.read_csv(path, sep="\t")
+                if ext in (".json", ".ndjson", ".jsonl"):
+                    # prefer json lines if possible
+                    try:
+                        return pd.read_json(path, lines=True)
+                    except ValueError:
+                        return pd.read_json(path)
+                if ext in (".xls", ".xlsx"):
+                    return pd.read_excel(path)
+                if ext in (".parquet", ".pq"):
+                    return pd.read_parquet(path, engine="auto")
+                if ext == ".feather":
+                    return pd.read_feather(path)
+                if ext == ".orc":
+                    return pd.read_orc(path)
+            except Exception as e:
+                raise
 
-        if ext in ['.csv', '.tsv']:
-            sep = '\t' if ext == '.tsv' else ','
-            df = pd.read_csv(path, sep=sep)
-        elif ext in ['.json']:
-            df = pd.read_json(path)
-        elif ext in ['.xls', '.xlsx']:
-            df = pd.read_excel(path)
-        elif ext in ['.parquet']:
-            df = pd.read_parquet(path)
-        else:
-            print(f" Unsupported file type: {ext}")
+            # Fallback heuristics: try JSONL, then CSV
+            try:
+                return pd.read_json(path, lines=True)
+            except Exception:
+                pass
+            try:
+                return pd.read_csv(path)
+            except Exception:
+                pass
+
+            raise ValueError(f"Unsupported or unreadable file format for automatic loading: {path}")
+
+        try:
+            in_path = args.in_file
+            preview_rows = int(str(args.preview_rows))
+            processed_out = args.processed_file
+            preview_out = args.preview_file
+            schema_out = args.schema_file
+            row_count_out = args.row_count
+
+            if not os.path.exists(in_path):
+                print(f"ERROR: input file does not exist: {in_path}", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"Loading file: {in_path}")
+            df = read_with_pandas(in_path)
+            print(f"Loaded DataFrame: rows={len(df)}, cols={len(df.columns)}")
+
+            # Ensure output dirs exist
+            makedirs_for(processed_out)
+            makedirs_for(preview_out)
+            makedirs_for(schema_out)
+            makedirs_for(row_count_out)
+
+            # Save processed file as Parquet
+            # let pandas choose pyarrow/fastparquet if available
+            df.to_parquet(processed_out, index=False)
+            print("Wrote processed parquet:", processed_out)
+
+            # Save preview (JSON records)
+            preview_df = df.head(max(1, preview_rows))
+            preview_df.to_json(preview_out, orient="records", indent=2, force_ascii=False)
+            print("Wrote preview json:", preview_out)
+
+            # Save schema
+            schema = { str(c): str(t) for c, t in zip(df.columns, df.dtypes) }
+            with open(schema_out, "w", encoding="utf-8") as fh:
+                json.dump({"columns": schema}, fh, indent=2, ensure_ascii=False)
+            print("Wrote schema json:", schema_out)
+
+            # Save row count
+            with open(row_count_out, "w", encoding="utf-8") as fh:
+                fh.write(str(len(df)))
+            print("Wrote row count:", row_count_out)
+
+            print("SUCCESS: All artifacts produced.")
+        except Exception as exc:
+            print("ERROR during Load Data into Pandas:", exc, file=sys.stderr)
+            traceback.print_exc()
             sys.exit(1)
-
-        # Save processed file
-        df.to_parquet(args.processed_file, index=False)
-
-        # Save preview
-        df.head(args.preview_rows).to_json(args.preview_file, orient='records', indent=2)
-
-        # Save schema
-        schema = {col: str(dtype) for col, dtype in df.dtypes.items()}
-        json.dump(schema, open(args.schema_file, 'w'), indent=2)
-
-        # Save row count
-        open(args.row_count, 'w').write(str(len(df)))
-
-        print(f"Data loaded successfully:")
-        print(f"Processed: {args.processed_file}")
-        print(f"Preview: {args.preview_file}")
-        print(f"Schema: {args.schema_file}")
-        print(f"Row count: {len(df)}")
     args:
       - --in_file
       - {inputPath: in_file}
