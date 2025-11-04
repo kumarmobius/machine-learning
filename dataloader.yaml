@@ -1,8 +1,7 @@
 name: Load Data into Pandas
 description: |
   Loads a local dataset file (CSV, JSON, Excel, TSV, or Parquet)
-  into a pandas DataFrame, automatically detects file format,
-  and saves processed, preview, schema, and row count outputs.
+  into a pandas DataFrame, detects format, and writes processed/preview/schema/row_count.
 inputs:
   - {name: in_file, type: Data, description: "Path to local file to load"}
   - {name: preview_rows, type: Integer, description: "Number of rows for preview JSON", default: "20"}
@@ -67,8 +66,11 @@ implementation:
         print(f"Preview: {args.preview_file}")
         print(f"Schema: {args.schema_file}")
         print(f"Row count: {len(df)}")
-
     args:
+      - --in_file
+      - {inputPath: in_file}
+      - --preview_rows
+      - {inputValue: preview_rows}
       - --processed_file
       - {outputPath: processed_file}
       - --preview_file
