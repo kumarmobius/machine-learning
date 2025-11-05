@@ -1,4 +1,4 @@
-name: Load & Preprocess - ENTIRE
+name: Load & Preprocess
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -649,7 +649,7 @@ implementation:
                     enc_type = cfg.get('encoder_type')
                     if enc_type == 'onehot':
                         # fit OneHotEncoder on column and produce new columns
-                        ohe = OneHotEncoder(sparse=False, handle_unknown='ignore')
+                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                         resh = df[[c]].astype(str)
                         ohe.fit(resh)
                         arr = ohe.transform(resh)
