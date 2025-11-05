@@ -1,0 +1,260 @@
+name: Load & Preprocess - from CDN (produce X,y)
+description: |
+  Loads a dataset file (CSV/JSON/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
+  removes duplicates, drops rows with missing target, converts numeric-like object columns,
+  applies outlier handling (winsorize or IQR-drop), then imputes missing values
+  (numeric: KNNImputer; categorical: most_frequent). Finally splits into X (features) and y (target)
+  and writes both as parquet artifacts.
+inputs:
+  - {name: in_file, type: Data, description: "Path to the downloaded file (connect CDN Generic Downloader: out_file)"}
+  - {name: target_column, type: String, description: "Name of the target column in the dataset (rows with null target will be dropped)"}
+  - {name: outlier_strategy, type: String, description: "Outlier strategy: winsorize or drop_iqr", optional: true, default: "winsorize"}
+  - {name: winsor_fold, type: String, description: "Winsorizer fold (IQR multiplier), used when winsorize is selected", optional: true, default: "1.5"}
+  - {name: winsor_tail, type: String, description: "Winsorizer tail: both / left / right", optional: true, default: "both"}
+  - {name: knn_n_neighbors, type: Integer, description: "Neighbors for KNNImputer", optional: true, default: "5"}
+outputs:
+  - {name: X, type: Data, description: "Feature matrix (parquet) after preprocessing"}
+  - {name: y, type: Data, description: "Target column (parquet) after preprocessing"}
+implementation:
+  container:
+    image: python:3.10-slim
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, traceback, subprocess
+
+        # Ensure required libs
+        try:
+            import pandas as pd, numpy as np
+            from sklearn.impute import KNNImputer, SimpleImputer
+            from sklearn.preprocessing import StandardScaler
+            from feature_engine.outliers import Winsorizer
+        except Exception:
+            # install minimal deps if missing
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "pandas", "numpy", "scikit-learn", "feature-engine", "pyarrow", "openpyxl", "fastparquet"])
+            import pandas as pd, numpy as np
+            from sklearn.impute import KNNImputer, SimpleImputer
+            from sklearn.preprocessing import StandardScaler
+            from feature_engine.outliers import Winsorizer
+
+        # ---------- helper converters ----------
+        class NumericStringConverter:
+            """Simple helper (not sklearn estimator) to convert object-like numeric columns to numeric."""
+            def __init__(self, columns=None, assume_thousands_sep=',', decimal_comma=False):
+                self.columns = columns
+                self.assume_thousands_sep = assume_thousands_sep
+                self.decimal_comma = decimal_comma
+
+            def fit(self, df):
+                if self.columns is None:
+                    self.columns = [c for c in df.columns if df[c].dtype == 'object' or str(df[c].dtype).startswith('string')]
+                return self
+
+            def transform(self, df):
+                df = df.copy()
+                for col in list(self.columns):
+                    if col not in df.columns:
+                        continue
+                    s = df[col].astype(str).str.strip().replace({'': None, 'nan': None, 'NaN': None, 'None': None})
+                    s = s.str.replace(r'[€£¥₹$]', '', regex=True)
+                    is_pct = s.str.endswith('%', na=False)
+                    if not self.decimal_comma:
+                        if self.assume_thousands_sep:
+                            s = s.str.replace(self.assume_thousands_sep, '', regex=False)
+                        s = s.str.replace(' ', '', regex=False)
+                    else:
+                        s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+                    numeric_prefix = s.str.extract(r'^\s*([-+]?(?:\d+(\.\d+)?|\.\d+))', expand=False)[0]
+                    out = pd.to_numeric(numeric_prefix, errors='coerce')
+                    try:
+                        out.loc[is_pct] = out.loc[is_pct] / 100.0
+                    except Exception:
+                        out = out.where(~is_pct, out / 100.0)
+                    # keep original for audit
+                    df[col + "_orig"] = df[col]
+                    df[col] = out
+                return df
+
+        def read_with_pandas(path):
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".csv":
+                return pd.read_csv(path)
+            if ext in (".tsv", ".tab"):
+                return pd.read_csv(path, sep="\t")
+            if ext in (".json", ".ndjson", ".jsonl"):
+                try:
+                    return pd.read_json(path, lines=True)
+                except ValueError:
+                    return pd.read_json(path)
+            if ext in (".xls", ".xlsx"):
+                return pd.read_excel(path)
+            if ext in (".parquet", ".pq"):
+                return pd.read_parquet(path, engine="auto")
+            if ext == ".feather":
+                return pd.read_feather(path)
+            if ext == ".orc":
+                return pd.read_orc(path)
+            # fallbacks
+            try:
+                return pd.read_json(path, lines=True)
+            except Exception:
+                pass
+            try:
+                return pd.read_csv(path)
+            except Exception:
+                pass
+            raise ValueError(f"Unsupported or unreadable file format: {path}")
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--in_file', type=str, required=True)
+        parser.add_argument('--target_column', type=str, required=True)
+        parser.add_argument('--outlier_strategy', type=str, default="winsorize")
+        parser.add_argument('--winsor_fold', type=float, default=1.5)
+        parser.add_argument('--winsor_tail', type=str, default="both")
+        parser.add_argument('--knn_n_neighbors', type=int, default=5)
+        parser.add_argument('--X', type=str, required=True)
+        parser.add_argument('--y', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            in_path = args.in_file
+            target_col = args.target_column
+            outlier_strategy = args.outlier_strategy
+            winsor_fold = float(args.winsor_fold)
+            winsor_tail = args.winsor_tail
+            knn_n = int(args.knn_n_neighbors)
+            out_X = args.X
+            out_y = args.y
+
+            if not os.path.exists(in_path):
+                print("ERROR: input file does not exist:", in_path, file=sys.stderr)
+                sys.exit(1)
+
+            print("Loading:", in_path)
+            df = read_with_pandas(in_path)
+            print("Loaded shape:", df.shape)
+
+            # 1. drop duplicates
+            before = len(df)
+            df = df.drop_duplicates(keep='first')
+            print(f"Removed duplicates: {before - len(df)} rows dropped")
+
+            # 2. drop rows where target is null
+            if target_col not in df.columns:
+                print(f"ERROR: target column '{target_col}' not found in data", file=sys.stderr)
+                sys.exit(1)
+            before = len(df)
+            df = df[df[target_col].notna()].reset_index(drop=True)
+            print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
+
+            # 3. convert object-like numeric columns
+            converter = NumericStringConverter(columns=None, assume_thousands_sep=',', decimal_comma=False)
+            converter.fit(df)
+            df = converter.transform(df)
+            print("Converted object-like columns to numeric where possible.")
+
+            # 4. Outlier handling (before imputation)
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            print("Numeric columns identified for outlier handling:", numeric_cols)
+            if outlier_strategy == "winsorize" and len(numeric_cols) > 0:
+                wins = Winsorizer(capping_method='iqr', tail=winsor_tail, fold=winsor_fold, variables=numeric_cols)
+                wins.fit(df)
+                df = wins.transform(df)
+                print("Applied Winsorizer to numeric columns.")
+            elif outlier_strategy == "drop_iqr" and len(numeric_cols) > 0:
+                # compute IQR removal and drop rows outside bounds
+                q1 = df[numeric_cols].quantile(0.25)
+                q3 = df[numeric_cols].quantile(0.75)
+                iqr = q3 - q1
+                lower = q1 - winsor_fold * iqr
+                upper = q3 + winsor_fold * iqr
+                mask = pd.Series(True, index=df.index)
+                for c in numeric_cols:
+                    mask &= df[c].ge(lower[c]) & df[c].le(upper[c])
+                before = len(df)
+                df = df.loc[mask].reset_index(drop=True)
+                print(f"Dropped outlier rows using IQR method: {before - len(df)} rows removed")
+            else:
+                print("No outlier handling applied (no numeric columns or unknown strategy).")
+
+            # 5. Imputation: categorical (most frequent) then numeric (KNN with scaling)
+            # categorical columns (object / category)
+            cat_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('category')) and c != target_col]
+            if len(cat_cols) > 0:
+                cat_imp = SimpleImputer(strategy='most_frequent')
+                df[cat_cols] = cat_imp.fit_transform(df[cat_cols])
+                print("Applied most_frequent imputation to categorical columns:", cat_cols)
+            else:
+                print("No categorical columns to impute.")
+
+            # numeric columns (exclude target if numeric)
+            num_cols = [c for c in df.select_dtypes(include=[np.number]).columns.tolist() if c != target_col]
+            if len(num_cols) > 0:
+                numeric_df = df[num_cols].copy()
+                missing_mask = numeric_df.isna().to_numpy()
+
+                medians = numeric_df.median()
+                temp_filled = numeric_df.fillna(medians)
+
+                scaler = StandardScaler()
+                scaled_temp = scaler.fit_transform(temp_filled)
+
+                # reintroduce NaNs
+                scaled_temp[missing_mask] = np.nan
+
+                knn = KNNImputer(n_neighbors=knn_n)
+                imputed_scaled = knn.fit_transform(scaled_temp)
+
+                restored = scaler.inverse_transform(imputed_scaled)
+                df[num_cols] = pd.DataFrame(restored, columns=num_cols, index=df.index)
+                print("Applied KNN imputation to numeric columns:", num_cols)
+
+                # optional: cast integer-like columns back to Int64
+                for col in num_cols:
+                    col_vals = df[col].dropna()
+                    if not col_vals.empty and np.all(np.isclose(col_vals, np.round(col_vals))):
+                        try:
+                            df[col] = df[col].round().astype("Int64")
+                            print(f"Casted {col} to Int64 (nullable integer).")
+                        except Exception:
+                            df[col] = df[col].astype(float)
+            else:
+                print("No numeric columns to impute.")
+
+            # 6. split X, y and save as parquet
+            y_ser = df[[target_col]].copy()
+            X_df = df.drop(columns=[target_col]).copy()
+
+            makedirs = lambda p: os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            makedirs(out_X); makedirs(out_y)
+
+            X_df.to_parquet(out_X, index=False)
+            y_ser.to_parquet(out_y, index=False)
+
+            print("Saved X to:", out_X)
+            print("Saved y to:", out_y)
+            print("SUCCESS: Preprocessing complete.")
+
+        except Exception as exc:
+            print("ERROR during preprocessing:", exc, file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --in_file
+      - {inputPath: in_file}
+      - --target_column
+      - {inputValue: target_column}
+      - --outlier_strategy
+      - {inputValue: outlier_strategy}
+      - --winsor_fold
+      - {inputValue: winsor_fold}
+      - --winsor_tail
+      - {inputValue: winsor_tail}
+      - --knn_n_neighbors
+      - {inputValue: knn_n_neighbors}
+      - --X
+      - {outputPath: X}
+      - --y
+      - {outputPath: y}
