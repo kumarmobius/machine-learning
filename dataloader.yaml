@@ -1,4 +1,4 @@
-name: Load Data into Pandas -
+name: Load Data into Pandas - from CDN
 description: |
   Loads a dataset file (CSV, TSV, JSON/JSONL, Excel, Parquet, Feather, ORC) produced by the
   CDN Generic Downloader into a pandas DataFrame, then writes:
@@ -7,10 +7,10 @@ description: |
     - schema_file (JSON with column dtypes)
     - row_count (text file containing the number of rows)
 
-  This version is more robust: if the provided `in_file` is a directory (common for the CDN
-  downloader), the brick will automatically pick the best candidate file inside (single file
-  or largest file). It also supports compressed .gz and .zip inputs and better content sniffing
-  when extensions are missing.
+  This component is robust: it will accept either a direct file path or a directory produced
+  by the CDN downloader. If a directory is provided it will select a sensible candidate file
+  (single file or largest regular file). It supports compressed .gz and .zip files and falls
+  back to content-sniffing (JSONL vs CSV) when extensions are missing.
 inputs:
   - {name: in_file, type: Data, description: "Path to the downloaded file or directory (connect CDN Generic Downloader: out_file)"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview JSON", default: "20"}
@@ -27,13 +27,21 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, traceback, subprocess, io, gzip, zipfile
+        import argparse
+        import os
+        import sys
+        import json
+        import traceback
+        import subprocess
+        import io
+        import gzip
+        import zipfile
 
-        # Try import pandas and engines, install if missing
+        # Install pandas & common engines if missing
         try:
             import pandas as pd
         except Exception:
-            print("pandas not found — installing pandas and engines (pyarrow, openpyxl, fastparquet)...", file=sys.stderr)
+            print("Installing pandas and common engines...", file=sys.stderr)
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "pandas", "pyarrow", "openpyxl", "fastparquet"])
             import pandas as pd
 
@@ -53,7 +61,6 @@ implementation:
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
 
-        # --- robust helpers for sniffing ---
         def _sample_bytes(path, n=8192):
             try:
                 with open(path, "rb") as fh:
@@ -62,17 +69,15 @@ implementation:
                 return b""
 
         def _likely_json(sample_bytes):
+            # safe check: decode to text and inspect for JSON-like starts
             if not sample_bytes:
                 return False
             try:
                 txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
             except Exception:
-                # if decode fails, fallback to bytes checks but avoid literal b"..."
                 return False
             return txt.startswith("{") or txt.startswith("[") or "\n{" in txt or "\n[" in txt
 
-
-        # Robust read_with_pandas:
         def read_with_pandas(path):
             # if path is a directory choose candidate file
             if os.path.isdir(path):
@@ -98,27 +103,30 @@ implementation:
 
             # handle gz compressed CSV/JSONL
             if ext in (".gz",) or path.endswith(".csv.gz") or path.endswith(".json.gz"):
-                with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
-                    sample = fh.read(8192)
-                    fh.seek(0)
-                    if _likely_json(sample.encode() if isinstance(sample, str) else sample):
-                        try:
+                try:
+                    with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
+                        sample = fh.read(8192)
+                        fh.seek(0)
+                        if _likely_json(sample.encode() if isinstance(sample, str) else sample):
                             fh.seek(0)
-                            return pd.read_json(fh, lines=True)
-                        except Exception:
+                            try:
+                                return pd.read_json(fh, lines=True)
+                            except Exception:
+                                fh.seek(0)
+                                return pd.read_csv(fh)
+                        else:
                             fh.seek(0)
                             return pd.read_csv(fh)
-                    else:
-                        fh.seek(0)
-                        return pd.read_csv(fh)
+                except Exception as e:
+                    # fallback to trying pandas readers directly
+                    pass
 
-            # handle zip archives: pick first non-dir member (or largest member)
+            # handle zip archives: pick largest non-dir member
             if ext == ".zip":
                 with zipfile.ZipFile(path, "r") as z:
                     names = [n for n in z.namelist() if not n.endswith("/")]
                     if not names:
                         raise ValueError(f"No files inside zip archive: {path}")
-                    # prefer largest member
                     member = max(names, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
                     with z.open(member) as fh:
                         sample = fh.read(8192)
