@@ -1,4 +1,4 @@
-name: Load Data into Pandas
+name: Load Data into Pandas -
 description: |
   Loads a dataset file (CSV, TSV, JSON/JSONL, Excel, Parquet, Feather, ORC) produced by the
   CDN Generic Downloader into a pandas DataFrame, then writes:
@@ -64,8 +64,13 @@ implementation:
         def _likely_json(sample_bytes):
             if not sample_bytes:
                 return False
-            s = sample_bytes.lstrip()
-            return s.startswith(b"{") or s.startswith(b"[") or b"\n{" in s or b"\n[" in s
+            try:
+                txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
+            except Exception:
+                # if decode fails, fallback to bytes checks but avoid literal b"..."
+                return False
+            return txt.startswith("{") or txt.startswith("[") or "\n{" in txt or "\n[" in txt
+
 
         # Robust read_with_pandas:
         def read_with_pandas(path):
