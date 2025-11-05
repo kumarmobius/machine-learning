@@ -414,7 +414,7 @@ implementation:
                 # low-cardinality
                 if nunique <= 10:
                     # OneHot good
-                    enc = OneHotEncoder(sparse=False, handle_unknown='ignore')
+                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                     return 'onehot', enc, {}
                 # medium card
                 if target_series is not None and train_mode:
