@@ -1,4 +1,4 @@
-name: Load & Preprocess - Auto Impute/Encode/Scale (produce X,y + preprocessor)
+name: Load & Preprocess - ENTIRE
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -74,6 +74,7 @@ implementation:
             except Exception:
                 return b""
 
+        # a
         def is_likely_json(sample_bytes):
             if not sample_bytes:
                 return False
@@ -83,8 +84,21 @@ implementation:
                 return False
             if not txt:
                 return False
-            c = txt[0]
-            return c in ('{', '[') or "\n{" in txt or "\n[" in txt
+        
+            # use chr() to avoid embedding literal { or [ in YAML
+            open_brace = chr(123)   # '{'
+            open_bracket = chr(91)  # '['
+            newline = chr(10)
+        
+            first_char = txt[0]
+            if first_char == open_brace or first_char == open_bracket:
+                return True
+        
+            if (newline + open_brace) in txt or (newline + open_bracket) in txt:
+                return True
+        
+            return False
+
 
         def read_with_pandas(path):
             # If directory, pick largest/only file
