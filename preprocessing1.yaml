@@ -31,19 +31,9 @@ implementation:
       - -u
       - -c
       - |
-        # """
-        # Auto preprocessing brick:
-        # - robust loading
-        # - advanced alphanumeric numeric conversion
-        # - date detection + extraction
-        # - per-column smart imputer selection (Simple/KNN/Iterative)
-        # - two-stage safe KNN: temporary simple impute -> scale -> KNN -> inverse-scale
-        # - outlier removal (IQR-drop / winsorize)
-        # - per-column automatic scaler selection
-        # - categorical encoding selection with RareLabel and optional string-similarity grouping
-        # - save X,y, preprocessor.pkl and metadata.json
-        # """
-
+        import argparse
+        import os
+        import sys
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
         from datetime import datetime
         from collections import Counter, defaultdict
