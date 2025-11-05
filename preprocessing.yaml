@@ -1,17 +1,17 @@
-name: Load & Preprocess - from CDN (produce X,y)
+name: Load & Preprocess
 description: |
   Loads a dataset file (CSV/JSON/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
-  removes duplicates, drops rows with missing target, converts numeric-like object columns,
-  applies outlier handling (winsorize or IQR-drop), then imputes missing values
-  (numeric: KNNImputer; categorical: most_frequent). Finally splits into X (features) and y (target)
-  and writes both as parquet artifacts.
+  removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
+  & conversion, identifies datetime columns and extracts common date features, optimizes numeric dtypes
+  to the smallest safe dtype (int8/int16/float32/etc.), and returns the feature matrix X and target y
+  as parquet files. This pipeline DOES NOT impute, scale, or perform outlier handling.
 inputs:
   - {name: in_file, type: Data, description: "Path to the downloaded file (connect CDN Generic Downloader: out_file)"}
   - {name: target_column, type: String, description: "Name of the target column in the dataset (rows with null target will be dropped)"}
-  - {name: outlier_strategy, type: String, description: "Outlier strategy: winsorize or drop_iqr", optional: true, default: "winsorize"}
-  - {name: winsor_fold, type: String, description: "Winsorizer fold (IQR multiplier), used when winsorize is selected", optional: true, default: "1.5"}
-  - {name: winsor_tail, type: String, description: "Winsorizer tail: both / left / right", optional: true, default: "both"}
-  - {name: knn_n_neighbors, type: Integer, description: "Neighbors for KNNImputer", optional: true, default: "5"}
+  - {name: numeric_detection_threshold, type: Float, description: "Minimum fraction (0-1) of parsable numeric values in an object column to coerce it to numeric", optional: true, default: "0.6"}
+  - {name: advanced_alphanumeric, type: String, description: "Enable advanced alphanumeric parsing (true/false). Parses units, multipliers (k/M), percents, currencies", optional: true, default: "true"}
+  - {name: date_parse, type: String, description: "Enable date parsing & extraction (true/false). Attempts to parse object columns as datetimes and extract features", optional: true, default: "true"}
+  - {name: optimize_dtypes, type: String, description: "Optimize numeric dtypes after cleaning (true/false)", optional: true, default: "true"}
 outputs:
   - {name: X, type: Data, description: "Feature matrix (parquet) after preprocessing"}
   - {name: y, type: Data, description: "Target column (parquet) after preprocessing"}
@@ -23,59 +23,17 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, traceback, subprocess
+        import argparse, os, sys, json, traceback, subprocess, re
+        from datetime import datetime
 
         # Ensure required libs
         try:
             import pandas as pd, numpy as np
-            from sklearn.impute import KNNImputer, SimpleImputer
-            from sklearn.preprocessing import StandardScaler
-            from feature_engine.outliers import Winsorizer
         except Exception:
-            # install minimal deps if missing
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "pandas", "numpy", "scikit-learn", "feature-engine", "pyarrow", "openpyxl", "fastparquet"])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "pandas", "numpy", "pyarrow", "fastparquet", "openpyxl"])
             import pandas as pd, numpy as np
-            from sklearn.impute import KNNImputer, SimpleImputer
-            from sklearn.preprocessing import StandardScaler
-            from feature_engine.outliers import Winsorizer
 
-        # ---------- helper converters ----------
-        class NumericStringConverter:
-            def __init__(self, columns=None, assume_thousands_sep=',', decimal_comma=False):
-                self.columns = columns
-                self.assume_thousands_sep = assume_thousands_sep
-                self.decimal_comma = decimal_comma
-
-            def fit(self, df):
-                if self.columns is None:
-                    self.columns = [c for c in df.columns if df[c].dtype == 'object' or str(df[c].dtype).startswith('string')]
-                return self
-
-            def transform(self, df):
-                df = df.copy()
-                for col in list(self.columns):
-                    if col not in df.columns:
-                        continue
-                    s = df[col].astype(str).str.strip().replace({'': None, 'nan': None, 'NaN': None, 'None': None})
-                    s = s.str.replace(r'[€£¥₹$]', '', regex=True)
-                    is_pct = s.str.endswith('%', na=False)
-                    if not self.decimal_comma:
-                        if self.assume_thousands_sep:
-                            s = s.str.replace(self.assume_thousands_sep, '', regex=False)
-                        s = s.str.replace(' ', '', regex=False)
-                    else:
-                        s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-                    numeric_prefix = s.str.extract(r'^\s*([-+]?(?:\d+(\.\d+)?|\.\d+))', expand=False)[0]
-                    out = pd.to_numeric(numeric_prefix, errors='coerce')
-                    try:
-                        out.loc[is_pct] = out.loc[is_pct] / 100.0
-                    except Exception:
-                        out = out.where(~is_pct, out / 100.0)
-                    # keep original for audit
-                    df[col + "_orig"] = df[col]
-                    df[col] = out
-                return df
-
+        # ---------- helper functions ----------
         def read_with_pandas(path):
             ext = os.path.splitext(path)[1].lower()
             if ext == ".csv":
@@ -106,13 +64,201 @@ implementation:
                 pass
             raise ValueError(f"Unsupported or unreadable file format: {path}")
 
+
+        MULTIPLIER_MAP = {
+            'k': 1_000.0,
+            'm': 1_000_000.0,
+            'b': 1_000_000_000.0,
+            't': 1_000_000_000_000.0
+        }
+
+        UNIT_SUFFIXES = [
+            'km','m','cm','mm','kg','g','lbs','lb','oz','ft','feet','in','inch','mi','sqm','sqft','sq m','sqft',
+            'pcs','pieces','units','hr','hrs','h','min','s'  # conservative list - numeric kept, unit dropped
+        ]
+
+        CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺₪¥]'
+        TOKEN_RE = re.compile(
+            r'^\s*'
+            r'(?P<sign>[-+]?)'
+            r'(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)'  # captures numbers with commas or decimals
+            r'\s*'
+            r'(?P<mult>[kKmMbBtT])?'                                   # optional k/m/b multiplier
+            r'\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$'                        # optional unit or percent or degree sign, squared etc.
+        )
+
+        def parse_alphanumeric_to_numeric(s, decimal_comma=False):
+            if pd.isna(s):
+                return np.nan
+            orig = str(s).strip()
+            if orig == '' or orig.lower() in {'nan','none','null','na'}:
+                return np.nan
+
+            # remove currency symbols anywhere
+            tmp = re.sub(CURRENCY_SYMBOLS_REGEX, '', orig)
+
+            # handle percentages like "45%" or "45 %"
+            if tmp.strip().endswith('%'):
+                try:
+                    num = float(tmp.strip().rstrip('%').replace(',', '').replace(' ', ''))
+                    return num / 100.0
+                except Exception:
+                    pass
+
+            # normalize common unicode minus characters
+            tmp = tmp.replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-')
+
+            # remove spaces between thousands (e.g., '1 234' or '1 234')
+            tmp = re.sub(r'[\u00A0\u202F]', '', tmp)  # NBSP and narrow NBSP
+            tmp = tmp.strip()
+
+            # If decimal_comma is True, swap characters to standard decimal point
+            if decimal_comma:
+                tmp = tmp.replace('.', '').replace(',', '.')
+            else:
+                # remove thousands separators (commas) and internal spaces
+                tmp = tmp.replace(',', '').replace(' ', '')
+
+            # Attempt direct float conversion
+            try:
+                return float(tmp)
+            except Exception:
+                pass
+
+            # Try token regex
+            m = TOKEN_RE.match(tmp)
+            if m:
+                number = m.group('number')
+                mult = m.group('mult')
+                unit = (m.group('unit') or '').lower()
+                # cleanup number
+                number_clean = number.replace(',', '').replace(' ', '')
+                try:
+                    val = float(number_clean)
+                except Exception:
+                    try:
+                        val = float(number_clean.replace(',', '.'))
+                    except Exception:
+                        return np.nan
+                # apply multiplier if present
+                if mult:
+                    mul = MULTIPLIER_MAP.get(mult.lower(), 1.0)
+                    val = val * mul
+                # if unit is percentage-like
+                if unit and '%' in unit:
+                    val = val / 100.0
+                # drop trailing known unit suffixes (we do not convert units to canonical units here)
+                # e.g., '100km' -> 100
+                # if unit is only letters from UNIT_SUFFIXES, we already extracted number; just return number
+                # so return val as-is (user requested '100km' -> 100 numeric part)
+                return val
+
+            # fallback: attempt to find a number anywhere in the string
+            num_search = re.search(r'[-+]?\d+([.,]\d+)?', tmp)
+            if num_search:
+                try:
+                    candidate = num_search.group(0).replace(',', '')
+                    return float(candidate)
+                except Exception:
+                    return np.nan
+            return np.nan
+
+        def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True):
+            df = df.copy()
+            report = {'converted': [], 'skipped': []}
+            obj_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
+            for col in obj_cols:
+                ser = df[col].astype(object)
+                total_non_null = ser.notna().sum()
+                if total_non_null == 0:
+                    report['skipped'].append(col)
+                    continue
+
+                parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma) if advanced else _simple_numeric_prefix(x))
+                parsable = parsed.notna().sum()
+                frac = parsable / float(total_non_null)
+                if frac >= detect_threshold:
+                    df[col + "_orig"] = df[col]
+                    df[col] = parsed
+                    report['converted'].append({'col': col, 'parsable_fraction': frac})
+                else:
+                    report['skipped'].append({'col': col, 'parsable_fraction': frac})
+            return df, report
+
+        def detect_and_extract_dates(df, date_parse_enabled=True):
+            df = df.copy()
+            report = {'date_columns': [], 'skipped': []}
+            if not date_parse_enabled:
+                return df, report
+            candidate_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
+            for col in candidate_cols:
+                ser = df[col].astype(object)
+                # try parsing a sample to check if a reasonable fraction parse as datetime
+                sample = ser.dropna().astype(str).head(500)  # sample first up to 500 non-null values
+                if sample.empty:
+                    report['skipped'].append(col); continue
+                parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True, utc=False)
+                parsable_frac = parsed.notna().mean()
+                if parsable_frac >= 0.6:
+                    # parse full column
+                    full_parsed = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True, utc=False)
+                    df[col + "_orig"] = df[col]
+                    df[col] = full_parsed
+                    # extract features
+                    df[col + "_year"] = df[col].dt.year
+                    df[col + "_month"] = df[col].dt.month
+                    df[col + "_day"] = df[col].dt.day
+                    df[col + "_dayofweek"] = df[col].dt.dayofweek
+                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5,6]).astype('Int64')
+                    df[col + "_is_month_start"] = df[col].dt.is_month_start.astype('Int64')
+                    df[col + "_is_month_end"] = df[col].dt.is_month_end.astype('Int64')
+                    # days since epoch (1970-01-01) as integer
+                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                    report['date_columns'].append({'col': col, 'parsable_fraction': parsable_frac})
+                else:
+                    report['skipped'].append({'col': col, 'parsable_fraction': parsable_frac})
+            return df, report
+
+        def optimize_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+            df_optimized = df.copy()
+            start_mem = df_optimized.memory_usage(deep=True).sum() / 1024**2
+
+            for col in df_optimized.select_dtypes(include=[np.number]).columns:
+                col_min = df_optimized[col].min()
+                col_max = df_optimized[col].max()
+                col_dtype = df_optimized[col].dtype
+
+                if pd.api.types.is_integer_dtype(col_dtype):
+                    # downcast integer
+                    if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int8)
+                    elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int16)
+                    elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
+                        df_optimized[col] = df_optimized[col].astype(np.int32)
+                    else:
+                        df_optimized[col] = df_optimized[col].astype(np.int64)
+
+                elif pd.api.types.is_float_dtype(col_dtype):
+                    # downcast float
+                    df_optimized[col] = pd.to_numeric(df_optimized[col], downcast="float")
+
+            end_mem = df_optimized.memory_usage(deep=True).sum() / 1024**2
+            try:
+                reduction_pct = 100 * (start_mem - end_mem) / start_mem
+            except Exception:
+                reduction_pct = 0.0
+            print(f"Memory reduced from {start_mem:.2f} MB to {end_mem:.2f} MB ({reduction_pct:.1f}% reduction)")
+            return df_optimized
+
+        # ---------- main argument parsing ----------
         parser = argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
-        parser.add_argument('--outlier_strategy', type=str, default="winsorize")
-        parser.add_argument('--winsor_fold', type=float, default=1.5)
-        parser.add_argument('--winsor_tail', type=str, default="both")
-        parser.add_argument('--knn_n_neighbors', type=int, default=5)
+        parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
+        parser.add_argument('--advanced_alphanumeric', type=str, default="true")
+        parser.add_argument('--date_parse', type=str, default="true")
+        parser.add_argument('--optimize_dtypes', type=str, default="true")
         parser.add_argument('--X', type=str, required=True)
         parser.add_argument('--y', type=str, required=True)
         args = parser.parse_args()
@@ -120,10 +266,10 @@ implementation:
         try:
             in_path = args.in_file
             target_col = args.target_column
-            outlier_strategy = args.outlier_strategy
-            winsor_fold = float(args.winsor_fold)
-            winsor_tail = args.winsor_tail
-            knn_n = int(args.knn_n_neighbors)
+            detect_thresh = float(args.numeric_detection_threshold)
+            advanced_flag = str(args.advanced_alphanumeric).lower() in ("1","true","t","yes","y")
+            date_parse_flag = str(args.date_parse).lower() in ("1","true","t","yes","y")
+            optimize_flag = str(args.optimize_dtypes).lower() in ("1","true","t","yes","y")
             out_X = args.X
             out_y = args.y
 
@@ -148,79 +294,23 @@ implementation:
             df = df[df[target_col].notna()].reset_index(drop=True)
             print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
 
-            # 3. convert object-like numeric columns
-            converter = NumericStringConverter(columns=None, assume_thousands_sep=',', decimal_comma=False)
-            converter.fit(df)
-            df = converter.transform(df)
-            print("Converted object-like columns to numeric where possible.")
+            # 3. advanced alphanumeric conversion for object columns
+            print("Running advanced alphanumeric numeric detection (enabled=%s) with threshold=%.2f" % (advanced_flag, detect_thresh))
+            df_conv, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=advanced_flag)
+            df = df_conv
+            print("Conversion report:", json.dumps(conv_report, default=str)[:1000])
 
-            # 4. Outlier handling (before imputation)
-            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            print("Numeric columns identified for outlier handling:", numeric_cols)
-            if outlier_strategy == "winsorize" and len(numeric_cols) > 0:
-                wins = Winsorizer(capping_method='iqr', tail=winsor_tail, fold=winsor_fold, variables=numeric_cols)
-                wins.fit(df)
-                df = wins.transform(df)
-                print("Applied Winsorizer to numeric columns.")
-            elif outlier_strategy == "drop_iqr" and len(numeric_cols) > 0:
-                # compute IQR removal and drop rows outside bounds
-                q1 = df[numeric_cols].quantile(0.25)
-                q3 = df[numeric_cols].quantile(0.75)
-                iqr = q3 - q1
-                lower = q1 - winsor_fold * iqr
-                upper = q3 + winsor_fold * iqr
-                mask = pd.Series(True, index=df.index)
-                for c in numeric_cols:
-                    mask &= df[c].ge(lower[c]) & df[c].le(upper[c])
-                before = len(df)
-                df = df.loc[mask].reset_index(drop=True)
-                print(f"Dropped outlier rows using IQR method: {before - len(df)} rows removed")
+            # 4. detect & extract dates (if enabled)
+            print("Running date detection & feature extraction (enabled=%s)" % date_parse_flag)
+            df, date_report = detect_and_extract_dates(df, date_parse_enabled=date_parse_flag)
+            print("Date parse report:", json.dumps(date_report, default=str)[:1000])
+
+            # 5. Optimize numeric dtypes (if enabled)
+            if optimize_flag:
+                print("Optimizing numeric dtypes...")
+                df = optimize_numeric_dtypes(df)
             else:
-                print("No outlier handling applied (no numeric columns or unknown strategy).")
-
-            # 5. Imputation: categorical (most frequent) then numeric (KNN with scaling)
-            # categorical columns (object / category)
-            cat_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('category')) and c != target_col]
-            if len(cat_cols) > 0:
-                cat_imp = SimpleImputer(strategy='most_frequent')
-                df[cat_cols] = cat_imp.fit_transform(df[cat_cols])
-                print("Applied most_frequent imputation to categorical columns:", cat_cols)
-            else:
-                print("No categorical columns to impute.")
-
-            # numeric columns (exclude target if numeric)
-            num_cols = [c for c in df.select_dtypes(include=[np.number]).columns.tolist() if c != target_col]
-            if len(num_cols) > 0:
-                numeric_df = df[num_cols].copy()
-                missing_mask = numeric_df.isna().to_numpy()
-
-                medians = numeric_df.median()
-                temp_filled = numeric_df.fillna(medians)
-
-                scaler = StandardScaler()
-                scaled_temp = scaler.fit_transform(temp_filled)
-
-                # reintroduce NaNs
-                scaled_temp[missing_mask] = np.nan
-
-                knn = KNNImputer(n_neighbors=knn_n)
-                imputed_scaled = knn.fit_transform(scaled_temp)
-
-                restored = scaler.inverse_transform(imputed_scaled)
-                df[num_cols] = pd.DataFrame(restored, columns=num_cols, index=df.index)
-                print("Applied KNN imputation to numeric columns:", num_cols)
-
-                # optional: cast integer-like columns back to Int64
-                for col in num_cols:
-                    col_vals = df[col].dropna()
-                    if not col_vals.empty and np.all(np.isclose(col_vals, np.round(col_vals))):
-                        try:
-                            df[col] = df[col].round().astype("Int64")
-                            print(f"Casted {col} to Int64 (nullable integer).")
-                        except Exception:
-                            df[col] = df[col].astype(float)
-            else:
-                print("No numeric columns to impute.")
+                print("Skipping dtype optimization (optimize_dtypes=False).")
 
             # 6. split X, y and save as parquet
             y_ser = df[[target_col]].copy()
@@ -245,14 +335,14 @@ implementation:
       - {inputPath: in_file}
       - --target_column
       - {inputValue: target_column}
-      - --outlier_strategy
-      - {inputValue: outlier_strategy}
-      - --winsor_fold
-      - {inputValue: winsor_fold}
-      - --winsor_tail
-      - {inputValue: winsor_tail}
-      - --knn_n_neighbors
-      - {inputValue: knn_n_neighbors}
+      - --numeric_detection_threshold
+      - {inputValue: numeric_detection_threshold}
+      - --advanced_alphanumeric
+      - {inputValue: advanced_alphanumeric}
+      - --date_parse
+      - {inputValue: date_parse}
+      - --optimize_dtypes
+      - {inputValue: optimize_dtypes}
       - --X
       - {outputPath: X}
       - --y
