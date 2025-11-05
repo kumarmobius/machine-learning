@@ -1,4 +1,4 @@
-name: Load Data into Pandas - from CDN
+name: Load Data into Pandas
 description: |
   Loads a dataset file (CSV, TSV, JSON/JSONL, Excel, Parquet, Feather, ORC) produced by the
   CDN Generic Downloader into a pandas DataFrame, then writes:
@@ -76,7 +76,12 @@ implementation:
                 txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
             except Exception:
                 return False
-            return txt.startswith("{") or txt.startswith("[") or "\n{" in txt or "\n[" in txt
+            # Check for JSON patterns - using variables to avoid YAML issues
+            open_brace = "{"
+            open_bracket = "["
+            newline_brace = "\n{"
+            newline_bracket = "\n["
+            return txt.startswith(open_brace) or txt.startswith(open_bracket) or newline_brace in txt or newline_bracket in txt
 
         def read_with_pandas(path):
             # if path is a directory choose candidate file
