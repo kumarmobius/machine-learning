@@ -41,7 +41,6 @@ implementation:
 
         # ---------- helper converters ----------
         class NumericStringConverter:
-            """Simple helper (not sklearn estimator) to convert object-like numeric columns to numeric."""
             def __init__(self, columns=None, assume_thousands_sep=',', decimal_comma=False):
                 self.columns = columns
                 self.assume_thousands_sep = assume_thousands_sep
