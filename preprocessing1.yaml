@@ -1,4 +1,4 @@
-name: Load & Preprocess
+name: Load & Preprocess_ h
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -11,31 +11,74 @@ description: |
     - preprocessing_summary (json) - per-column readable summary
     - processed_preview (json) - df.head() after preprocessing
 inputs:
-  - {name: in_file, type: Data, description: "Path to the downloaded file or directory (connect CDN Generic Downloader: out_file)"}
-  - {name: target_column, type: String, description: "Name of the target column in the dataset (rows with null target will be dropped)"}
-  - {name: outlier_strategy, type: String, description: "Outlier strategy: 'drop_iqr' or 'winsorize' or 'none'", optional: true, default: "drop_iqr"}
-  - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule (e.g., 1.5)", optional: true, default: "1.5"}
-  - {name: max_knn_rows, type: Integer, description: "Max rows allowed to use KNN imputer (otherwise fall back)", optional: true, default: "5000"}
-  - {name: numeric_detection_threshold, type: Float, description: "Fraction (0-1) of parsable numeric values in object column to coerce to numeric", optional: true, default: "0.6"}
-  - {name: rare_threshold, type: Float, description: "Rare label threshold as fraction or absolute count (e.g. 0.01 or 10)", optional: true, default: "0.01"}
-  - {name: enable_string_similarity, type: String, description: "Use string similarity grouping for high-cardinality categoricals (true/false)", optional: true, default: "false"}
-  - {name: preview_rows, type: Integer, description: "Rows to include in preview JSON", optional: true, default: "20"}
+  - name: in_file
+    type: Data
+    description: "Path to the downloaded file or directory (connect CDN Generic Downloader: out_file)"
+  - name: target_column
+    type: String
+    description: "Name of the target column in the dataset (rows with null target will be dropped)"
+  - name: outlier_strategy
+    type: String
+    description: "Outlier strategy: 'drop_iqr' or 'winsorize' or 'none'"
+    optional: true
+    default: "drop_iqr"
+  - name: outlier_fold
+    type: Float
+    description: "IQR fold for outlier rule (e.g., 1.5)"
+    optional: true
+    default: "1.5"
+  - name: max_knn_rows
+    type: Integer
+    description: "Max rows allowed to use KNN imputer (otherwise fall back)"
+    optional: true
+    default: "5000"
+  - name: numeric_detection_threshold
+    type: Float
+    description: "Fraction (0-1) of parsable numeric values in object column to coerce to numeric"
+    optional: true
+    default: "0.6"
+  - name: rare_threshold
+    type: Float
+    description: "Rare label threshold as fraction or absolute count (e.g. 0.01 or 10)"
+    optional: true
+    default: "0.01"
+  - name: enable_string_similarity
+    type: String
+    description: "Use string similarity grouping for high-cardinality categoricals (true/false)"
+    optional: true
+    default: "false"
+  - name: preview_rows
+    type: Integer
+    description: "Rows to include in preview JSON"
+    optional: true
+    default: "20"
 outputs:
-  - {name: X, type: Data, description: "Feature matrix (parquet) after preprocessing"}
-  - {name: y, type: Data, description: "Target column (parquet) after preprocessing"}
-  - {name: preprocessor, type: Data, description: "Pickle file with fitted preprocessor (for inference)"}
-  - {name: preprocess_metadata, type: Data, description: "JSON metadata describing chosen preprocessing steps"}
-  - {name: preprocessing_summary, type: Data, description: "Readable JSON summary of per-column preprocessing decisions"}
-  - {name: processed_preview, type: Data, description: "JSON preview of processed DataFrame (df.head())"}
+  - name: X
+    type: Data
+    description: "Feature matrix (parquet) after preprocessing"
+  - name: y
+    type: Data
+    description: "Target column (parquet) after preprocessing"
+  - name: preprocessor
+    type: Data
+    description: "Pickle file with fitted preprocessor (for inference)"
+  - name: preprocess_metadata
+    type: Data
+    description: "JSON metadata describing chosen preprocessing steps"
+  - name: preprocessing_summary
+    type: Data
+    description: "Readable JSON summary of per-column preprocessing decisions"
+  - name: processed_preview
+    type: Data
+    description: "JSON preview of processed DataFrame (df.head())"
 implementation:
   container:
     image: python:3.10-slim
     command:
-      - python3
-      - -u
-      - -c
+      - sh
+      - -ec
       - |
-        # Full end-to-end preprocessing component
+        cat > /tmp/preprocess_script.py << 'EOF'
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math, inspect
         from datetime import datetime
         from collections import Counter, defaultdict
@@ -49,7 +92,7 @@ implementation:
             from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
             from sklearn.pipeline import Pipeline
             from sklearn.model_selection import KFold
-            from sklearn.experimental import enable_iterative_imputer  # noqa
+            from sklearn.experimental import enable_iterative_imputer
             from sklearn.impute import IterativeImputer
             import joblib
             import category_encoders as ce
@@ -60,14 +103,13 @@ implementation:
             from sklearn.impute import SimpleImputer, KNNImputer
             from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
             from sklearn.pipeline import Pipeline
-            from sklearn.model_selection import KFold
-            from sklearn.experimental import enable_iterative_imputer  # noqa
+            from sklearn.model_model import KFold
+            from sklearn.experimental import enable_iterative_imputer
             from sklearn.impute import IterativeImputer
             import joblib
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 
-        # ---------- helper: robust OneHot creation compatible across sklearn versions
         def make_onehot(handle_unknown='ignore'):
             try:
                 params = inspect.signature(OneHotEncoder).parameters
@@ -78,7 +120,6 @@ implementation:
             except Exception:
                 return OneHotEncoder(handle_unknown=handle_unknown)
 
-        # ---------- robust file loader (dir/gz/zip/sniff)
         def sample_file_bytes(path, n=8192):
             try:
                 with open(path, "rb") as fh:
@@ -95,8 +136,8 @@ implementation:
                 return False
             if not txt:
                 return False
-            open_brace = chr(123)   # '{'
-            open_bracket = chr(91)  # '['
+            open_brace = chr(123)
+            open_bracket = chr(91)
             newline = chr(10)
             first_char = txt[0]
             if first_char == open_brace or first_char == open_bracket:
@@ -109,15 +150,15 @@ implementation:
             if os.path.isdir(path):
                 entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
                 if not entries:
-                    raise ValueError("Input directory is empty: " + path)
+                    raise ValueError("Input directory is empty" + path)
                 files = [p for p in entries if os.path.isfile(p)]
                 if not files:
-                    raise ValueError("No regular files inside directory: " + path)
+                    raise ValueError("No regular files inside directory" + path)
                 path = files[0] if len(files) == 1 else max(files, key=lambda p: os.path.getsize(p))
                 print("Info: in_file was directory, selected:", path)
 
             if not os.path.exists(path) or not os.path.isfile(path):
-                raise ValueError("Input path not found or not a file: " + path)
+                raise ValueError("Input path not found or not a file" + path)
 
             ext = os.path.splitext(path)[1].lower()
 
@@ -142,7 +183,7 @@ implementation:
                 with zipfile.ZipFile(path, "r") as z:
                     members = [n for n in z.namelist() if not n.endswith("/")]
                     if not members:
-                        raise ValueError("Zip archive empty: " + path)
+                        raise ValueError("Zip archive empty" + path)
                     member = max(members, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
                     with z.open(member) as fh:
                         sample = fh.read(8192)
@@ -190,9 +231,8 @@ implementation:
             except Exception:
                 pass
 
-            raise ValueError("Unsupported or unreadable file format: " + path)
+            raise ValueError("Unsupported or unreadable file format" + path)
 
-        # ---------- advanced alphanumeric parsing ----------
         CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
         MULTIPLIER_MAP = {'k':1e3, 'm':1e6, 'b':1e9, 't':1e12}
         TOKEN_RE = re.compile(
@@ -262,7 +302,8 @@ implementation:
                 ser = df[col].astype(object)
                 total_non_null = ser.notna().sum()
                 if total_non_null == 0:
-                    report['skipped'].append(col); continue
+                    report['skipped'].append(col)
+                    continue
                 if advanced:
                     parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma))
                 else:
@@ -277,7 +318,6 @@ implementation:
                     report['skipped'].append({'col': col, 'parsable_fraction': frac})
             return df, report
 
-        # ---------------- Date detection & extraction -----------------------------
         def detect_and_extract_dates(df, date_parse_enabled=True):
             df = df.copy()
             report = {'date_columns': [], 'skipped': []}
@@ -288,7 +328,8 @@ implementation:
                 ser = df[col].astype(object)
                 sample = ser.dropna().astype(str).head(500)
                 if sample.empty:
-                    report['skipped'].append(col); continue
+                    report['skipped'].append(col)
+                    continue
                 parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True, utc=False)
                 parsable_frac = parsed.notna().mean()
                 if parsable_frac >= 0.6:
@@ -308,7 +349,6 @@ implementation:
                     report['skipped'].append({'col': col, 'parsable_fraction': parsable_frac})
             return df, report
 
-        # ------------- rare labels & string-similarity grouping -------------------
         def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
             counts = series.value_counts(dropna=False)
             n = len(series)
@@ -323,7 +363,8 @@ implementation:
             mapping = {}
             used = set()
             for v in vals:
-                if v in used: continue
+                if v in used:
+                    continue
                 matches = rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
                 group = [m[0] for m in matches]
                 for g in group:
@@ -331,7 +372,6 @@ implementation:
                     used.add(g)
             return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
 
-        # ---------------- outlier helpers ----------------
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
             if not numeric_cols:
                 return df, 0
@@ -360,7 +400,6 @@ implementation:
                 df2[c] = df2[c].clip(lower=lower[c], upper=upper[c])
             return df2, 0
 
-        # --------------- choose scaler heuristics ----------------
         def choose_scaler_for_series(s):
             v = s.dropna()
             if v.empty:
@@ -378,7 +417,6 @@ implementation:
                 return RobustScaler()
             return StandardScaler()
 
-        # ---------------- choose categorical encoder ----------------
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
             n = len(series)
             nunique = series.nunique(dropna=True)
@@ -400,7 +438,6 @@ implementation:
                     enc = OrdinalEncoder()
                     return 'ordinal', enc, {}
 
-        # --------------- safe target-encoding fit (k-fold) ----------------
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
             X_col = df[col].astype(object).fillna('__NA__')
             global_mean = y.mean()
@@ -417,13 +454,13 @@ implementation:
                 smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
             return oof.fillna(global_mean), smooth_map, global_mean
 
-        # ----------------- Preprocessor object ----------------
         class Preprocessor:
             def __init__(self):
                 self.num_cols = []
                 self.cat_cols = []
                 self.col_config = {}
                 self.global_metadata = {}
+            
             def fit(self, df, y=None, config=None):
                 self.global_metadata['config'] = config or {}
                 nrows = len(df)
@@ -474,6 +511,7 @@ implementation:
                 self.global_metadata['num_cols'] = self.num_cols
                 self.global_metadata['cat_cols'] = self.cat_cols
                 return self
+            
             def transform(self, df, training_mode=False):
                 df = df.copy()
                 temp_df = df.copy()
@@ -606,13 +644,14 @@ implementation:
                     else:
                         df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
                 return df
+            
             def save(self, path):
                 joblib.dump(self, path)
+            
             @staticmethod
             def load(path):
                 return joblib.load(path)
 
-        # ---------------- main execution ----------------
         parser = argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
@@ -655,7 +694,6 @@ implementation:
             df = read_with_pandas(in_path)
             print("Loaded shape:", df.shape)
 
-            # --- BEFORE PREPROCESSING: preview + diagnostics ---
             print("\n===== BEFORE PREPROCESSING: DATA PREVIEW =====")
             try:
                 print(df.head(preview_rows).to_string(index=False))
@@ -681,7 +719,6 @@ implementation:
                 print("-" * 40)
             print("===== END BEFORE PREPROCESSING =====\n")
 
-            # basic cleaning
             before = len(df)
             df = df.drop_duplicates(keep='first')
             print(f"Removed duplicates: {before - len(df)} rows dropped")
@@ -693,7 +730,6 @@ implementation:
             df = df[df[target_col].notna()].reset_index(drop=True)
             print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
 
-            # advanced conversion & date extraction
             print("Converting object columns to numeric where possible...")
             df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
             print("Conversion report:", json.dumps(conv_report, default=str)[:1000])
@@ -719,7 +755,6 @@ implementation:
             print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
             X_processed = pre.transform(X_df_init, training_mode=True)
 
-            # --- AFTER PREPROCESSING: build readable summary and print preview ---
             print("\n===== AFTER PREPROCESSING: TRANSFORMATION SUMMARY =====")
             preproc_summary = []
             orig_num_cols = pre.global_metadata.get('num_cols', []) or []
@@ -780,7 +815,6 @@ implementation:
                     print(f"  • Notes: {entry['notes']}")
                 print("-" * 60)
 
-            # Save processed preview and preprocessing summary files
             try:
                 preview_obj = X_processed.head(preview_rows)
                 preview_obj.to_json(preview_path, orient="records", indent=2, force_ascii=False)
@@ -795,7 +829,6 @@ implementation:
             except Exception as e:
                 print("Warning: could not write preprocessing summary:", e)
 
-            # finalize dtype optimization (downcast numeric columns)
             print("Optimizing numeric dtypes...")
             for col in X_processed.select_dtypes(include=[np.number]).columns:
                 col_min = X_processed[col].min(skipna=True)
@@ -815,12 +848,16 @@ implementation:
                 except Exception:
                     X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
 
-            # write outputs
             def makedirs_for(p):
                 d = os.path.dirname(p)
                 if d and not os.path.exists(d):
                     os.makedirs(d, exist_ok=True)
-            makedirs_for(out_X); makedirs_for(out_y); makedirs_for(preproc_path); makedirs_for(meta_path); makedirs_for(summary_path); makedirs_for(preview_path)
+            makedirs_for(out_X)
+            makedirs_for(out_y)
+            makedirs_for(preproc_path)
+            makedirs_for(meta_path)
+            makedirs_for(summary_path)
+            makedirs_for(preview_path)
 
             X_processed.to_parquet(out_X, index=False)
             print("Wrote X parquet:", out_X)
@@ -849,34 +886,36 @@ implementation:
             print("ERROR during preprocessing:", exc, file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
+        EOF
+        python3 /tmp/preprocess_script.py "$@"
     args:
       - --in_file
-      - {inputPath: in_file}
+      - inputPath: in_file
       - --target_column
-      - {inputValue: target_column}
+      - inputValue: target_column
       - --outlier_strategy
-      - {inputValue: outlier_strategy}
+      - inputValue: outlier_strategy
       - --outlier_fold
-      - {inputValue: outlier_fold}
+      - inputValue: outlier_fold
       - --max_knn_rows
-      - {inputValue: max_knn_rows}
+      - inputValue: max_knn_rows
       - --numeric_detection_threshold
-      - {inputValue: numeric_detection_threshold}
+      - inputValue: numeric_detection_threshold
       - --rare_threshold
-      - {inputValue: rare_threshold}
+      - inputValue: rare_threshold
       - --enable_string_similarity
-      - {inputValue: enable_string_similarity}
+      - inputValue: enable_string_similarity
       - --preview_rows
-      - {inputValue: preview_rows}
+      - inputValue: preview_rows
       - --X
-      - {outputPath: X}
+      - outputPath: X
       - --y
-      - {outputPath: y}
+      - outputPath: y
       - --preprocessor
-      - {outputPath: preprocessor}
+      - outputPath: preprocessor
       - --preprocess_metadata
-      - {outputPath: preprocess_metadata}
+      - outputPath: preprocess_metadata
       - --preprocessing_summary
-      - {outputPath: preprocessing_summary}
+      - outputPath: preprocessing_summary
       - --processed_preview
-      - {outputPath: processed_preview}
+      - outputPath: processed_preview
