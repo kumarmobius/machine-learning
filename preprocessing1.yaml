@@ -729,6 +729,36 @@ implementation:
             df = read_with_pandas(in_path)
             print("Loaded shape:", df.shape)
 
+            # --- BEFORE PREPROCESSING: preview + basic column diagnostics ---
+            print("\n===== BEFORE PREPROCESSING: DATA PREVIEW =====")
+            try:
+                # preview_rows is from parser args
+                preview_n = preview_rows if 'preview_rows' in locals() else 10
+                print(df.head(preview_n).to_string(index=False))
+            except Exception:
+                print(df.head(min(10, len(df))))
+            
+            print("\n===== BEFORE PREPROCESSING: COLUMN DIAGNOSTICS =====")
+            for col in df.columns:
+                try:
+                    non_null = int(df[col].notna().sum())
+                    missing = int(df[col].isna().sum())
+                    unique = int(df[col].nunique(dropna=True))
+                    dtype = str(df[col].dtype)
+                except Exception:
+                    non_null = df[col].notna().sum()
+                    missing = df[col].isna().sum()
+                    unique = df[col].nunique(dropna=True)
+                    dtype = str(df[col].dtype)
+                print(f"Column: {col}")
+                print(f"  • Type: {dtype}")
+                print(f"  • Non-null: {non_null} / {len(df)}")
+                print(f"  • Missing: {missing}")
+                print(f"  • Unique (non-null): {unique}")
+                print("-" * 40)
+            print("===== END BEFORE PREPROCESSING =====\n")
+
+
             # basic cleaning
             before = len(df)
             df = df.drop_duplicates(keep='first')
