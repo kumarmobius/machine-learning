@@ -1,4 +1,4 @@
-name: Load & Preprocess
+name: Load & Preprocess test
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -800,6 +800,96 @@ implementation:
             # transform data
             print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
             X_processed = pre.transform(X_df_init, training_mode=True)
+
+            # --- AFTER PREPROCESSING: build readable column-wise summary from pre.col_config ---
+            print("\n===== AFTER PREPROCESSING: TRANSFORMATION SUMMARY =====")
+            preproc_summary = []
+            orig_num_cols = pre.global_metadata.get('num_cols', []) or []
+            orig_cat_cols = pre.global_metadata.get('cat_cols', []) or []
+            orig_cols = list(dict.fromkeys(orig_num_cols + orig_cat_cols))  # preserve order
+            
+            for col in orig_cols:
+                cfg = pre.col_config.get(col, {})
+                entry = {
+                    "column": col,
+                    "original_dtype": str(X_df_init[col].dtype) if col in X_df_init.columns else "N/A",
+                    "imputer": None,
+                    "scaler": None,
+                    "encoder": None,
+                    "rare_values_count": None,
+                    "ohe_generated_columns": None,
+                    "notes": None
+                }
+            
+                # imputer
+                imputer_info = cfg.get('imputer')
+                if isinstance(imputer_info, (list, tuple)):
+                    entry['imputer'] = imputer_info[0]
+                elif isinstance(imputer_info, dict):
+                    entry['imputer'] = str(imputer_info)
+                else:
+                    entry['imputer'] = str(imputer_info)
+            
+                # scaler
+                sc_obj = cfg.get('scaler_obj')
+                if sc_obj is None:
+                    entry['scaler'] = None
+                else:
+                    try:
+                        entry['scaler'] = type(sc_obj).__name__
+                    except Exception:
+                        entry['scaler'] = str(sc_obj)
+            
+                # encoder and encoder specifics
+                enc = cfg.get('encoder_type')
+                entry['encoder'] = enc if enc is not None else None
+                if cfg.get('rare_values') is not None:
+                    try:
+                        entry['rare_values_count'] = len(cfg.get('rare_values', []))
+                    except Exception:
+                        entry['rare_values_count'] = None
+                if cfg.get('ohe_columns'):
+                    entry['ohe_generated_columns'] = cfg.get('ohe_columns')
+            
+                # target mapping / count map
+                if cfg.get('target_mapping'):
+                    entry['notes'] = f"target_mapping (n_keys={len(cfg.get('target_mapping',{}))})"
+                elif cfg.get('count_map'):
+                    entry['notes'] = "count_map applied"
+            
+                preproc_summary.append(entry)
+            
+                # print human-readable
+                print(f"Column: {entry['column']}")
+                print(f"  • Original dtype: {entry['original_dtype']}")
+                print(f"  • Imputer: {entry['imputer']}")
+                print(f"  • Scaler: {entry['scaler']}")
+                print(f"  • Encoder: {entry['encoder']}")
+                if entry['rare_values_count'] is not None:
+                    print(f"  • Rare values collapsed: {entry['rare_values_count']}")
+                if entry['ohe_generated_columns']:
+                    ncols = len(entry['ohe_generated_columns'])
+                    print(f"  • OneHot produced {ncols} columns (example names): {entry['ohe_generated_columns'][:5]}")
+                if entry['notes']:
+                    print(f"  • Notes: {entry['notes']}")
+                print("-" * 60)
+            
+            # Save summary into metadata (augment existing metadata later when writing file)
+            try:
+                if 'metadata' not in locals():
+                    metadata = {}
+                metadata['preprocessing_detail'] = preproc_summary
+            except Exception:
+                pass
+            
+            # Print processed DF preview
+            print("\n===== AFTER PREPROCESSING: DATA PREVIEW =====")
+            try:
+                print(X_processed.head(preview_rows).to_string(index=False))
+            except Exception:
+                print(X_processed.head(min(10, len(X_processed))))
+            print("===== END AFTER PREPROCESSING =====\n")
+            
 
             # Convert any remaining non-numeric columns to numeric where possible (safe)
             # and ensure no object dtype remains except for rare cases
