@@ -1,4 +1,4 @@
-name: Load & Preprocess
+name: Load & Preprocess changes
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -483,6 +483,7 @@ implementation:
 
             def transform(self, df, training_mode=False):
                 df = df.copy()
+                cfg = self.global_metadata.get('config') or {}
                 temp_df = df.copy()
                 temp_filled_cols = []
                 for c in self.num_cols:
@@ -516,7 +517,11 @@ implementation:
                 scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
                 need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'knn']
                 if need_knn:
-                    knn = KNNImputer(n_neighbors=self.col_config[self.num_cols[0]]['imputer'][1].get('n_neighbors', 5) if isinstance(self.col_config[self.num_cols[0]]['imputer'], tuple) and self.col_config[self.num_cols[0]]['imputer'][0] == 'knn' else 5)
+                    knn_neighbors = 5
+                    base_imp = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
+                    if isinstance(base_imp, dict):
+                        knn_neighbors = base_imp.get('n_neighbors', 5)
+                    knn = KNNImputer(n_neighbors=knn_neighbors)
                     imputed_scaled = knn.fit_transform(scaled_df)
                     imputed_scaled_df = pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
                     for c in self.num_cols:
@@ -528,7 +533,11 @@ implementation:
                         df[c] = inv
                 need_iter = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'iterative']
                 if need_iter:
-                    iter_imp = IterativeImputer(max_iter=self.col_config[self.num_cols[0]]['imputer'][1].get('max_iter', 10), random_state=0)
+                    iter_max_iter = 10
+                    base_imp2 = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
+                    if isinstance(base_imp2, dict):
+                        iter_max_iter = base_imp2.get('max_iter', 10)
+                    iter_imp = IterativeImputer(max_iter=iter_max_iter, random_state=0)
                     iter_out = iter_imp.fit_transform(df[self.num_cols])
                     df[self.num_cols] = pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
                     for c in need_iter:
@@ -538,11 +547,12 @@ implementation:
                     if cfg['imputer'][0] == 'simple_median':
                         imp = cfg['imputer'][1]
                         df[c] = imp.transform(df[[c]])
-                if self.global_metadata['config'].get('outlier_strategy', 'drop_iqr') == 'drop_iqr':
-                    df, n_removed = drop_outliers_iqr(df, self.num_cols, fold=self.global_metadata['config'].get('outlier_fold', 1.5))
+                if cfg.get('outlier_strategy', 'drop_iqr') == 'drop_iqr':
+                    df, n_removed = drop_outliers_iqr(df, self.num_cols, fold=cfg.get('outlier_fold', 1.5))
                     self.global_metadata['outliers_removed'] = int(n_removed)
-                elif self.global_metadata['config'].get('outlier_strategy') == 'winsorize':
-                    df, _ = winsorize_df(df, self.num_cols, fold=self.global_metadata['config'].get('outlier_fold', 1.5))
+                elif cfg.get('outlier_strategy') == 'winsorize':
+                    df, _ = winsorize_df(df, self.num_cols, fold=cfg.get('outlier_fold', 1.5))
+
                 for c in self.num_cols:
                     sc = self.col_config[c].get('scaler_obj')
                     if sc is None:
@@ -566,7 +576,7 @@ implementation:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
                     df[c] = collapsed
                     cfg['rare_values'] = list(rare_set)
-                    if self.global_metadata['config'].get('enable_string_similarity', False) and cfg['n_unique'] > 20:
+                    if cfg.get('enable_string_similarity', False) and cfg['n_unique'] > 20:
                         grouped, mapping = string_similarity_group(df[c], score_threshold=90)
                         df[c] = grouped
                         cfg['string_similarity_map'] = mapping
