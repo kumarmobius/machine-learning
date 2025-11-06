@@ -1,4 +1,4 @@
-name: Load & Preprocess test
+name: Load & Preprocess
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -8,6 +8,8 @@ description: |
     - y (parquet)
     - preprocessor (pickle) - fitted preprocessing object for inference
     - preprocess_metadata (json) - decisions and diagnostics
+    - preprocessing_summary (json) - per-column readable summary
+    - processed_preview (json) - df.head() after preprocessing
 inputs:
   - {name: in_file, type: Data, description: "Path to the downloaded file or directory (connect CDN Generic Downloader: out_file)"}
   - {name: target_column, type: String, description: "Name of the target column in the dataset (rows with null target will be dropped)"}
@@ -23,6 +25,8 @@ outputs:
   - {name: y, type: Data, description: "Target column (parquet) after preprocessing"}
   - {name: preprocessor, type: Data, description: "Pickle file with fitted preprocessor (for inference)"}
   - {name: preprocess_metadata, type: Data, description: "JSON metadata describing chosen preprocessing steps"}
+  - {name: preprocessing_summary, type: Data, description: "Readable JSON summary of per-column preprocessing decisions"}
+  - {name: processed_preview, type: Data, description: "JSON preview of processed DataFrame (df.head())"}
 implementation:
   container:
     image: python:3.10-slim
@@ -31,14 +35,11 @@ implementation:
       - -u
       - -c
       - |
-        import argparse
-        import os
-        import sys
-        import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
+        # Full end-to-end preprocessing component
+        import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math, inspect
         from datetime import datetime
         from collections import Counter, defaultdict
 
-        # Install needed packages if missing
         def pip_install(pkgs):
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
 
@@ -66,7 +67,18 @@ implementation:
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 
-        # -------------- Robust file loader (handles dir/gz/zip/sniff) --------------
+        # ---------- helper: robust OneHot creation compatible across sklearn versions
+        def make_onehot(handle_unknown='ignore'):
+            try:
+                params = inspect.signature(OneHotEncoder).parameters
+                if 'sparse_output' in params:
+                    return OneHotEncoder(sparse_output=False, handle_unknown=handle_unknown)
+                else:
+                    return OneHotEncoder(sparse=False, handle_unknown=handle_unknown)
+            except Exception:
+                return OneHotEncoder(handle_unknown=handle_unknown)
+
+        # ---------- robust file loader (dir/gz/zip/sniff)
         def sample_file_bytes(path, n=8192):
             try:
                 with open(path, "rb") as fh:
@@ -74,7 +86,6 @@ implementation:
             except Exception:
                 return b""
 
-        # a
         def is_likely_json(sample_bytes):
             if not sample_bytes:
                 return False
@@ -84,24 +95,17 @@ implementation:
                 return False
             if not txt:
                 return False
-        
-            # use chr() to avoid embedding literal { or [ in YAML
             open_brace = chr(123)   # '{'
             open_bracket = chr(91)  # '['
             newline = chr(10)
-        
             first_char = txt[0]
             if first_char == open_brace or first_char == open_bracket:
                 return True
-        
             if (newline + open_brace) in txt or (newline + open_bracket) in txt:
                 return True
-        
             return False
 
-
         def read_with_pandas(path):
-            # If directory, pick largest/only file
             if os.path.isdir(path):
                 entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
                 if not entries:
@@ -117,7 +121,6 @@ implementation:
 
             ext = os.path.splitext(path)[1].lower()
 
-            # gz
             if ext == ".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
                 try:
                     with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
@@ -135,7 +138,6 @@ implementation:
                 except Exception:
                     pass
 
-            # zip
             if ext == ".zip":
                 with zipfile.ZipFile(path, "r") as z:
                     members = [n for n in z.namelist() if not n.endswith("/")]
@@ -151,7 +153,6 @@ implementation:
                             with z.open(member) as fh2:
                                 return pd.read_csv(io.TextIOWrapper(fh2, encoding="utf-8"))
 
-            # extension quick attempts
             try:
                 if ext == ".csv":
                     return pd.read_csv(path)
@@ -173,13 +174,11 @@ implementation:
             except Exception:
                 pass
 
-            # sniff parquet
             try:
                 return pd.read_parquet(path, engine="auto")
             except Exception:
                 pass
 
-            # sample-based sniff
             sample = sample_file_bytes(path)
             if is_likely_json(sample):
                 try:
@@ -193,7 +192,7 @@ implementation:
 
             raise ValueError("Unsupported or unreadable file format: " + path)
 
-        # -------------- Advanced alphanumeric parsing -----------------------------
+        # ---------- advanced alphanumeric parsing ----------
         CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
         MULTIPLIER_MAP = {'k':1e3, 'm':1e6, 'b':1e9, 't':1e12}
         TOKEN_RE = re.compile(
@@ -212,7 +211,6 @@ implementation:
             if orig == '' or orig.lower() in {'nan','none','null','na'}:
                 return np.nan
             tmp = re.sub(CURRENCY_SYMBOLS_REGEX, '', orig)
-            # percent
             if tmp.strip().endswith('%'):
                 try:
                     num = float(tmp.strip().rstrip('%').replace(',', '').replace(' ', ''))
@@ -297,7 +295,6 @@ implementation:
                     full_parsed = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True, utc=False)
                     df[col + "_orig"] = df[col]
                     df[col] = full_parsed
-                    # extract features
                     df[col + "_year"] = df[col].dt.year
                     df[col + "_month"] = df[col].dt.month
                     df[col + "_day"] = df[col].dt.day
@@ -311,7 +308,7 @@ implementation:
                     report['skipped'].append({'col': col, 'parsable_fraction': parsable_frac})
             return df, report
 
-        # ----------------- Rare label & string similarity helpers -----------------
+        # ------------- rare labels & string-similarity grouping -------------------
         def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
             counts = series.value_counts(dropna=False)
             n = len(series)
@@ -322,21 +319,19 @@ implementation:
             return series.map(lambda x: "__RARE__" if x in rare else x), rare
 
         def string_similarity_group(series, score_threshold=90):
-            # greedily cluster unique values by similarity using rapidfuzz
             vals = [v for v in pd.Series(series.dropna().unique()).astype(str)]
             mapping = {}
             used = set()
             for v in vals:
                 if v in used: continue
                 matches = rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
-                # matches: list of (match,score,idx)
                 group = [m[0] for m in matches]
                 for g in group:
                     mapping[g] = v
                     used.add(g)
             return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
 
-        # ----------------- Outlier handling --------------------------------------
+        # ---------------- outlier helpers ----------------
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
             if not numeric_cols:
                 return df, 0
@@ -365,104 +360,75 @@ implementation:
                 df2[c] = df2[c].clip(lower=lower[c], upper=upper[c])
             return df2, 0
 
-        # ----------------- Scaler selection --------------------------------------
+        # --------------- choose scaler heuristics ----------------
         def choose_scaler_for_series(s):
-            # input: pandas Series numeric (no NaNs)
-            # compute skewness & outlier measure
             v = s.dropna()
             if v.empty:
-                return StandardScaler()  # default
-            skew = float(v.skew())
-            kurt = float(v.kurtosis()) if len(v) > 3 else 0.0
-            # proportion of extreme values beyond 3*std
+                return StandardScaler()
+            skew = float(v.skew()) if len(v)>2 else 0.0
+            kurt = float(v.kurtosis()) if len(v)>3 else 0.0
             if v.std(ddof=0) == 0:
                 return StandardScaler()
             extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
-            # if bounded 0..1
             if (v.min() >= 0.0 and v.max() <= 1.0):
                 return MinMaxScaler()
             if abs(skew) >= 1.0:
-                # use power transformer then standardize
                 return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', StandardScaler())])
             if extreme_frac > 0.01 or abs(kurt) > 10:
                 return RobustScaler()
-            # default
             return StandardScaler()
 
-        # ----------------- Categorical encoder chooser ---------------------------
+        # ---------------- choose categorical encoder ----------------
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
-            # returns tuple (encoder_name, encoder_obj, encoder_args)
             n = len(series)
             nunique = series.nunique(dropna=True)
-            missing_frac = series.isna().mean()
-            top_freq = series.value_counts(normalize=True, dropna=True).iloc[0] if nunique>0 else 1.0
             high_card = (nunique > max(50, 0.05 * n))
-            # Rare label collapse recommended first
-            # Choose encoder:
             if high_card:
-                # prefer TargetEncoder if target present and training; else Count/Freq encoder
                 if target_series is not None and train_mode:
                     enc = ce.TargetEncoder(cols=[col], smoothing=0.3)
                     return 'target', enc, {}
                 else:
-                    # count/freq
-                    def freq_map(s):
-                        c = s.value_counts()
-                        return s.map(c.to_dict())
                     return 'count', None, {}
             else:
-                # low-cardinality
                 if nunique <= 10:
-                    # OneHot good
-                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                    enc = make_onehot()
                     return 'onehot', enc, {}
-                # medium card
                 if target_series is not None and train_mode:
                     enc = ce.TargetEncoder(cols=[col], smoothing=0.3)
                     return 'target', enc, {}
                 else:
-                    # ordinal fallback
                     enc = OrdinalEncoder()
                     return 'ordinal', enc, {}
 
-        # ----------------- Target-aware encoders: safe K-fold target encoding ----
+        # --------------- safe target-encoding fit (k-fold) ----------------
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
-            # Returns mapping dict to mean-encoded values + global mean
-            # K-fold out-of-fold target encoding to avoid leakage
             X_col = df[col].astype(object).fillna('__NA__')
             global_mean = y.mean()
             oof = pd.Series(index=df.index, dtype=float)
             kf = KFold(n_splits=min(n_splits, max(2, len(df)//10)), shuffle=True, random_state=random_state)
             for tr_idx, val_idx in kf.split(df):
-                grp = X_col.iloc[tr_idx].map(lambda x: x)
                 means = y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
                 oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: means.get(v, global_mean))
-            # smoothing: blend per category count with global mean
             counts = X_col.value_counts()
             smooth_map = {}
             for cat, cnt in counts.items():
                 cat_mean = y[X_col==cat].mean() if cnt>0 else global_mean
-                # smoothed value
                 alpha = cnt / (cnt + smoothing)
                 smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
             return oof.fillna(global_mean), smooth_map, global_mean
 
-        # ----------------- Preprocessor object saved for inference ----------------
+        # ----------------- Preprocessor object ----------------
         class Preprocessor:
             def __init__(self):
-                # store per-column pipeline objects & mappings
                 self.num_cols = []
                 self.cat_cols = []
-                self.col_config = {}  # col -> dict with imputer/scaler/encoder etc.
+                self.col_config = {}
                 self.global_metadata = {}
             def fit(self, df, y=None, config=None):
-                # config contains thresholds and flags (populated by main)
                 self.global_metadata['config'] = config or {}
                 nrows = len(df)
-                # detect cols
                 self.num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
                 self.cat_cols = [c for c in df.columns if c not in self.num_cols]
-                # Fit per numeric column
                 for c in self.num_cols:
                     s = df[c]
                     cfg = {}
@@ -471,7 +437,6 @@ implementation:
                     cfg['n_unique'] = int(s.nunique(dropna=True))
                     cfg['skew'] = float(s.dropna().skew()) if s.dropna().shape[0]>2 else 0.0
                     cfg['kurtosis'] = float(s.dropna().kurtosis()) if s.dropna().shape[0]>3 else 0.0
-                    # choose imputer
                     if missing_frac == 0:
                         cfg['imputer'] = ('none', None)
                     elif missing_frac < 0.02:
@@ -479,138 +444,106 @@ implementation:
                         imp.fit(np.array(s).reshape(-1,1))
                         cfg['imputer'] = ('simple_median', imp)
                     else:
-                        # prefer KNN if small dataset and fraction moderate
                         if nrows <= config.get('max_knn_rows', 5000) and missing_frac < 0.25:
                             cfg['imputer'] = ('knn', {'n_neighbors':5})
                         else:
                             cfg['imputer'] = ('iterative', {'max_iter':10, 'random_state':0})
-                    # choose scaler (fit later after imputation)
                     cfg['scaler_choice'] = 'auto'
                     self.col_config[c] = cfg
-                # Fit per categorical column
                 for c in self.cat_cols:
                     s = df[c].astype(object)
                     cfg = {}
                     cfg['n_unique'] = int(s.nunique(dropna=True))
                     cfg['missing_frac'] = float(s.isna().mean())
                     cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
-                    # Rare collapse threshold
                     cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.01)
-                    # Choose encoder
                     enc_name, enc_obj, enc_args = choose_categorical_encoder(c, s, (y if y is not None else None), train_mode=(y is not None))
                     cfg['encoder_type'] = enc_name
-                    cfg['encoder_obj'] = enc_obj  # sklearn / ce objects or None for count
+                    cfg['encoder_obj'] = enc_obj
                     self.col_config[c] = cfg
-                # Fit target-based encoders if present
                 if y is not None:
                     for c in self.cat_cols:
                         cfg = self.col_config[c]
                         if cfg['encoder_type'] == 'target':
-                            # use kfold target encoding with smoothing
                             _, mapping, global_mean = fit_target_encoder_kfold(df, c, y, n_splits=5)
                             cfg['target_mapping'] = mapping
                             cfg['target_global_mean'] = float(global_mean)
                         elif cfg['encoder_type'] == 'count':
                             counts = df[c].astype(object).value_counts().to_dict()
                             cfg['count_map'] = counts
-                # store numeric col order
                 self.global_metadata['num_cols'] = self.num_cols
                 self.global_metadata['cat_cols'] = self.cat_cols
                 return self
-
             def transform(self, df, training_mode=False):
                 df = df.copy()
-                # apply numeric imputers and scalers per the config
-                # first, handle numeric columns: create working copy
-                # We'll perform a two-stage approach for KNN/Iterative: temporary simple -> scaling -> impute -> inverse
-                # Step A: temporary simple fill for columns that need KNN/Iterative
                 temp_df = df.copy()
                 temp_filled_cols = []
                 for c in self.num_cols:
                     cfg = self.col_config.get(c, {})
                     imputer_info = cfg.get('imputer', ('none', None))
                     if imputer_info[0] in ('knn','iterative'):
-                        # temp median fill
                         med = temp_df[c].median()
                         temp_df[c] = temp_df[c].fillna(med)
                         temp_filled_cols.append(c)
-                # Step B: choose scalers for numeric columns using temp_filled data
                 scaler_objs = {}
                 for c in self.num_cols:
                     sample = temp_df[c]
                     scaler = choose_scaler_for_series(sample)
-                    # fit scaler on temp_filled data
                     try:
-                        if isinstance(scaler, Pipeline):
-                            scaler.fit(sample.values.reshape(-1,1))
-                        else:
-                            scaler.fit(sample.values.reshape(-1,1))
+                        scaler.fit(sample.values.reshape(-1,1))
                     except Exception:
-                        # fallback
                         scaler = StandardScaler()
                         scaler.fit(sample.values.reshape(-1,1))
                     scaler_objs[c] = scaler
                     self.col_config[c]['scaler_obj'] = scaler
-                # Step C: apply KNN/Iterative using scaled values for relevant cols
-                # Build matrix for numeric columns
-                num_matrix = temp_df[self.num_cols].copy()
-                # scale each column independently (so KNN distance is balanced)
-                scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
-                for i, c in enumerate(self.num_cols):
-                    sc = scaler_objs[c]
-                    col_vals = num_matrix[c].values.reshape(-1,1)
-                    try:
-                        scaled_col = sc.transform(col_vals).reshape(-1)
-                    except Exception:
-                        scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
-                    scaled_matrix[:, i] = scaled_col
-                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
-                # For columns requiring knn/iterative, apply
-                # KNN on scaled space (only numeric columns are used)
-                # We'll apply KNN imputation columnwise using sklearn KNNImputer on whole scaled_df
-                # Identify columns that need KNN
+                num_matrix = temp_df[self.num_cols].copy() if self.num_cols else pd.DataFrame(index=df.index)
+                if not num_matrix.empty:
+                    scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
+                    for i, c in enumerate(self.num_cols):
+                        sc = scaler_objs[c]
+                        col_vals = num_matrix[c].values.reshape(-1,1)
+                        try:
+                            scaled_col = sc.transform(col_vals).reshape(-1)
+                        except Exception:
+                            scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
+                        scaled_matrix[:, i] = scaled_col
+                    scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
+                else:
+                    scaled_df = pd.DataFrame(index=df.index)
                 need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='knn']
-                if need_knn:
-                    knn = KNNImputer(n_neighbors= self.col_config[self.num_cols[0]]['imputer'][1].get('n_neighbors',5) if isinstance(self.col_config[self.num_cols[0]]['imputer'], tuple) and self.col_config[self.num_cols[0]]['imputer'][0]=='knn' else 5)
+                if need_knn and not scaled_df.empty:
+                    knn = KNNImputer(n_neighbors=5)
                     imputed_scaled = knn.fit_transform(scaled_df)
                     imputed_scaled_df = pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
-                    # inverse transform back into original units for all numeric columns
                     for c in self.num_cols:
                         sc = scaler_objs[c]
                         try:
                             inv = sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
                         except Exception:
-                            inv = sc.fit_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
+                            inv = imputed_scaled_df[c].values
                         df[c] = inv
-                # For iterative imputer, apply on original numeric matrix (after simple temp fill and scaling)
                 need_iter = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='iterative']
                 if need_iter:
-                    # apply iterative imputer on original numeric columns (fit on temp-filled matrix)
-                    iter_imp = IterativeImputer(max_iter=self.col_config[self.num_cols[0]]['imputer'][1].get('max_iter',10), random_state=0)
+                    iter_imp = IterativeImputer(max_iter=10, random_state=0)
                     iter_out = iter_imp.fit_transform(df[self.num_cols])
                     df[self.num_cols] = pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
-                    # store imputer object for future use
                     for c in need_iter:
                         self.col_config[c]['imputer_obj'] = iter_imp
-                # Apply simple imputers for remaining columns
                 for c in self.num_cols:
                     cfg = self.col_config[c]
                     if cfg['imputer'][0] == 'simple_median':
                         imp = cfg['imputer'][1]
-                        df[c] = imp.transform(df[[c]])
+                        try:
+                            df[c] = imp.transform(df[[c]])
+                        except Exception:
+                            df[c] = df[c].fillna(df[c].median())
                     elif cfg['imputer'][0] == 'none':
                         pass
-                    elif cfg['imputer'][0] == 'knn':
-                        # already handled via KNN imputed whole numeric block above if need_knn present
-                        pass
-                    # iterative already handled
-                # After imputation, optionally do outlier handling (global)
                 if self.global_metadata['config'].get('outlier_strategy','drop_iqr') == 'drop_iqr':
                     df, n_removed = drop_outliers_iqr(df, self.num_cols, fold=self.global_metadata['config'].get('outlier_fold',1.5))
                     self.global_metadata['outliers_removed'] = int(n_removed)
                 elif self.global_metadata['config'].get('outlier_strategy') == 'winsorize':
                     df, _ = winsorize_df(df, self.num_cols, fold=self.global_metadata['config'].get('outlier_fold',1.5))
-                # Fit/apply scalers finally (on imputed data)
                 for c in self.num_cols:
                     sc = self.col_config[c].get('scaler_obj')
                     if sc is None:
@@ -619,46 +552,40 @@ implementation:
                         transformed = sc.transform(df[[c]].values)
                         df[c] = transformed.reshape(-1)
                     except Exception:
-                        # if scaler is a Pipeline with PowerTransformer + StandardScaler
                         try:
                             df[c] = sc.fit_transform(df[[c]].values).reshape(-1)
                         except Exception:
-                            # fallback: standard scale manually
                             df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
-                    # save scaler for inference
                     self.col_config[c]['scaler_obj'] = sc
-                # Categorical columns: apply RareLabel + encoders
-                for c in self.cat_cols:
+                for c in list(self.cat_cols):
                     cfg = self.col_config[c]
                     s = df[c].astype(object)
-                    # rare label collapse
                     rare_thresh = cfg.get('rare_threshold_frac', 0.01)
-                    # If value is fraction between 0 and 1, interpret as fraction else treat as count if >=1
                     if rare_thresh < 1.0:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
                     else:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
                     df[c] = collapsed
                     cfg['rare_values'] = list(rare_set)
-                    # optional string similarity grouping (only if enabled)
                     if self.global_metadata['config'].get('enable_string_similarity', False) and cfg['n_unique'] > 20:
                         grouped, mapping = string_similarity_group(df[c], score_threshold=90)
                         df[c] = grouped
                         cfg['string_similarity_map'] = mapping
-                    # now encoder
                     enc_type = cfg.get('encoder_type')
                     if enc_type == 'onehot':
-                        # fit OneHotEncoder on column and produce new columns
-                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                        ohe = make_onehot()
                         resh = df[[c]].astype(str)
-                        ohe.fit(resh)
-                        arr = ohe.transform(resh)
-                        cols = [f"{c}__{cat}" for cat in ohe.categories_[0]]
-                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
-                        # drop original and concat
-                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
-                        cfg['encoder_obj'] = ohe
-                        cfg['ohe_columns'] = cols
+                        try:
+                            ohe.fit(resh)
+                            arr = ohe.transform(resh)
+                            cats = ohe.categories_[0] if hasattr(ohe, 'categories_') else []
+                            cols = [f"{c}__{cat}" for cat in cats]
+                            df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
+                            df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                            cfg['encoder_obj'] = ohe
+                            cfg['ohe_columns'] = cols
+                        except Exception:
+                            df[c] = df[c].astype('category').cat.codes.astype(float)
                     elif enc_type == 'ordinal':
                         ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
                         resh = df[[c]].astype(object)
@@ -673,24 +600,19 @@ implementation:
                         df[c] = df[c].map(lambda x: cnt_map.get(x, 0))
                         cfg['count_map'] = cnt_map
                     elif enc_type == 'target':
-                        # use mapping produced in fit
                         mapping = cfg.get('target_mapping', {})
                         global_mean = cfg.get('target_global_mean', 0.0)
                         df[c] = df[c].map(lambda x: mapping.get(x, global_mean))
                     else:
-                        # fallback: label encode
                         df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
-                # finished transformations
                 return df
-
             def save(self, path):
                 joblib.dump(self, path)
-
             @staticmethod
             def load(path):
                 return joblib.load(path)
 
-        # ----------------- Main execution starts here ---------------------------
+        # ---------------- main execution ----------------
         parser = argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
@@ -705,6 +627,8 @@ implementation:
         parser.add_argument('--y', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--preprocess_metadata', type=str, required=True)
+        parser.add_argument('--preprocessing_summary', type=str, required=True)
+        parser.add_argument('--processed_preview', type=str, required=True)
         args = parser.parse_args()
 
         try:
@@ -721,6 +645,8 @@ implementation:
             out_y = args.y
             preproc_path = args.preprocessor
             meta_path = args.preprocess_metadata
+            summary_path = args.preprocessing_summary
+            preview_path = args.processed_preview
 
             if not os.path.exists(in_path):
                 print("ERROR: input file does not exist:", in_path, file=sys.stderr)
@@ -729,15 +655,12 @@ implementation:
             df = read_with_pandas(in_path)
             print("Loaded shape:", df.shape)
 
-            # --- BEFORE PREPROCESSING: preview + basic column diagnostics ---
+            # --- BEFORE PREPROCESSING: preview + diagnostics ---
             print("\n===== BEFORE PREPROCESSING: DATA PREVIEW =====")
             try:
-                # preview_rows is from parser args
-                preview_n = preview_rows if 'preview_rows' in locals() else 10
-                print(df.head(preview_n).to_string(index=False))
+                print(df.head(preview_rows).to_string(index=False))
             except Exception:
                 print(df.head(min(10, len(df))))
-            
             print("\n===== BEFORE PREPROCESSING: COLUMN DIAGNOSTICS =====")
             for col in df.columns:
                 try:
@@ -758,7 +681,6 @@ implementation:
                 print("-" * 40)
             print("===== END BEFORE PREPROCESSING =====\n")
 
-
             # basic cleaning
             before = len(df)
             df = df.drop_duplicates(keep='first')
@@ -771,17 +693,15 @@ implementation:
             df = df[df[target_col].notna()].reset_index(drop=True)
             print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
 
-            # advanced alphanumeric conversion
+            # advanced conversion & date extraction
             print("Converting object columns to numeric where possible...")
             df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
             print("Conversion report:", json.dumps(conv_report, default=str)[:1000])
 
-            # detect dates and extract features
             print("Detecting date-like columns...")
             df, date_report = detect_and_extract_dates(df, date_parse_enabled=True)
             print("Date parse report:", json.dumps(date_report, default=str)[:1000])
 
-            # prepare preprocessor config
             config = {
                 'outlier_strategy': outlier_strategy,
                 'outlier_fold': outlier_fold,
@@ -791,23 +711,20 @@ implementation:
                 'enable_string_similarity': enable_string_similarity
             }
 
-            # build and fit preprocessor
             pre = Preprocessor()
             y_ser = df[[target_col]].copy()
             X_df_init = df.drop(columns=[target_col]).copy()
             pre.fit(X_df_init, y=y_ser[target_col] if not y_ser.empty else None, config=config)
 
-            # transform data
             print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
             X_processed = pre.transform(X_df_init, training_mode=True)
 
-            # --- AFTER PREPROCESSING: build readable column-wise summary from pre.col_config ---
+            # --- AFTER PREPROCESSING: build readable summary and print preview ---
             print("\n===== AFTER PREPROCESSING: TRANSFORMATION SUMMARY =====")
             preproc_summary = []
             orig_num_cols = pre.global_metadata.get('num_cols', []) or []
             orig_cat_cols = pre.global_metadata.get('cat_cols', []) or []
-            orig_cols = list(dict.fromkeys(orig_num_cols + orig_cat_cols))  # preserve order
-            
+            orig_cols = list(dict.fromkeys(orig_num_cols + orig_cat_cols))
             for col in orig_cols:
                 cfg = pre.col_config.get(col, {})
                 entry = {
@@ -820,8 +737,6 @@ implementation:
                     "ohe_generated_columns": None,
                     "notes": None
                 }
-            
-                # imputer
                 imputer_info = cfg.get('imputer')
                 if isinstance(imputer_info, (list, tuple)):
                     entry['imputer'] = imputer_info[0]
@@ -829,8 +744,6 @@ implementation:
                     entry['imputer'] = str(imputer_info)
                 else:
                     entry['imputer'] = str(imputer_info)
-            
-                # scaler
                 sc_obj = cfg.get('scaler_obj')
                 if sc_obj is None:
                     entry['scaler'] = None
@@ -839,8 +752,6 @@ implementation:
                         entry['scaler'] = type(sc_obj).__name__
                     except Exception:
                         entry['scaler'] = str(sc_obj)
-            
-                # encoder and encoder specifics
                 enc = cfg.get('encoder_type')
                 entry['encoder'] = enc if enc is not None else None
                 if cfg.get('rare_values') is not None:
@@ -850,16 +761,11 @@ implementation:
                         entry['rare_values_count'] = None
                 if cfg.get('ohe_columns'):
                     entry['ohe_generated_columns'] = cfg.get('ohe_columns')
-            
-                # target mapping / count map
                 if cfg.get('target_mapping'):
                     entry['notes'] = f"target_mapping (n_keys={len(cfg.get('target_mapping',{}))})"
                 elif cfg.get('count_map'):
                     entry['notes'] = "count_map applied"
-            
                 preproc_summary.append(entry)
-            
-                # print human-readable
                 print(f"Column: {entry['column']}")
                 print(f"  • Original dtype: {entry['original_dtype']}")
                 print(f"  • Imputer: {entry['imputer']}")
@@ -873,42 +779,29 @@ implementation:
                 if entry['notes']:
                     print(f"  • Notes: {entry['notes']}")
                 print("-" * 60)
-            
-            # Save summary into metadata (augment existing metadata later when writing file)
-            try:
-                if 'metadata' not in locals():
-                    metadata = {}
-                metadata['preprocessing_detail'] = preproc_summary
-            except Exception:
-                pass
-            
-            # Print processed DF preview
-            print("\n===== AFTER PREPROCESSING: DATA PREVIEW =====")
-            try:
-                print(X_processed.head(preview_rows).to_string(index=False))
-            except Exception:
-                print(X_processed.head(min(10, len(X_processed))))
-            print("===== END AFTER PREPROCESSING =====\n")
-            
 
-            # Convert any remaining non-numeric columns to numeric where possible (safe)
-            # and ensure no object dtype remains except for rare cases
-            for c in list(X_processed.columns):
-                if X_processed[c].dtype == 'object':
-                    try:
-                        X_processed[c] = pd.to_numeric(X_processed[c], errors='coerce')
-                    except Exception:
-                        pass
+            # Save processed preview and preprocessing summary files
+            try:
+                preview_obj = X_processed.head(preview_rows)
+                preview_obj.to_json(preview_path, orient="records", indent=2, force_ascii=False)
+                print("Wrote processed preview JSON:", preview_path)
+            except Exception as e:
+                print("Warning: could not write processed preview:", e)
 
-            # optimize numeric dtype
+            try:
+                with open(summary_path, "w", encoding="utf-8") as fh:
+                    json.dump(preproc_summary, fh, indent=2, ensure_ascii=False)
+                print("Wrote preprocessing summary JSON:", summary_path)
+            except Exception as e:
+                print("Warning: could not write preprocessing summary:", e)
+
+            # finalize dtype optimization (downcast numeric columns)
             print("Optimizing numeric dtypes...")
-            # downcast numeric columns
             for col in X_processed.select_dtypes(include=[np.number]).columns:
                 col_min = X_processed[col].min(skipna=True)
                 col_max = X_processed[col].max(skipna=True)
-                if pd.api.types.is_integer_dtype(X_processed[col].dtype) or np.allclose(X_processed[col].dropna(), np.round(X_processed[col].dropna())):
-                    # integer-like
-                    try:
+                try:
+                    if pd.api.types.is_integer_dtype(X_processed[col].dtype) or np.allclose(X_processed[col].dropna(), np.round(X_processed[col].dropna())):
                         if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
                             X_processed[col] = X_processed[col].astype('Int8')
                         elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
@@ -917,17 +810,17 @@ implementation:
                             X_processed[col] = X_processed[col].astype('Int32')
                         else:
                             X_processed[col] = X_processed[col].astype('Int64')
-                    except Exception:
+                    else:
                         X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
-                else:
+                except Exception:
                     X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
 
-            # Save outputs
+            # write outputs
             def makedirs_for(p):
                 d = os.path.dirname(p)
                 if d and not os.path.exists(d):
                     os.makedirs(d, exist_ok=True)
-            makedirs_for(out_X); makedirs_for(out_y); makedirs_for(preproc_path); makedirs_for(meta_path)
+            makedirs_for(out_X); makedirs_for(out_y); makedirs_for(preproc_path); makedirs_for(meta_path); makedirs_for(summary_path); makedirs_for(preview_path)
 
             X_processed.to_parquet(out_X, index=False)
             print("Wrote X parquet:", out_X)
@@ -935,7 +828,6 @@ implementation:
             y_ser.to_parquet(out_y, index=False)
             print("Wrote y parquet:", out_y)
 
-            # Save preprocessor and metadata
             pre.save(preproc_path)
             print("Saved preprocessor pickle:", preproc_path)
 
@@ -944,7 +836,7 @@ implementation:
                 'config': config,
                 'conversion_report': conv_report,
                 'date_report': date_report,
-                'col_config': {k: {kk:v for kk,v in ( (kk, (str(v) if not hasattr(v,'__name__') else v.__name__)) for kk,v in cfg.items() )} for k,cfg in pre.col_config.items() for k in [k]},
+                'preprocessing_detail': preproc_summary,
                 'num_cols': pre.global_metadata.get('num_cols', []),
                 'cat_cols': pre.global_metadata.get('cat_cols', [])
             }
@@ -984,3 +876,7 @@ implementation:
       - {outputPath: preprocessor}
       - --preprocess_metadata
       - {outputPath: preprocess_metadata}
+      - --preprocessing_summary
+      - {outputPath: preprocessing_summary}
+      - --processed_preview
+      - {outputPath: processed_preview}
