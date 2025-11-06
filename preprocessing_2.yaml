@@ -1,4 +1,4 @@
-name: Load & Preprocess (heredoc)
+name: Load & Preprocess _test _2
 description: |
   Robust end-to-end preprocessing component. Loads dataset (file or directory), prints
   before/after previews and diagnostics, performs advanced alphanumeric parsing, date detection,
@@ -28,12 +28,8 @@ implementation:
       - bash
       - -lc
       - |
-        # Write the full Python preprocessing script to a temp file using a heredoc.
-        # The heredoc is single-quoted (<<'PY') so the content is preserved exactly
-        # and will not be interpreted by YAML or the shell.
         cat > /tmp/preprocess.py <<'PY'
         #!/usr/bin/env python3
-        # Full preprocessing script (same logic as discussed)
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math, inspect
         from datetime import datetime
         from collections import Counter, defaultdict
@@ -188,9 +184,6 @@ implementation:
 
             raise ValueError("Unsupported or unreadable file format: " + path)
 
-        # advanced parsing, date detection, encoders, Preprocessor class, etc.
-        # (the same full implementations as we discussed previously)
-        # For brevity here I include the main functions and class as in your last script.
         CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
         MULTIPLIER_MAP = {'k':1e3, 'm':1e6, 'b':1e9, 't':1e12}
         TOKEN_RE = re.compile(
@@ -604,7 +597,6 @@ implementation:
             def load(path):
                 return joblib.load(path)
 
-        # parser, main execution
         parser = argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
@@ -709,7 +701,6 @@ implementation:
             print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
             X_processed = pre.transform(X_df_init, training_mode=True)
 
-            # AFTER preprocessing: summary & preview
             print("\n===== AFTER PREPROCESSING: TRANSFORMATION SUMMARY =====")
             preproc_summary = []
             orig_num_cols = pre.global_metadata.get('num_cols', []) or []
@@ -838,6 +829,22 @@ implementation:
             sys.exit(1)
         PY
 
+        python /tmp/preprocess.py \
+          --in_file "{inputPath: in_file}" \
+          --target_column "{inputValue: target_column}" \
+          --outlier_strategy "{inputValue: outlier_strategy}" \
+          --outlier_fold "{inputValue: outlier_fold}" \
+          --max_knn_rows "{inputValue: max_knn_rows}" \
+          --numeric_detection_threshold "{inputValue: numeric_detection_threshold}" \
+          --rare_threshold "{inputValue: rare_threshold}" \
+          --enable_string_similarity "{inputValue: enable_string_similarity}" \
+          --preview_rows "{inputValue: preview_rows}" \
+          --X "{outputPath: X}" \
+          --y "{outputPath: y}" \
+          --preprocessor "{outputPath: preprocessor}" \
+          --preprocess_metadata "{outputPath: preprocess_metadata}" \
+          --preprocessing_summary "{outputPath: preprocessing_summary}" \
+          --processed_preview "{outputPath: processed_preview}"
     args:
       - --in_file
       - {inputPath: in_file}
@@ -865,3 +872,7 @@ implementation:
       - {outputPath: preprocessor}
       - --preprocess_metadata
       - {outputPath: preprocess_metadata}
+      - --preprocessing_summary
+      - {outputPath: preprocessing_summary}
+      - --processed_preview
+      - {outputPath: processed_preview}
