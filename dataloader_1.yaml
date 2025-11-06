@@ -1,0 +1,131 @@
+name: Unified Data Loader
+description: Loads data from API using unified configuration and outputs as a single file for preprocessing
+inputs:
+  - name: api_url
+    type: String
+    description: 'API URL to fetch JSON data'
+  - name: access_token
+    type: string
+    description: 'Bearer access token for API auth'
+  - name: config_str
+    type: String
+    description: 'Unified configuration JSON string'
+outputs:
+  - name: data_file
+    type: Data
+    description: 'Complete dataset file in Parquet format for preprocessing'
+
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        python3 -m pip install --quiet requests pandas pyarrow scikit-learn numpy || \
+        python3 -m pip install --quiet requests pandas pyarrow scikit-learn numpy --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, pickle, pandas as pd, numpy as np, requests, json
+        from sklearn.preprocessing import LabelEncoder
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--api_url', type=str, required=True)
+        parser.add_argument('--access_token', type=str, required=True)
+        parser.add_argument('--config_str', type=str, required=True)
+        parser.add_argument('--data_file', type=str, required=True)
+        args = parser.parse_args()
+
+        # Load unified config
+        with open(args.access_token, 'r') as f:
+            access_token = f.read().strip()
+        
+        config = json.loads(args.config_str)
+        pipeline_config = config.get('pipeline', {})
+        target_column = pipeline_config.get('target_column', '')
+
+        print(f"DEBUG: Loading data with target: {target_column}")
+
+        # Fetch data
+        headers = {"Authorization": f"Bearer {access_token}"}
+        try:
+            resp = requests.get(args.api_url, headers=headers, timeout=30)
+            if resp.status_code == 405:
+                payload = {"dbType": "TIDB", "filter": {}, "startTime": 0, "endTime": 0}
+                resp = requests.post(args.api_url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            raw_data = resp.json()
+        except Exception as e:
+            print(f"API request failed: {e}")
+            raise
+
+        # Handle response format
+        if isinstance(raw_data, dict) and 'content' in raw_data:
+            df_data = raw_data['content']
+        else:
+            df_data = raw_data
+
+        df = pd.DataFrame(df_data)
+        print(f"DEBUG: Loaded {len(df)} records with {len(df.columns)} columns")
+        print(f"DEBUG: All columns: {list(df.columns)}")
+
+        # Flatten nested structures
+        def flatten_nested_columns(df):
+            flattened_df = df.copy()
+            for col in df.columns:
+                if len(df) > 0 and isinstance(df[col].iloc[0], dict):
+                    print(f"DEBUG: Flattening nested column: {col}")
+                    nested_df = pd.json_normalize(df[col])
+                    nested_df.columns = [f"{col}_{subcol}" for subcol in nested_df.columns]
+                    flattened_df = pd.concat([flattened_df.drop(columns=[col]), nested_df], axis=1)
+            return flattened_df
+
+        df_flat = flatten_nested_columns(df)
+        print(f"DEBUG: After flattening - columns: {list(df_flat.columns)}")
+        
+        # Basic data cleaning - convert to appropriate types
+        def clean_dataframe(df):
+            cleaned_df = df.copy()
+            
+            # Convert object columns to numeric where possible
+            for col in cleaned_df.columns:
+                if cleaned_df[col].dtype == 'object':
+                    # Try numeric conversion first
+                    converted_col = pd.to_numeric(cleaned_df[col], errors='coerce')
+                    if not converted_col.isna().all():
+                        cleaned_df[col] = converted_col
+                    else:
+                        # For categorical with reasonable cardinality, keep as string for preprocessing
+                        if cleaned_df[col].nunique() > 100:
+                            print(f"DEBUG: High cardinality categorical column '{col}' - keeping as string")
+                        else:
+                            print(f"DEBUG: Categorical column '{col}' - keeping as string for preprocessing")
+            
+            return cleaned_df
+
+        df_clean = clean_dataframe(df_flat)
+        print(f"DEBUG: After cleaning - dtypes: {df_clean.dtypes.to_dict()}")
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(args.data_file) or ".", exist_ok=True)
+
+        # Save as Parquet file (recommended for preprocessing)
+        df_clean.to_parquet(args.data_file, index=False, engine='pyarrow')
+        
+        print(f"Data loading complete: {len(df_clean)} records saved to {args.data_file}")
+        print(f"Columns: {list(df_clean.columns)}")
+        print(f"Data types: {df_clean.dtypes.to_dict()}")
+        print(f"Target column specified in config: {target_column}")
+            
+    args:
+      - --api_url
+      - {inputValue: api_url}
+      - --access_token
+      - {inputPath: access_token}
+      - --config_str
+      - {inputValue: config_str}
+      - --data_file
+      - {outputPath: data_file}
