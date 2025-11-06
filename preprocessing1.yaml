@@ -1,4 +1,4 @@
-name: Load & Preprocess - data
+name: Load & Preprocess
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -833,25 +833,6 @@ implementation:
             print("Saved preprocess metadata:", meta_path)
 
             print("SUCCESS: Preprocessing complete.")
-            print("\n===== PREPROCESSING SUMMARY =====")
-            for col in df.columns:
-                imputer = imputation_methods.get(col, "None")
-                scaler = scaling_methods.get(col, "None")
-                encoder = encoding_methods.get(col, "None")
-                transform = transform_methods.get(col, "None")
-            
-                print(f"Column: {col}")
-                print(f"  • Type: {df[col].dtype}")
-                print(f"  • Imputation: {imputer}")
-                print(f"  • Scaling: {scaler}")
-                print(f"  • Encoding: {encoder}")
-                print(f"  • Transformation: {transform}")
-                print("-" * 40)
-            
-            print("\n===== DATA PREVIEW =====")
-            print(df.head(10).to_string(index=False))
-            print("\n==================================")
-
         except Exception as exc:
             print("ERROR during preprocessing:", exc, file=sys.stderr)
             traceback.print_exc()
