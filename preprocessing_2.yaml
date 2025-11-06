@@ -1,4 +1,4 @@
-name: Load & Preprocess
+name: Load & Preprocess_23
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -432,7 +432,7 @@ implementation:
             X_col = df[col].astype(object).fillna('__NA__')
             global_mean = y.mean()
             oof = pd.Series(index=df.index, dtype=float)
-            kf = KFold(n_splits=min(n_splits, max(2, len(df)//10)), shuffle=True, random_state=42)
+            kf = KFold(n_splits=min(n_splits, max(2, len(df)//10)), shuffle=True, random_state=random_state)
             for tr_idx, val_idx in kf.split(df):
                 grp = X_col.iloc[tr_idx].map(lambda x: x)
                 means = y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
@@ -568,6 +568,7 @@ implementation:
                 # For columns requiring knn/iterative, apply
                 # KNN on scaled space (only numeric columns are used)
                 # We'll apply KNN imputation columnwise using sklearn KNNImputer on whole scaled_df
+                # Identify columns that need KNN
                 need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='knn']
                 if need_knn:
                     knn = KNNImputer(n_neighbors= self.col_config[self.num_cols[0]]['imputer'][1].get('n_neighbors',5) if isinstance(self.col_config[self.num_cols[0]]['imputer'], tuple) and self.col_config[self.num_cols[0]]['imputer'][0]=='knn' else 5)
@@ -689,78 +690,6 @@ implementation:
             def load(path):
                 return joblib.load(path)
 
-        # ----------------- Helper printing utilities -----------------------------
-        def _cls_name(obj):
-            try:
-                return obj.__class__.__name__
-            except Exception:
-                return str(obj)
-
-        def print_before_preview(df, target_col):
-            print("\n===== BEFORE PREPROCESSING: df.head() =====")
-            try:
-                print(df.head().to_string())
-            except Exception:
-                print(df.head())
-            print("\n===== BEFORE PREPROCESSING: dtypes =====")
-            try:
-                print(df.dtypes.astype(str))
-            except Exception:
-                print(df.dtypes)
-            print("\n===== BEFORE PREPROCESSING: missing counts =====")
-            miss = df.isna().sum()
-            miss[target_col] = df[target_col].isna().sum() if target_col in df.columns else "N/A"
-            print(miss)
-
-        def print_plan(pre, config):
-            print("\n===== PLAN: per-column strategies selected during fit() =====")
-            print("Numeric columns:", pre.num_cols)
-            print("Categorical columns:", pre.cat_cols)
-            for c in pre.num_cols:
-                cfg = pre.col_config.get(c, {})
-                imp = cfg.get('imputer', ('none', None))
-                scaler = cfg.get('scaler_obj', None)
-                print(f"[NUM] {c} | missing_frac={cfg.get('missing_frac')} | imputer={imp[0]} | scaler={_cls_name(scaler) if scaler else 'auto'}")
-            for c in pre.cat_cols:
-                cfg = pre.col_config.get(c, {})
-                enc = cfg.get('encoder_type')
-                hi = cfg.get('high_card')
-                rare = cfg.get('rare_threshold_frac')
-                print(f"[CAT] {c} | n_unique={cfg.get('n_unique')} | high_card={hi} | encoder={enc} | rare_threshold={rare} | string_similarity={'enabled' if config.get('enable_string_similarity', False) else 'disabled'}")
-
-        def print_after_report(X_processed, pre):
-            print("\n===== AFTER PREPROCESSING: df.head() =====")
-            try:
-                print(X_processed.head().to_string())
-            except Exception:
-                print(X_processed.head())
-            print("\n===== AFTER PREPROCESSING: dtypes =====")
-            try:
-                print(X_processed.dtypes.astype(str))
-            except Exception:
-                print(X_processed.dtypes)
-            print("\n===== AFTER PREPROCESSING: missing counts =====")
-            print(X_processed.isna().sum())
-
-            print("\n===== AFTER PREPROCESSING: per-original-column transformations applied =====")
-            # Numeric original columns
-            for c in pre.global_metadata.get('num_cols', []):
-                cfg = pre.col_config.get(c, {})
-                imp = cfg.get('imputer', ('none', None))
-                scaler_obj = cfg.get('scaler_obj', None)
-                print(f"[NUM] {c} -> dtype={str(X_processed[c].dtype) if c in X_processed.columns else 'transformed/removed'} | imputer={imp[0]} | scaler={_cls_name(scaler_obj)}")
-            # Categorical original columns
-            for c in pre.global_metadata.get('cat_cols', []):
-                cfg = pre.col_config.get(c, {})
-                enc = cfg.get('encoder_type')
-                if enc == 'onehot':
-                    cols = cfg.get('ohe_columns', [])
-                    print(f"[CAT] {c} -> onehot columns={len(cols)}: {', '.join(cols[:10])}{' ...' if len(cols)>10 else ''}")
-                elif enc in ('ordinal','count','target'):
-                    print(f"[CAT] {c} -> encoded as {enc} | dtype={str(X_processed[c].dtype) if c in X_processed.columns else 'n/a'}")
-                else:
-                    print(f"[CAT] {c} -> encoder={enc}")
-
         # ----------------- Main execution starts here ---------------------------
         parser = argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
@@ -808,10 +737,6 @@ implementation:
             if target_col not in df.columns:
                 print(f"ERROR: target column '{target_col}' not found in data", file=sys.stderr)
                 sys.exit(1)
-
-            # Preview before dropping null target to show original state
-            print_before_preview(df, target_col)
-
             before = len(df)
             df = df[df[target_col].notna()].reset_index(drop=True)
             print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
@@ -840,11 +765,7 @@ implementation:
             pre = Preprocessor()
             y_ser = df[[target_col]].copy()
             X_df_init = df.drop(columns=[target_col]).copy()
-
             pre.fit(X_df_init, y=y_ser[target_col] if not y_ser.empty else None, config=config)
-
-            # Print planned transformations
-            print_plan(pre, config)
 
             # transform data
             print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
@@ -872,7 +793,7 @@ implementation:
                             X_processed[col] = X_processed[col].astype('Int8')
                         elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
                             X_processed[col] = X_processed[col].astype('Int16')
-                        elif col_min >= np.iinfo[np.int32].min and col_max <= np.iinfo[np.int32].max:
+                        elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
                             X_processed[col] = X_processed[col].astype('Int32')
                         else:
                             X_processed[col] = X_processed[col].astype('Int64')
@@ -880,9 +801,6 @@ implementation:
                         X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
                 else:
                     X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
-
-            # Post-processing report
-            print_after_report(X_processed, pre)
 
             # Save outputs
             def makedirs_for(p):
