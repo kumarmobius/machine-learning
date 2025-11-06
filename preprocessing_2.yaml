@@ -1,4 +1,4 @@
-name: Load & Preprocess_test
+name: Load & Preprocess_
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -618,10 +618,7 @@ implementation:
 
         def print_before_preview(df, target_col):
             print("\n===== BEFORE PREPROCESSING: df.head() =====")
-            try:
-                print(df.head().to_string())
-            except Exception:
-                print(df.head())
+            print(df.head())
             print("\n===== BEFORE PREPROCESSING: dtypes =====")
             print(df.dtypes.astype(str))
             print("\n===== BEFORE PREPROCESSING: missing counts =====")
