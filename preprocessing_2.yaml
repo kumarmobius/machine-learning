@@ -638,7 +638,7 @@ implementation:
                 print(f"[CAT] {c} | n_unique={cfg.get('n_unique')} | high_card={cfg.get('high_card')} | encoder={cfg.get('encoder_type')} | rare_threshold={cfg.get('rare_threshold_frac')}")
 
         def print_after_report(X_processed, pre):
-            print("\nAFTER PREPROCESSING: df.head() ")
+            print("AFTER PREPROCESSING: df.head() ")
             try:
                 print(X_processed.head().to_string())
             except Exception:
