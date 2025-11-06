@@ -1,4 +1,4 @@
-name: Load & Preprocess_ew
+name: Load & Preprocess
 description: |
   Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
   removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
@@ -617,15 +617,15 @@ implementation:
                 return str(obj)
 
         def print_before_preview(df, target_col):
-            print("\n BEFORE PREPROCESSING: df.head()")
+            print("BEFORE PREPROCESSING: df.head()")
             print(df.head())
-            print("\n BEFORE PREPROCESSING: dtypes ")
+            print("BEFORE PREPROCESSING: dtypes ")
             print(df.dtypes.astype(str))
-            print("\nBEFORE PREPROCESSING: missing counts")
+            print("nBEFORE PREPROCESSING: missing counts")
             print(df.isna().sum())
 
         def print_plan(pre, config):
-            print("\nPLAN: per-column strategies selected during fit()")
+            print("PLAN: per-column strategies selected during fit()")
             print("Numeric columns:", pre.num_cols)
             print("Categorical columns:", pre.cat_cols)
             for c in pre.num_cols:
@@ -643,11 +643,11 @@ implementation:
                 print(X_processed.head().to_string())
             except Exception:
                 print(X_processed.head())
-            print("\nAFTER PREPROCESSING: dtypes ")
+            print("AFTER PREPROCESSING: dtypes ")
             print(X_processed.dtypes.astype(str))
-            print("\nAFTER PREPROCESSING: missing counts ")
+            print("AFTER PREPROCESSING: missing counts ")
             print(X_processed.isna().sum())
-            print("\nAFTER PREPROCESSING: per-original-column transformations applied =====")
+            print("AFTER PREPROCESSING: per-original-column transformations applied")
             for c in pre.global_metadata.get('num_cols', []):
                 cfg = pre.col_config.get(c, {})
                 imp = cfg.get('imputer', ('none', None))
