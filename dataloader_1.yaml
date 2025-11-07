@@ -1,45 +1,26 @@
 name: Unified Data Loader
-description: |
-  Loads data from API using unified configuration, preprocesses it, and splits into train/test sets.
-  Prints DataFrame info and head before and after preprocessing for verification.
-
+description: Loads data from API, prints info, splits into train and test, and saves outputs
 inputs:
   - name: api_url
-    type: string
-    description: "API URL to fetch JSON data"
+    type: String
+    description: 'API URL to fetch JSON data'
   - name: access_token
     type: string
-    description: "Bearer access token file"
-  - name: data_file
-    type: string
-    description: "Output file path to save full processed data (Parquet)"
-  - name: train_file
-    type: string
-    description: "Output file path for train data (Parquet)"
-  - name: test_x_file
-    type: string
-    description: "Output file path for test features (Parquet)"
-  - name: test_y_file
-    type: string
-    description: "Output file path for test labels (Parquet)"
+    description: 'Bearer access token for API auth'
   - name: test_split
-    type: integer
-    default: "10"
-    description: "Test split percentage (default = 10)"
-
+    type: Integer
+    description: 'Percentage of test split (e.g., 10 means 0.1 fraction)'
+    default: 10
 outputs:
-  - name: data_file
-    type: Data
-    description: "Processed complete dataset"
   - name: train_file
     type: Data
-    description: "Train split dataset"
+    description: 'Combined train set with features and target'
   - name: test_x_file
     type: Data
-    description: "Test features"
+    description: 'Test feature set (X)'
   - name: test_y_file
     type: Data
-    description: "Test labels"
+    description: 'Test target set (y)'
 
 implementation:
   container:
@@ -48,133 +29,80 @@ implementation:
       - sh
       - -c
       - |
-        set -e
-        python3 -m pip install --quiet pandas numpy requests scikit-learn pyarrow || \
-        python3 -m pip install --quiet --user pandas numpy requests scikit-learn pyarrow
-
-        python3 -u - <<'PYCODE'
-        import argparse, os, sys, pandas as pd, numpy as np, requests
+        python3 -m pip install --quiet requests pandas scikit-learn pyarrow || \
+        python3 -m pip install --quiet requests pandas scikit-learn pyarrow --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, requests, pandas as pd
         from sklearn.model_selection import train_test_split
-        from sklearn.preprocessing import StandardScaler, LabelEncoder
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--api_url', type=str, required=True)
         parser.add_argument('--access_token', type=str, required=True)
-        parser.add_argument('--data_file', type=str, required=True)
+        parser.add_argument('--test_split', type=int, default=10)
         parser.add_argument('--train_file', type=str, required=True)
         parser.add_argument('--test_x_file', type=str, required=True)
         parser.add_argument('--test_y_file', type=str, required=True)
-        parser.add_argument('--test_split', type=int, default=10)
         args = parser.parse_args()
 
-        # Convert integer test_split to fraction
-        test_size = args.test_split / 100 if args.test_split > 1 else args.test_split
-
-        # Load access token
         with open(args.access_token, 'r') as f:
-            access_token = f.read().strip()
+            token = f.read().strip()
 
-        headers = {"Authorization": f"Bearer {access_token}"}
-        print("Fetching data from API...")
+        headers = {"Authorization": f"Bearer {token}"}
+        print("DEBUG: Fetching data from API:", args.api_url)
+        resp = requests.get(args.api_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
 
-        try:
-            resp = requests.get(args.api_url, headers=headers, timeout=30)
-            if resp.status_code == 405:
-                payload = {"dbType": "TIDB", "filter": {}, "startTime": 0, "endTime": 0}
-                resp = requests.post(args.api_url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            raw_data = resp.json()
-        except Exception as e:
-            print(f"API request failed: {e}")
-            sys.exit(1)
-
-        if isinstance(raw_data, dict) and 'content' in raw_data:
-            df_data = raw_data['content']
+        if isinstance(data, dict) and 'content' in data:
+            df = pd.DataFrame(data['content'])
         else:
-            df_data = raw_data
+            df = pd.DataFrame(data)
 
-        df = pd.DataFrame(df_data)
-
-        print("\nDEBUG: DataFrame head (before preprocessing):")
-        print(df.head().to_string())
-        print("\nDEBUG: DataFrame info (before preprocessing):")
+        print("DEBUG: Data loaded successfully")
+        print("Number of rows:", len(df))
+        print("Number of columns:", len(df.columns))
+        print("Column names:", list(df.columns))
+        print("DataFrame info:")
         print(df.info())
-
-        # Preprocessing
-        print("\nStarting preprocessing...")
-
-        # Fill missing numeric values with median
-        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
-        for col in numeric_cols:
-            if df[col].isnull().any():
-                median_val = df[col].median()
-                df[col].fillna(median_val, inplace=True)
-                print(f"Filled missing numeric values in '{col}' with median ({median_val}).")
-
-        # Fill missing categorical values with mode
-        categorical_cols = df.select_dtypes(include=['object']).columns
-        for col in categorical_cols:
-            if df[col].isnull().any():
-                mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
-                df[col].fillna(mode_val, inplace=True)
-                print(f"Filled missing categorical values in '{col}' with mode ({mode_val}).")
-
-        # Encode categorical features
-        for col in categorical_cols:
-            encoder = LabelEncoder()
-            df[col] = encoder.fit_transform(df[col].astype(str))
-            print(f"Encoded categorical column '{col}'.")
-
-        # Scale numeric features
-        scaler = StandardScaler()
-        df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
-        print("Scaled numeric columns using StandardScaler.")
-
-        print("\nDEBUG: DataFrame head (after preprocessing):")
+        print("DataFrame head preview:")
         print(df.head().to_string())
-        print("\nDEBUG: DataFrame info (after preprocessing):")
-        print(df.info())
 
-        # Save complete processed data
-        os.makedirs(os.path.dirname(args.data_file) or ".", exist_ok=True)
-        df.to_parquet(args.data_file, index=False)
-        print(f"Saved full processed data to {args.data_file}")
+        if 'target' not in df.columns:
+            raise ValueError("Expected a 'target' column for splitting y variable")
 
-        # Split into train/test
-        if 'label' in df.columns:
-            X = df.drop(columns=['label'])
-            y = df['label']
-        else:
-            X = df.iloc[:, :-1]
-            y = df.iloc[:, -1]
+        test_size = args.test_split / 100.0 if args.test_split > 1 else args.test_split
+        X = df.drop(columns=['target'])
+        y = df['target']
+        train_x, test_x, train_y, test_y = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42, stratify=y if len(y.unique()) > 1 else None
-        )
+        train_combined = pd.concat([train_x, train_y], axis=1)
 
-        train_df = pd.concat([X_train, y_train], axis=1)
-        train_df.to_parquet(args.train_file, index=False)
-        X_test.to_parquet(args.test_x_file, index=False)
-        y_test.to_parquet(args.test_y_file, index=False)
+        os.makedirs(os.path.dirname(args.train_file) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.test_x_file) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.test_y_file) or ".", exist_ok=True)
 
-        print(f"Train/Test split complete with test_size={test_size}.")
-        print(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
-        print(f"Train data saved to {args.train_file}")
-        print(f"Test X saved to {args.test_x_file}")
-        print(f"Test Y saved to {args.test_y_file}")
-        print("Unified Data Loading and Preprocessing Complete.")
-        PYCODE
+        train_combined.to_parquet(args.train_file, index=False)
+        test_x.to_parquet(args.test_x_file, index=False)
+        test_y.to_frame().to_parquet(args.test_y_file, index=False)
+
+        print(f"DEBUG: Train file saved to {args.train_file} with {len(train_combined)} rows")
+        print(f"DEBUG: Test X saved to {args.test_x_file} with {len(test_x)} rows")
+        print(f"DEBUG: Test y saved to {args.test_y_file} with {len(test_y)} rows")
+
+    args:
       - --api_url
       - {inputValue: api_url}
       - --access_token
       - {inputPath: access_token}
-      - --data_file
-      - {outputPath: data_file}
+      - --test_split
+      - {inputValue: test_split}
       - --train_file
       - {outputPath: train_file}
       - --test_x_file
       - {outputPath: test_x_file}
       - --test_y_file
       - {outputPath: test_y_file}
-      - --test_split
-      - {inputValue: test_split}
