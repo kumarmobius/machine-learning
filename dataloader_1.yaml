@@ -10,7 +10,7 @@ inputs:
   - name: test_split
     type: Integer
     description: 'Percentage of test split (e.g., 10 means 0.1 fraction)'
-    default: 10
+    default: "10"
 outputs:
   - name: train_file
     type: Data
