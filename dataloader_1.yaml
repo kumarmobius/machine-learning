@@ -1,40 +1,61 @@
 name: Unified Data Loader
-description: Loads data from API using unified configuration and outputs as train/test files for preprocessing and modeling
+description: |
+  Loads data from API using unified configuration, preprocesses it, and splits into train/test sets.
+  Prints DataFrame info and head before and after preprocessing for verification.
+
 inputs:
   - name: api_url
-    type: String
-    description: API URL to fetch JSON data'
+    type: string
+    description: "API URL to fetch JSON data"
   - name: access_token
     type: string
-    description: 'Bearer access token for API auth'
+    description: "Bearer access token file"
+  - name: data_file
+    type: string
+    description: "Output file path to save full processed data (Parquet)"
+  - name: train_file
+    type: string
+    description: "Output file path for train data (Parquet)"
+  - name: test_x_file
+    type: string
+    description: "Output file path for test features (Parquet)"
+  - name: test_y_file
+    type: string
+    description: "Output file path for test labels (Parquet)"
   - name: test_split
-    type: float
-    description: 'Test split ratio (e.g., 0.2 or 20 for 20%). Default is 10%.'
+    type: integer
     default: "10"
+    description: "Test split percentage (default = 10)"
+
 outputs:
   - name: data_file
     type: Data
-    description: 'Complete cleaned dataset file in Parquet format'
+    description: "Processed complete dataset"
   - name: train_file
     type: Data
-    description: 'Train dataset (features + target) saved as Parquet'
+    description: "Train split dataset"
   - name: test_x_file
     type: Data
-    description: 'Test features (X_test) saved as Parquet'
+    description: "Test features"
   - name: test_y_file
     type: Data
-    description: 'Test labels (y_test) saved as Parquet'
+    description: "Test labels"
 
 implementation:
   container:
     image: python:3.9
     command:
-      - python3
-      - -u
+      - sh
       - -c
       - |
+        set -e
+        python3 -m pip install --quiet pandas numpy requests scikit-learn pyarrow || \
+        python3 -m pip install --quiet --user pandas numpy requests scikit-learn pyarrow
+
+        python3 -u - <<'PYCODE'
         import argparse, os, sys, pandas as pd, numpy as np, requests
         from sklearn.model_selection import train_test_split
+        from sklearn.preprocessing import StandardScaler, LabelEncoder
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--api_url', type=str, required=True)
@@ -43,17 +64,19 @@ implementation:
         parser.add_argument('--train_file', type=str, required=True)
         parser.add_argument('--test_x_file', type=str, required=True)
         parser.add_argument('--test_y_file', type=str, required=True)
-        parser.add_argument('--test_split', type=int, default=20,help='Test split percent (1-99)')
+        parser.add_argument('--test_split', type=int, default=10)
         args = parser.parse_args()
+
+        # Convert integer test_split to fraction
+        test_size = args.test_split / 100 if args.test_split > 1 else args.test_split
 
         # Load access token
         with open(args.access_token, 'r') as f:
             access_token = f.read().strip()
 
-        print("DEBUG: Starting unified data loading")
-
-        # Fetch data
         headers = {"Authorization": f"Bearer {access_token}"}
+        print("Fetching data from API...")
+
         try:
             resp = requests.get(args.api_url, headers=headers, timeout=30)
             if resp.status_code == 405:
@@ -63,155 +86,84 @@ implementation:
             raw_data = resp.json()
         except Exception as e:
             print(f"API request failed: {e}")
-            raise
+            sys.exit(1)
 
-        # Handle response format
         if isinstance(raw_data, dict) and 'content' in raw_data:
             df_data = raw_data['content']
         else:
             df_data = raw_data
 
         df = pd.DataFrame(df_data)
-        print(f"DEBUG: Loaded {len(df)} records with {len(df.columns)} columns")
-        print("DEBUG: DataFrame head (first 5 rows):")
-        try:
-            print(df.head().to_string())
-        except Exception:
-            print(df.head())
 
-        # Print dtypes and missing counts BEFORE preprocessing
-        print("DEBUG: Column dtypes before cleaning:")
-        print(df.dtypes.to_dict())
-        print("DEBUG: Missing values per column (before cleaning):")
-        print(df.isna().sum().to_dict())
+        print("\nDEBUG: DataFrame head (before preprocessing):")
+        print(df.head().to_string())
+        print("\nDEBUG: DataFrame info (before preprocessing):")
+        print(df.info())
 
-        # Flatten nested structures
-        def flatten_nested_columns(df):
-            flattened_df = df.copy()
-            for col in list(df.columns):
-                if len(df) > 0 and isinstance(df[col].iloc[0], dict):
-                    print(f"DEBUG: Flattening nested column: {col}")
-                    nested_df = pd.json_normalize(df[col])
-                    nested_df.columns = [f"{col}_{subcol}" for subcol in nested_df.columns]
-                    flattened_df = pd.concat([flattened_df.drop(columns=[col]), nested_df], axis=1)
-            return flattened_df
+        # Preprocessing
+        print("\nStarting preprocessing...")
 
-        df_flat = flatten_nested_columns(df)
-        print(f"DEBUG: After flattening - columns: {list(df_flat.columns)}")
+        # Fill missing numeric values with median
+        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+        for col in numeric_cols:
+            if df[col].isnull().any():
+                median_val = df[col].median()
+                df[col].fillna(median_val, inplace=True)
+                print(f"Filled missing numeric values in '{col}' with median ({median_val}).")
 
-        # Basic data cleaning - convert to appropriate types
-        def clean_dataframe(df):
-            cleaned_df = df.copy()
+        # Fill missing categorical values with mode
+        categorical_cols = df.select_dtypes(include=['object']).columns
+        for col in categorical_cols:
+            if df[col].isnull().any():
+                mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
+                df[col].fillna(mode_val, inplace=True)
+                print(f"Filled missing categorical values in '{col}' with mode ({mode_val}).")
 
-            for col in list(cleaned_df.columns):
-                if cleaned_df[col].dtype == 'object':
-                    converted_col = pd.to_numeric(cleaned_df[col], errors='coerce')
-                    # If conversion created any non-all-NaN column, replace
-                    if not converted_col.isna().all():
-                        cleaned_df[col] = converted_col
-                    else:
-                        # Keep as string categorical
-                        if cleaned_df[col].nunique() > 100:
-                            print(f"DEBUG: High cardinality categorical column '{col}' - keeping as string")
-                        else:
-                            print(f"DEBUG: Categorical column '{col}' - keeping as string for preprocessing")
-            # Optional: strip whitespace from string columns
-            for col in cleaned_df.select_dtypes(include=['object']).columns:
-                cleaned_df[col] = cleaned_df[col].astype(str).str.strip()
-            return cleaned_df
+        # Encode categorical features
+        for col in categorical_cols:
+            encoder = LabelEncoder()
+            df[col] = encoder.fit_transform(df[col].astype(str))
+            print(f"Encoded categorical column '{col}'.")
 
-        df_clean = clean_dataframe(df_flat)
-        print("DEBUG: After cleaning - dtypes:")
-        print(df_clean.dtypes.to_dict())
-        print("DEBUG: Missing values per column (after cleaning):")
-        print(df_clean.isna().sum().to_dict())
-        print("DEBUG: DataFrame head after cleaning:")
-        try:
-            print(df_clean.head().to_string())
-        except Exception:
-            print(df_clean.head())
+        # Scale numeric features
+        scaler = StandardScaler()
+        df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+        print("Scaled numeric columns using StandardScaler.")
 
-        # Determine target column
-        target_col = None
-        for cand in ['target', 'label', 'y']:
-            if cand in df_clean.columns:
-                target_col = cand
-                break
-        if target_col is None:
-            # fallback to last column
-            target_col = df_clean.columns[-1]
-            print(f"WARNING: No standard target column found. Falling back to last column: '{target_col}'")
+        print("\nDEBUG: DataFrame head (after preprocessing):")
+        print(df.head().to_string())
+        print("\nDEBUG: DataFrame info (after preprocessing):")
+        print(df.info())
 
-        print(f"DEBUG: Using '{target_col}' as target column")
+        # Save complete processed data
+        os.makedirs(os.path.dirname(args.data_file) or ".", exist_ok=True)
+        df.to_parquet(args.data_file, index=False)
+        print(f"Saved full processed data to {args.data_file}")
 
-        # Prepare X and y
-        X = df_clean.drop(columns=[target_col])
-        y = df_clean[target_col]
-
-        # Validate test_split value
-        ts = args.test_split
-        if ts <= 0 or ts >= 100:
-            print(f"WARNING: test_split {ts} out of valid range (1-99). Defaulting to 20.")
-            ts = 20
-        test_size = ts / 100.0
-
-        # Try to stratify if possible (only if categorical/small number of unique classes)
-        stratify_arg = None
-        try:
-            if y.nunique() <= 20:
-                stratify_arg = y
-        except Exception:
-            stratify_arg = None
-
-        # Perform split
-        if stratify_arg is not None:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_size, random_state=42, stratify=stratify_arg
-            )
-            print("DEBUG: Performed stratified split.")
+        # Split into train/test
+        if 'label' in df.columns:
+            X = df.drop(columns=['label'])
+            y = df['label']
         else:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_size, random_state=42
-            )
-            print("DEBUG: Performed random split (no stratify).")
+            X = df.iloc[:, :-1]
+            y = df.iloc[:, -1]
 
-        print(f"DEBUG: Train shape: X_train={X_train.shape}, y_train={y_train.shape}")
-        print(f"DEBUG: Test shape: X_test={X_test.shape}, y_test={y_test.shape}")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y if len(y.unique()) > 1 else None
+        )
 
-        # Print class distribution in train & test
-        try:
-            print("DEBUG: y_train value counts:")
-            print(y_train.value_counts().to_dict())
-            print("DEBUG: y_test value counts:")
-            print(y_test.value_counts().to_dict())
-        except Exception:
-            pass
+        train_df = pd.concat([X_train, y_train], axis=1)
+        train_df.to_parquet(args.train_file, index=False)
+        X_test.to_parquet(args.test_x_file, index=False)
+        y_test.to_parquet(args.test_y_file, index=False)
 
-        # Ensure output directories exist
-        for path in [args.data_file, args.train_file, args.test_x_file, args.test_y_file]:
-            dirpath = os.path.dirname(path) or "."
-            os.makedirs(dirpath, exist_ok=True)
-
-        # Save cleaned full data, train (X+y), test X and test y separately
-        df_clean.to_parquet(args.data_file, index=False, engine='pyarrow')
-
-        # Train dataset: combine X_train and y_train for convenience
-        df_train = X_train.copy()
-        df_train[target_col] = y_train.values
-        df_train.to_parquet(args.train_file, index=False, engine='pyarrow')
-
-        # Save X_test and y_test separately
-        X_test.to_parquet(args.test_x_file, index=False, engine='pyarrow')
-        # save y_test as a single-column DataFrame (keeps column name)
-        pd.DataFrame({target_col: y_test.values}).to_parquet(args.test_y_file, index=False, engine='pyarrow')
-
-        print(f"Data loading & split complete.")
-        print(f"Saved cleaned full dataset to: {args.data_file} ({len(df_clean)} rows)")
-        print(f"Saved train dataset to: {args.train_file} ({len(df_train)} rows)")
-        print(f"Saved test X to: {args.test_x_file} ({len(X_test)} rows)")
-        print(f"Saved test y to: {args.test_y_file} ({len(y_test)} rows)")
-
-    args:
+        print(f"Train/Test split complete with test_size={test_size}.")
+        print(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
+        print(f"Train data saved to {args.train_file}")
+        print(f"Test X saved to {args.test_x_file}")
+        print(f"Test Y saved to {args.test_y_file}")
+        print("Unified Data Loading and Preprocessing Complete.")
+        PYCODE
       - --api_url
       - {inputValue: api_url}
       - --access_token
