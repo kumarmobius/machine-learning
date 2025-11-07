@@ -1,31 +1,34 @@
-name: Load & Preprocess (fit/transform)
+name: Load & Preprocess + Auto Feature Select (v2)
 description: |
-  Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
-  removes duplicates, drops rows with missing target (fit mode), performs advanced alphanumeric numeric detection
-  & conversion, identifies datetime columns and extracts common date features, automatically chooses
-  per-column imputation/encoding/scaling strategies, applies outlier handling (optional, fit mode only), and saves:
-    - X (parquet)
-    - y (parquet, if present)
-    - preprocessor (pickle) - fitted preprocessing object for inference (fit mode)
-    - preprocess_metadata (json) - decisions and diagnostics
-  In transform mode, it loads a saved preprocessor pickle and only applies transform without refitting and without outlier removal.
+  End-to-end robust preprocessing + automatic feature selection.
+  - Smart numeric parsing: currencies, multipliers (k/m/b/t), percents, mixed tokens.
+  - Datetime detection + feature extraction.
+  - Rare-label collapsing and optional string-similarity grouping.
+  - Per-column imputation: none/median/KNN/Iterative chosen by data profile.
+  - Smart scaler per numeric: MinMax for [0,1], Robust for heavy tails, Yeo-Johnson+Std for skewed, Std otherwise.
+  - Optional outlier handling (fit-time only): drop-IQR or winsorize; transform-time does NOT drop rows.
+  - Target handling: auto-cast boolean-like or male/female/other to integers when model_type=classification.
+  - Feature selection (two-stage):
+      Stage 1: Mutual Information with dynamic k (auto k based on p).
+      Stage 2: Sparse model selector (L1 LogisticRegression for classification; LassoCV for regression).
+  - Saves: X (selected), y, preprocessor.pkl, feature_selector.pkl, preprocess_metadata.json
 inputs:
-  - {name: in_file, type: Data, description: "Path to the input file or directory (connect CDN Generic Downloader: out_file)"}
-  - {name: target_column, type: String, description: "Name of the target column in the dataset (rows with null target dropped in fit mode only)"}
-  - {name: outlier_strategy, type: String, description: "Outlier strategy: 'drop_iqr' or 'winsorize' or 'none' (fit mode only)", optional: true, default: "drop_iqr"}
-  - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule (e.g., 1.5)", optional: true, default: "1.5"}
-  - {name: max_knn_rows, type: Integer, description: "Max rows allowed to use KNN imputer (otherwise fall back)", optional: true, default: "5000"}
-  - {name: numeric_detection_threshold, type: Float, description: "Fraction (0-1) of parsable numeric values in object column to coerce to numeric", optional: true, default: "0.6"}
-  - {name: rare_threshold, type: Float, description: "Rare label threshold as fraction or absolute count (e.g. 0.01 or 10)", optional: true, default: "0.01"}
-  - {name: enable_string_similarity, type: String, description: "Use string similarity grouping for high-cardinality categoricals (true/false)", optional: true, default: "false"}
-  - {name: preview_rows, type: Integer, description: "Rows to include in preview JSON", optional: true, default: "20"}
-  - {name: mode, type: String, description: "fit or transform", optional: true, default: "fit"}
-  - {name: preprocessor_in, type: Data, description: "Path to an existing preprocessor.pkl when mode=transform", optional: true}
+  - {name: in_file, type: Data, description: "Path to tabular file or directory"}
+  - {name: target_column, type: String, description: "Target column name"}
+  - {name: model_type, type: String, description: "classification or regression"}
+  - {name: outlier_strategy, type: String, optional: true, default: "drop_iqr", description: "'drop_iqr'|'winsorize'|'none' (fit-time only)"}
+  - {name: outlier_fold, type: Float, optional: true, default: "1.5", description: "IQR fold for outlier fences"}
+  - {name: max_knn_rows, type: Integer, optional: true, default: "5000", description: "Max rows to allow KNN impute"}
+  - {name: numeric_detection_threshold, type: Float, optional: true, default: "0.6", description: "Object->numeric if parsable frac >= threshold"}
+  - {name: rare_threshold, type: Float, optional: true, default: "0.01", description: "Rare label threshold: fraction or absolute count"}
+  - {name: enable_string_similarity, type: String, optional: true, default: "false", description: "true/false for high-cardinality grouping"}
+  - {name: preview_rows, type: Integer, optional: true, default: "20"}
 outputs:
-  - {name: X, type: Data, description: "Feature matrix (parquet) after preprocessing"}
-  - {name: y, type: Data, description: "Target column (parquet) if present"}
-  - {name: preprocessor, type: Data, description: "Pickle file with fitted preprocessor (for inference, fit mode only)"}
-  - {name: preprocess_metadata, type: Data, description: "JSON metadata describing chosen preprocessing steps"}
+  - {name: X, type: Data, description: "Parquet of selected features"}
+  - {name: y, type: Data, description: "Parquet of target"}
+  - {name: preprocessor, type: Data, description: "Pickle of fitted preprocessing object"}
+  - {name: feature_selector, type: Data, description: "Pickle of fitted feature selector pipeline"}
+  - {name: preprocess_metadata, type: Data, description: "JSON diagnostics and selections"}
 implementation:
   container:
     image: python:3.10-slim
@@ -34,16 +37,10 @@ implementation:
       - -u
       - -c
       - |
-        import argparse
-        import os
-        import sys
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
         from datetime import datetime
-        from collections import Counter, defaultdict
-
         def pip_install(pkgs):
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
-
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "--quiet"] + pkgs)
         try:
             import pandas as pd, numpy as np
             from sklearn.impute import SimpleImputer, KNNImputer
@@ -52,11 +49,11 @@ implementation:
             from sklearn.model_selection import KFold
             from sklearn.experimental import enable_iterative_imputer  # noqa
             from sklearn.impute import IterativeImputer
+            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel
+            from sklearn.linear_model import LogisticRegression, LassoCV
             import joblib
-            import category_encoders as ce
-            from rapidfuzz import process as rf_process, fuzz as rf_fuzz
         except Exception:
-            pip_install(["pandas", "numpy", "scikit-learn", "joblib", "category_encoders", "rapidfuzz", "pyarrow", "fastparquet", "openpyxl"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet","openpyxl","rapidfuzz","category_encoders"])
             import pandas as pd, numpy as np
             from sklearn.impute import SimpleImputer, KNNImputer
             from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
@@ -64,785 +61,485 @@ implementation:
             from sklearn.model_selection import KFold
             from sklearn.experimental import enable_iterative_imputer  # noqa
             from sklearn.impute import IterativeImputer
+            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel
+            from sklearn.linear_model import LogisticRegression, LassoCV
             import joblib
-            import category_encoders as ce
+        try:
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+            import category_encoders as ce
+        except Exception:
+            rf_process = rf_fuzz = None
+            ce = None
 
-        def sample_file_bytes(path, n=8192):
+        def ensure_dir_for(path):
+            d = os.path.dirname(path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def sample_bytes(path, n=8192):
             try:
-                with open(path, "rb") as fh:
-                    return fh.read(n)
-            except Exception:
-                return b""
+                with open(path,"rb") as fh: return fh.read(n)
+            except: return b""
 
-        def is_likely_json(sample_bytes):
-            if not sample_bytes:
-                return False
-            try:
-                txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
-            except Exception:
-                return False
-            if not txt:
-                return False
-            open_brace = chr(123)
-            open_bracket = chr(91)
-            newline = chr(10)
-            first_char = txt[0]
-            if first_char == open_brace or first_char == open_bracket:
-                return True
-            if (newline + open_brace) in txt or (newline + open_bracket) in txt:
-                return True
-            return False
+        def is_json_like(b):
+            if not b: return False
+            try: t=b.decode("utf-8",errors="ignore").lstrip()
+            except: return False
+            if not t: return False
+            ob=chr(123); br=chr(91); nl=chr(10)
+            return t[0] in (ob, br) or (nl+ob) in t or (nl+br) in t
 
-        def read_with_pandas(path):
+        def load_table(path):
             if os.path.isdir(path):
-                entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
-                if not entries:
-                    raise ValueError("Input directory is empty: " + path)
-                files = [p for p in entries if os.path.isfile(p)]
-                if not files:
-                    raise ValueError("No regular files inside directory: " + path)
-                path = files[0] if len(files) == 1 else max(files, key=lambda p: os.path.getsize(p))
-                print("Info: in_file was directory, selected:", path)
-
+                cand=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
+                files=[p for p in cand if os.path.isfile(p)]
+                if not files: raise ValueError("Input directory empty")
+                path = files[0] if len(files)==1 else max(files,key=lambda p: os.path.getsize(p))
+                print("Info selected file:", path)
             if not os.path.exists(path) or not os.path.isfile(path):
-                raise ValueError("Input path not found or not a file: " + path)
-
-            ext = os.path.splitext(path)[1].lower()
-
-            if ext == ".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
+                raise ValueError("Input path not found: "+path)
+            ext=os.path.splitext(path)[1].lower()
+            if ext==".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
                 try:
-                    with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
-                        sample = fh.read(8192)
-                        fh.seek(0)
-                        if is_likely_json(sample.encode() if isinstance(sample,str) else sample):
+                    with gzip.open(path,"rt",encoding="utf-8",errors="ignore") as fh:
+                        s=fh.read(8192); fh.seek(0)
+                        if is_json_like(s.encode() if isinstance(s,str) else s):
                             fh.seek(0)
-                            try:
-                                return pd.read_json(fh, lines=True)
-                            except Exception:
-                                fh.seek(0)
-                                return pd.read_csv(fh)
-                        fh.seek(0)
-                        return pd.read_csv(fh)
-                except Exception:
-                    pass
-
-            if ext == ".zip":
-                with zipfile.ZipFile(path, "r") as z:
-                    members = [n for n in z.namelist() if not n.endswith("/")]
-                    if not members:
-                        raise ValueError("Zip archive empty: " + path)
-                    member = max(members, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
-                    with z.open(member) as fh:
-                        sample = fh.read(8192)
-                        if is_likely_json(sample):
-                            with z.open(member) as fh2:
-                                return pd.read_json(io.TextIOWrapper(fh2, encoding="utf-8"), lines=True)
+                            try: return pd.read_json(fh, lines=True)
+                            except: fh.seek(0); return pd.read_csv(fh)
+                        fh.seek(0); return pd.read_csv(fh)
+                except: pass
+            if ext==".zip":
+                with zipfile.ZipFile(path,"r") as z:
+                    members=[n for n in z.namelist() if not n.endswith("/")]
+                    if not members: raise ValueError("Zip empty")
+                    m=max(members,key=lambda n:z.getinfo(n).file_size or 0)
+                    with z.open(m) as fh:
+                        s=fh.read(8192)
+                        if is_json_like(s):
+                            with z.open(m) as fh2: return pd.read_json(io.TextIOWrapper(fh2,encoding="utf-8"), lines=True)
                         else:
-                            with z.open(member) as fh2:
-                                return pd.read_csv(io.TextIOWrapper(fh2, encoding="utf-8"))
-
+                            with z.open(m) as fh2: return pd.read_csv(io.TextIOWrapper(fh2,encoding="utf-8"))
             try:
-                if ext == ".csv":
-                    return pd.read_csv(path)
-                if ext in (".tsv", ".tab"):
-                    return pd.read_csv(path, sep="\t")
-                if ext in (".json", ".ndjson", ".jsonl"):
-                    try:
-                        return pd.read_json(path, lines=True)
-                    except ValueError:
-                        return pd.read_json(path)
-                if ext in (".xls", ".xlsx"):
-                    return pd.read_excel(path)
-                if ext in (".parquet", ".pq"):
-                    return pd.read_parquet(path, engine="auto")
-                if ext == ".feather":
-                    return pd.read_feather(path)
-                if ext == ".orc":
-                    return pd.read_orc(path)
-            except Exception:
-                pass
+                if ext==".csv": return pd.read_csv(path)
+                if ext in (".tsv",".tab"): return pd.read_csv(path,sep="\t")
+                if ext in (".json",".ndjson",".jsonl"):
+                    try: return pd.read_json(path,lines=True)
+                    except: return pd.read_json(path)
+                if ext in (".xls",".xlsx"): return pd.read_excel(path)
+                if ext in (".parquet",".pq"): return pd.read_parquet(path,engine="auto")
+                if ext==".feather": return pd.read_feather(path)
+                if ext==".orc": return pd.read_orc(path)
+            except: pass
+            try: return pd.read_parquet(path,engine="auto")
+            except: pass
+            b=sample_bytes(path)
+            if is_json_like(b):
+                try: return pd.read_json(path,lines=True)
+                except: pass
+            return pd.read_csv(path)
 
-            try:
-                return pd.read_parquet(path, engine="auto")
-            except Exception:
-                pass
-
-            sample = sample_file_bytes(path)
-            if is_likely_json(sample):
-                try:
-                    return pd.read_json(path, lines=True)
-                except Exception:
-                    pass
-            try:
-                return pd.read_csv(path)
-            except Exception:
-                pass
-            raise ValueError("Unsupported or unreadable file format: " + path)
-
-        CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
-        MULTIPLIER_MAP = {'k':1e3, 'm':1e6, 'b':1e9, 't':1e12}
+        CURRENCY = r'[€£¥₹$¢฿₪₩₫₽₺]'
+        MULT = {'k':1e3,'m':1e6,'b':1e9,'t':1e12}
         TOKEN_RE = re.compile(
-            r'^\s*'
-            r'(?P<sign>[-+]?)'
-            r'(?P<number>(?:\\d{1,3}(?:[,\\s]\\d{3})+|\\d+)(?:[.,]\\d+)?)'
-            r'\\s*'
-            r'(?P<mult>[kKmMbBtT])?'
-            r'\\s*(?P<unit>[A-Za-z%/°µμ²³]*)\\s*$'
+            r'^\s*(?P<sign>[-+]?)'
+            r'(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*'
+            r'(?P<mult>[kKmMbBtT])?\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$'
         )
-
-        def parse_alphanumeric_to_numeric(s, decimal_comma=False):
-            if pd.isna(s):
-                return np.nan
-            orig = str(s).strip()
-            if orig == '' or orig.lower() in {'nan','none','null','na'}:
-                return np.nan
-            tmp = re.sub(CURRENCY_SYMBOLS_REGEX, '', orig)
-            if tmp.strip().endswith('%'):
-                try:
-                    num = float(tmp.strip().rstrip('%').replace(',', '').replace(' ', ''))
-                    return num / 100.0
-                except Exception:
-                    pass
-            tmp = tmp.replace('\\u2212', '-').replace('\\u2013', '-').replace('\\u2014', '-')
-            tmp = re.sub(r'[\\u00A0\\u202F]', '', tmp).strip()
-            if decimal_comma:
-                tmp = tmp.replace('.', '').replace(',', '.')
-            else:
-                tmp = tmp.replace(',', '').replace(' ', '')
-            try:
-                return float(tmp)
-            except Exception:
-                pass
-            m = TOKEN_RE.match(tmp)
+        def parse_alpha_num(x, comma_decimal=False):
+            import numpy as _np, pandas as _pd, re as _re
+            if _pd.isna(x): return _np.nan
+            s=str(x).strip()
+            if s=="" or s.lower() in {"nan","none","null","na"}: return _np.nan
+            s=_re.sub(CURRENCY,"",s)
+            if s.endswith("%"):
+                try: return float(s[:-1].replace(",","").replace(" ",""))/100.0
+                except: pass
+            s=s.replace("\u2212","-").replace("\u2013","-").replace("\u2014","-")
+            s=_re.sub(r'[\u00A0\u202F]','',s).strip()
+            if comma_decimal: s=s.replace(".","").replace(",",".")
+            else: s=s.replace(",","").replace(" ","")
+            try: return float(s)
+            except: pass
+            m=TOKEN_RE.match(s)
             if m:
-                number = m.group('number')
-                mult = m.group('mult')
-                unit = (m.group('unit') or '').lower()
-                number_clean = number.replace(',', '').replace(' ', '')
-                try:
-                    val = float(number_clean)
-                except Exception:
-                    try:
-                        val = float(number_clean.replace(',', '.'))
-                    except Exception:
-                        return np.nan
-                if mult:
-                    val *= MULTIPLIER_MAP.get(mult.lower(), 1.0)
-                if unit and '%' in unit:
-                    val = val / 100.0
+                num=m.group("number"); mult=m.group("mult"); unit=(m.group("unit") or "").lower()
+                try: val=float(num.replace(",","").replace(" ",""))
+                except:
+                    try: val=float(num.replace(",","."))
+                    except: return _np.nan
+                if mult: val*=MULT.get(mult.lower(),1.0)
+                if "%" in unit: val/=100.0
                 return val
-            num_search = re.search(r'[-+]?\\d+([.,]\\d+)?', tmp)
-            if num_search:
-                try:
-                    candidate = num_search.group(0).replace(',', '')
-                    return float(candidate)
-                except Exception:
-                    return np.nan
-            return np.nan
+            g=re.search(r'[-+]?\d+([.]\d+)?',s)
+            if g:
+                try: return float(g.group(0))
+                except: return _np.nan
+            return _np.nan
 
-        def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True):
-            df = df.copy()
-            report = {'converted': [], 'skipped': []}
-            obj_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
-            for col in obj_cols:
-                ser = df[col].astype(object)
-                total_non_null = ser.notna().sum()
-                if total_non_null == 0:
-                    report['skipped'].append(col); continue
-                if advanced:
-                    parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma))
+        def convert_objects_to_numeric(df, thr=0.6):
+            df=df.copy()
+            obj=[c for c in df.columns if (df[c].dtype=="object" or str(df[c].dtype).startswith("string"))]
+            report={"converted":[], "skipped":[]}
+            for c in obj:
+                ser=df[c].astype(object)
+                nn=ser.notna().sum()
+                if nn==0: report["skipped"].append(c); continue
+                parsed=ser.map(parse_alpha_num)
+                frac=parsed.notna().sum()/float(nn)
+                if frac>=thr:
+                    df[c+"_orig"]=df[c]
+                    df[c]=parsed
+                    report["converted"].append({"col":c,"parsable_fraction":frac})
                 else:
-                    parsed = pd.to_numeric(ser, errors='coerce')
-                parsable = parsed.notna().sum()
-                frac = parsable / float(total_non_null)
-                if frac >= detect_threshold:
-                    df[col + "_orig"] = df[col]
-                    df[col] = parsed
-                    report['converted'].append({'col': col, 'parsable_fraction': frac})
-                else:
-                    report['skipped'].append({'col': col, 'parsable_fraction': frac})
+                    report["skipped"].append({"col":c,"parsable_fraction":frac})
             return df, report
 
-        def detect_and_extract_dates(df, date_parse_enabled=True):
-            df = df.copy()
-            report = {'date_columns': [], 'skipped': []}
-            if not date_parse_enabled:
-                return df, report
-            candidate_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
-            for col in candidate_cols:
-                ser = df[col].astype(object)
-                sample = ser.dropna().astype(str).head(500)
-                if sample.empty:
-                    report['skipped'].append({'col': col, 'parsable_fraction': 0.0}); continue
-                parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True, utc=False)
-                parsable_frac = parsed.notna().mean()
-                if parsable_frac >= 0.6:
-                    full_parsed = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True, utc=False)
-                    df[col + "_orig"] = df[col]
-                    df[col] = full_parsed
-                    df[col + "_year"] = df[col].dt.year
-                    df[col + "_month"] = df[col].dt.month
-                    df[col + "_day"] = df[col].dt.day
-                    df[col + "_dayofweek"] = df[col].dt.dayofweek
-                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5,6]).astype('Int64')
-                    df[col + "_is_month_start"] = df[col].dt.is_month_start.astype('Int64')
-                    df[col + "_is_month_end"] = df[col].dt.is_month_end.astype('Int64')
-                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
-                    report['date_columns'].append({'col': col, 'parsable_fraction': parsable_frac})
+        def detect_dates(df):
+            df=df.copy(); rep={"date_columns":[], "skipped":[]}
+            cand=[c for c in df.columns if (df[c].dtype=="object" or str(df[c].dtype).startswith("string"))]
+            for c in cand:
+                s=df[c].dropna().astype(str).head(500)
+                if s.empty: rep["skipped"].append({"col":c,"parsable_fraction":0.0}); continue
+                parsed=pd.to_datetime(s, errors="coerce", utc=False)
+                frac=float(parsed.notna().mean())
+                if frac>=0.6:
+                    full=pd.to_datetime(df[c], errors="coerce", utc=False)
+                    df[c+"_orig"]=df[c]; df[c]=full
+                    df[c+"_year"]=df[c].dt.year
+                    df[c+"_month"]=df[c].dt.month
+                    df[c+"_day"]=df[c].dt.day
+                    df[c+"_dow"]=df[c].dt.dayofweek
+                    df[c+"_is_weekend"]=df[c].dt.dayofweek.isin([5,6]).astype("Int64")
+                    df[c+"_is_month_start"]=df[c].dt.is_month_start.astype("Int64")
+                    df[c+"_is_month_end"]=df[c].dt.is_month_end.astype("Int64")
+                    df[c+"_days_since_epoch"]=(df[c]-pd.Timestamp("1970-01-01"))//pd.Timedelta("1D")
+                    rep["date_columns"].append({"col":c,"parsable_fraction":frac})
                 else:
-                    report['skipped'].append({'col': col, 'parsable_fraction': parsable_frac})
-            return df, report
+                    rep["skipped"].append({"col":c,"parsable_fraction":frac})
+            return df, rep
 
-        def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
-            counts = series.value_counts(dropna=False)
-            n = len(series)
-            if threshold_count is not None:
-                rare = set(counts[counts <= threshold_count].index)
-            else:
-                rare = set(counts[counts <= max(1, int(threshold_frac * n))].index)
-            return series.map(lambda x: "__RARE__" if x in rare else x), rare
+        def collapse_rare(series, thr_frac=0.01, thr_count=None):
+            vc=series.value_counts(dropna=False)
+            n=len(series)
+            if thr_count is not None: rare=set(vc[vc<=thr_count].index)
+            else: rare=set(vc[vc<=max(1,int(thr_frac*n))].index)
+            return series.map(lambda x: "__RARE__" if x in rare else x), list(rare)
 
-        def string_similarity_group(series, score_threshold=90):
-            vals = [v for v in pd.Series(series.dropna().unique()).astype(str)]
-            mapping = {}
-            used = set()
-            for v in vals:
-                if v in used: continue
-                matches = rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=90)
-                group = [m[0] for m in matches]
-                for g in group:
-                    mapping[g] = v
-                    used.add(g)
-            return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
-
-        def drop_outliers_iqr(df, numeric_cols, fold=1.5):
-            if not numeric_cols:
-                return df, 0
-            q1 = df[numeric_cols].quantile(0.25)
-            q3 = df[numeric_cols].quantile(0.75)
-            iqr = q3 - q1
-            lower = q1 - fold * iqr
-            upper = q3 + fold * iqr
-            mask = pd.Series(True, index=df.index)
-            for c in numeric_cols:
-                mask &= df[c].ge(lower[c]) & df[c].le(upper[c])
-            before = len(df)
-            df2 = df.loc[mask].reset_index(drop=True)
-            return df2, before - len(df2)
-
-        def winsorize_df(df, numeric_cols, fold=1.5):
-            if not numeric_cols:
-                return df, 0
-            q1 = df[numeric_cols].quantile(0.25)
-            q3 = df[numeric_cols].quantile(0.75)
-            iqr = q3 - q1
-            lower = q1 - fold * iqr
-            upper = q3 + fold * iqr
-            df2 = df.copy()
-            for c in numeric_cols:
-                df2[c] = df2[c].clip(lower=lower[c], upper=upper[c])
-            return df2, 0
-
-        def choose_scaler_for_series(s):
-            v = s.dropna()
-            if v.empty:
-                return StandardScaler()
-            skew = float(v.skew())
-            kurt = float(v.kurtosis()) if len(v) > 3 else 0.0
-            if v.std(ddof=0) == 0:
-                return StandardScaler()
-            extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
-            if (v.min() >= 0.0 and v.max() <= 1.0):
-                return MinMaxScaler()
-            if abs(skew) >= 1.0:
-                return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', StandardScaler())])
-            if extreme_frac > 0.01 or abs(kurt) > 10:
-                return RobustScaler()
+        def choose_scaler(values):
+            v=pd.Series(values).dropna()
+            if v.empty: return StandardScaler()
+            if v.min()>=0 and v.max()<=1: return MinMaxScaler()
+            std=float(v.std(ddof=0))
+            if std==0: return StandardScaler()
+            skew=float(v.skew())
+            kurt=float(v.kurtosis()) if len(v)>3 else 0.0
+            extreme=float(((v-v.mean()).abs()>3*std).mean())
+            if abs(skew)>=1.0: return Pipeline([("power",PowerTransformer(method="yeo-johnson")),("std",StandardScaler())])
+            if extreme>0.01 or abs(kurt)>10: return RobustScaler()
             return StandardScaler()
 
-        def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
-            n = len(series)
-            nunique = series.nunique(dropna=True)
-            high_card = (nunique > max(50, 0.05 * n))
-            if high_card:
-                if target_series is not None and train_mode:
-                    enc = ce.TargetEncoder(cols=[col], smoothing=0.3)
-                    return 'target', enc, {}
-                else:
-                    return 'count', None, {}
-            else:
-                if nunique <= 10:
-                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                    return 'onehot', enc, {}
-                if target_series is not None and train_mode:
-                    enc = ce.TargetEncoder(cols=[col], smoothing=0.3)
-                    return 'target', enc, {}
-                else:
-                    enc = OrdinalEncoder()
-                    return 'ordinal', enc, {}
-
-        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
-            X_col = df[col].astype(object).fillna('__NA__')
-            global_mean = y.mean()
-            oof = pd.Series(index=df.index, dtype=float)
-            kf = KFold(n_splits=min(n_splits, max(2, len(df)//10)), shuffle=True, random_state=42)
-            for tr_idx, val_idx in kf.split(df):
-                means = y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
-                oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: means.get(v, global_mean))
-            counts = X_col.value_counts()
-            smooth_map = {}
-            for cat, cnt in counts.items():
-                cat_mean = y[X_col == cat].mean() if cnt > 0 else global_mean
-                alpha = cnt / (cnt + smoothing)
-                smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
-            return oof.fillna(global_mean), smooth_map, global_mean
-
         class Preprocessor:
-            def __init__(self):
-                self.num_cols = []
-                self.cat_cols = []
-                self.col_config = {}
-                self.global_metadata = {}
+            def __init__(self, config):
+                self.cfg=config
+                self.num_cols=[]; self.cat_cols=[]
+                self.col_cfg={}
+                self.outlier_limits=None
 
-            def fit(self, df, y=None, config=None):
-                self.global_metadata['config'] = config or {}
-                nrows = len(df)
-                self.num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-                self.cat_cols = [c for c in df.columns if c not in self.num_cols]
+            def _profile(self, X):
+                self.num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+                self.cat_cols = [c for c in X.columns if c not in self.num_cols]
+
+            def fit(self, X, y=None):
+                self._profile(X)
+                n=len(X)
                 for c in self.num_cols:
-                    s = df[c]
-                    cfg = {}
-                    missing_frac = s.isna().mean()
-                    cfg['missing_frac'] = float(missing_frac)
-                    cfg['n_unique'] = int(s.nunique(dropna=True))
-                    cfg['skew'] = float(s.dropna().skew()) if s.dropna().shape[0] > 2 else 0.0
-                    cfg['kurtosis'] = float(s.dropna().kurtosis()) if s.dropna().shape[0] > 3 else 0.0
-                    if missing_frac == 0:
-                        cfg['imputer'] = ('none', None)
-                    elif missing_frac < 0.02:
-                        imp = SimpleImputer(strategy='median')
-                        imp.fit(np.array(s).reshape(-1, 1))
-                        cfg['imputer'] = ('simple_median', imp)
+                    s=X[c]
+                    miss=float(s.isna().mean())
+                    nc={}
+                    if miss==0: nc["imputer"]=("none", None)
+                    elif miss<0.02:
+                        imp=SimpleImputer(strategy="median"); imp.fit(s.values.reshape(-1,1))
+                        nc["imputer"]=("simple_median", imp)
                     else:
-                        if nrows <= self.global_metadata['config'].get('max_knn_rows', 5000) and missing_frac < 0.25:
-                            cfg['imputer'] = ('knn', {'n_neighbors': 5})
+                        if n<=self.cfg.get("max_knn_rows",5000) and miss<0.25:
+                            nc["imputer"]=("knn", {"n_neighbors":5})
                         else:
-                            cfg['imputer'] = ('iterative', {'max_iter': 10, 'random_state': 0})
-                    cfg['scaler_choice'] = 'auto'
-                    self.col_config[c] = cfg
+                            nc["imputer"]=("iterative", {"max_iter":10, "random_state":0})
+                    tmp=s.fillna(s.median())
+                    sc=choose_scaler(tmp)
+                    try: sc.fit(tmp.values.reshape(-1,1))
+                    except: sc=StandardScaler().fit(tmp.values.reshape(-1,1))
+                    nc["scaler"]=sc
+                    self.col_cfg[c]=nc
                 for c in self.cat_cols:
-                    s = df[c].astype(object)
-                    cfg = {}
-                    cfg['n_unique'] = int(s.nunique(dropna=True))
-                    cfg['missing_frac'] = float(s.isna().mean())
-                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
-                    cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
-                    enc_name, enc_obj, _ = choose_categorical_encoder(c, s, (y if y is not None else None), train_mode=(y is not None))
-                    cfg['encoder_type'] = enc_name
-                    cfg['encoder_obj'] = enc_obj
-                    self.col_config[c] = cfg
-                if y is not None:
-                    for c in self.cat_cols:
-                        cfg = self.col_config[c]
-                        if cfg['encoder_type'] == 'target':
-                            _, mapping, global_mean = fit_target_encoder_kfold(df, c, y, n_splits=5)
-                            cfg['target_mapping'] = mapping
-                            cfg['target_global_mean'] = float(global_mean)
-                        elif cfg['encoder_type'] == 'count':
-                            counts = df[c].astype(object).value_counts().to_dict()
-                            cfg['count_map'] = counts
-                self.global_metadata['num_cols'] = self.num_cols
-                self.global_metadata['cat_cols'] = self.cat_cols
+                    s=X[c].astype(object)
+                    nunique=int(s.nunique(dropna=True)); high = nunique>max(50, 0.05*len(X))
+                    cc={"nunique":nunique,"high_card":high,"rare_threshold":self.cfg.get("rare_threshold",0.01)}
+                    if high:
+                        if y is not None and self.cfg.get("model_type")=="classification": cc["encoder"]="target"
+                        else: cc["encoder"]="count"
+                    else:
+                        if nunique<=10: cc["encoder"]="onehot"
+                        else:
+                            if y is not None and self.cfg.get("model_type")=="classification": cc["encoder"]="target"
+                            else: cc["encoder"]="ordinal"
+                    self.col_cfg[c]=cc
+                if self.cfg.get("outlier_strategy")=="winsorize" and self.num_cols:
+                    q1=X[self.num_cols].quantile(0.25); q3=X[self.num_cols].quantile(0.75); iqr=q3-q1
+                    l=q1 - self.cfg.get("outlier_fold",1.5)*iqr; u=q3 + self.cfg.get("outlier_fold",1.5)*iqr
+                    self.outlier_limits={"lower":l.to_dict(), "upper":u.to_dict()}
                 return self
 
-            def transform(self, df, training_mode=False):
-                df = df.copy()
-                config_local = self.global_metadata.get('config') or {}
-                temp_df = df.copy()
-                for c in self.num_cols:
-                    cfgc = self.col_config.get(c, {})
-                    imputer_info = cfgc.get('imputer', ('none', None))
-                    if imputer_info[0] in ('knn','iterative'):
-                        med = temp_df[c].median()
-                        temp_df[c] = temp_df[c].fillna(med)
-                scaler_objs = {}
-                for c in self.num_cols:
-                    sample = temp_df[c]
-                    scaler = choose_scaler_for_series(sample)
-                    try:
-                        scaler.fit(sample.values.reshape(-1,1))
-                    except Exception:
-                        scaler = StandardScaler()
-                        scaler.fit(sample.values.reshape(-1,1))
-                    scaler_objs[c] = scaler
-                    self.col_config[c]['scaler_obj'] = scaler
-                num_matrix = temp_df[self.num_cols].copy()
-                scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
-                for i, c in enumerate(self.num_cols):
-                    sc = scaler_objs[c]
-                    col_vals = num_matrix[c].values.reshape(-1,1)
-                    try:
-                        scaled_col = sc.transform(col_vals).reshape(-1)
-                    except Exception:
-                        scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
-                    scaled_matrix[:, i] = scaled_col
-                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
-                need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='knn']
-                if need_knn:
-                    base_imp = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
-                    k = 5
-                    if isinstance(base_imp, dict):
-                        k = base_imp.get('n_neighbors', 5)
-                    knn = KNNImputer(n_neighbors=k)
-                    imputed_scaled = knn.fit_transform(scaled_df)
-                    imputed_scaled_df = pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
-                    for c in self.num_cols:
-                        sc = scaler_objs[c]
-                        try:
-                            inv = sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
-                        except Exception:
-                            inv = sc.fit_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
-                        df[c] = inv
-                need_iter = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='iterative']
+            def _impute(self, X):
+                X=X.copy()
+                need_iter=[c for c in self.num_cols if self.col_cfg[c]["imputer"][0]=="iterative"]
                 if need_iter:
-                    base_imp2 = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
-                    max_iter = 10
-                    if isinstance(base_imp2, dict):
-                        max_iter = base_imp2.get('max_iter', 10)
-                    iter_imp = IterativeImputer(max_iter=max_iter, random_state=0)
-                    iter_out = iter_imp.fit_transform(df[self.num_cols])
-                    df[self.num_cols] = pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
-                    for c in need_iter:
-                        self.col_config[c]['imputer_obj'] = iter_imp
+                    iter_imp=IterativeImputer(max_iter=self.col_cfg[need_iter[0]]["imputer"][1]["max_iter"], random_state=0)
+                    blk=X[self.num_cols].replace([np.inf,-np.inf], np.nan)
+                    X[self.num_cols]=iter_imp.fit_transform(blk)
+                need_knn=[c for c in self.num_cols if self.col_cfg[c]["imputer"][0]=="knn"]
+                if need_knn:
+                    knn=KNNImputer(n_neighbors=self.col_cfg[need_knn[0]]["imputer"][1]["n_neighbors"])
+                    blk=X[self.num_cols].replace([np.inf,-np.inf], np.nan)
+                    X[self.num_cols]=knn.fit_transform(blk)
                 for c in self.num_cols:
-                    cfgc = self.col_config[c]
-                    if cfgc['imputer'][0] == 'simple_median':
-                        imp = cfgc['imputer'][1]
-                        df[c] = imp.transform(df[[c]])
-                strat = config_local.get('outlier_strategy', 'drop_iqr')
-                if training_mode and strat == 'drop_iqr':
-                    df, n_removed = drop_outliers_iqr(df, self.num_cols, fold=config_local.get('outlier_fold',1.5))
-                    self.global_metadata['outliers_removed'] = int(n_removed)
-                elif training_mode and strat == 'winsorize':
-                    df, _ = winsorize_df(df, self.num_cols, fold=config_local.get('outlier_fold',1.5))
+                    imp=self.col_cfg[c]["imputer"]
+                    if imp[0]=="simple_median":
+                        X[c]=imp[1].transform(X[[c]])
+                return X
+
+            def _outliers_fit_stage(self, X):
+                if self.cfg.get("outlier_strategy")=="drop_iqr" and self.num_cols:
+                    q1=X[self.num_cols].quantile(0.25); q3=X[self.num_cols].quantile(0.75); iqr=q3-q1
+                    l=q1 - self.cfg.get("outlier_fold",1.5)*iqr; u=q3 + self.cfg.get("outlier_fold",1.5)*iqr
+                    mask=pd.Series(True,index=X.index)
+                    for c in self.num_cols: mask &= X[c].ge(l[c]) & X[c].le(u[c])
+                    return X.loc[mask].reset_index(drop=True)
+                if self.cfg.get("outlier_strategy")=="winsorize" and self.outlier_limits:
+                    for c in self.num_cols:
+                        lo=self.outlier_limits["lower"][c]; hi=self.outlier_limits["upper"][c]
+                        X[c]=X[c].clip(lower=lo, upper=hi)
+                return X
+
+            def _scale(self, X):
+                X=X.copy()
                 for c in self.num_cols:
-                    sc = self.col_config[c].get('scaler_obj')
-                    if sc is None:
-                        sc = choose_scaler_for_series(df[c].fillna(df[c].median()))
-                    try:
-                        transformed = sc.transform(df[[c]].values)
-                        df[c] = transformed.reshape(-1)
-                    except Exception:
-                        try:
-                            df[c] = sc.fit_transform(df[[c]].values).reshape(-1)
-                        except Exception:
-                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
-                    self.col_config[c]['scaler_obj'] = sc
-                for c in self.cat_cols:
-                    cfgc = self.col_config[c]
-                    s = df[c].astype(object) if c in df.columns else pd.Series([np.nan]*len(df), index=df.index)
-                    rare_thresh = cfgc.get('rare_threshold_frac', 0.01)
-                    if rare_thresh < 1.0:
-                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
+                    sc=self.col_cfg[c]["scaler"]
+                    try: X[c]=sc.transform(X[[c]]).reshape(-1)
+                    except:
+                        sc=StandardScaler().fit(X[[c]].fillna(X[c].median()))
+                        X[c]=sc.transform(X[[c]]).reshape(-1)
+                        self.col_cfg[c]["scaler"]=sc
+                return X
+
+            def _encode(self, X, y=None, training=True):
+                X=X.copy()
+                for c in list(self.cat_cols):
+                    if c not in X.columns: continue
+                    s=X[c].astype(object)
+                    thr=self.col_cfg[c].get("rare_threshold",0.01)
+                    if thr<1.0: s, rare = collapse_rare(s, thr_frac=thr)
+                    else: s, rare = collapse_rare(s, thr_frac=0.01, thr_count=int(thr))
+                    X[c]=s
+                    enc=self.col_cfg[c]["encoder"]
+                    if enc=="onehot":
+                        ohe=OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+                        arr=ohe.fit_transform(X[[c]].astype(str)) if training else ohe.transform(X[[c]].astype(str))
+                        cols=[f"{c}__{v}" for v in ohe.categories_[0]]
+                        X=pd.concat([X.drop(columns=[c]), pd.DataFrame(arr,columns=cols,index=X.index)], axis=1)
+                        self.col_cfg[c]["ohe"]=ohe; self.col_cfg[c]["ohe_cols"]=cols
+                    elif enc=="ordinal":
+                        oe=OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+                        X[c]= (oe.fit_transform(X[[c]]) if training else oe.transform(X[[c]])).astype(float)
+                        self.col_cfg[c]["ord"]=oe
+                    elif enc=="count":
+                        if training:
+                            vc=X[c].value_counts().to_dict(); self.col_cfg[c]["count_map"]=vc
+                        vc=self.col_cfg[c]["count_map"]
+                        X[c]=X[c].map(lambda v: vc.get(v,0)).astype(float)
+                    elif enc=="target" and y is not None and training:
+                        ser=X[c].astype(object); tgt=pd.Series(y).astype(float)
+                        prior=float(tgt.mean())
+                        counts=ser.value_counts()
+                        means=tgt.groupby(ser).mean()
+                        smooth={k:(means.get(k,prior)* (cnt/(cnt+10)) + prior*(10/(cnt+10))) for k,cnt in counts.items()}
+                        self.col_cfg[c]["tgt_map"]=smooth; self.col_cfg[c]["tgt_prior"]=prior
+                        X[c]=ser.map(lambda v: smooth.get(v, prior)).astype(float)
+                    elif enc=="target" and y is None and not training:
+                        prior=self.col_cfg[c].get("tgt_prior",0.0); mp=self.col_cfg[c].get("tgt_map",{})
+                        X[c]=X[c].astype(object).map(lambda v: mp.get(v, prior)).astype(float)
                     else:
-                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
-                    s2 = collapsed
-                    if self.global_metadata['config'].get('enable_string_similarity', False) and cfgc.get('n_unique', 0) > 20:
-                        grouped, mapping = string_similarity_group(s2, score_threshold=90)
-                        s2 = grouped
-                        cfgc['string_similarity_map'] = mapping
-                    enc_type = cfgc.get('encoder_type')
-                    if enc_type == 'onehot':
-                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                        resh = s2.to_frame(c).astype(str)
-                        ohe.fit(resh)
-                        arr = ohe.transform(resh)
-                        cols = [f"{c}__{cat}" for cat in ohe.categories_[0]]
-                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
-                        df = pd.concat([df.drop(columns=[c], errors='ignore'), df_ohe], axis=1)
-                        cfgc['encoder_obj'] = ohe
-                        cfgc['ohe_columns'] = cols
-                    elif enc_type == 'ordinal':
-                        ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-                        resh = s2.to_frame(c).astype(object)
-                        try:
-                            ord_enc.fit(resh)
-                            df[c] = ord_enc.transform(resh).astype(float)
-                            cfgc['encoder_obj'] = ord_enc
-                        except Exception:
-                            df[c] = s2.astype('category').cat.codes.astype(float)
-                    elif enc_type == 'count':
-                        cnt_map = s2.value_counts().to_dict()
-                        df[c] = s2.map(lambda x: cnt_map.get(x, 0)).astype(float)
-                        cfgc['count_map'] = cnt_map
-                    elif enc_type == 'target':
-                        mapping = cfgc.get('target_mapping', {})
-                        global_mean = cfgc.get('target_global_mean', 0.0)
-                        df[c] = s2.map(lambda x: mapping.get(x, global_mean)).astype(float)
-                    else:
-                        df[c] = s2.astype('category').cat.codes.replace({-1: np.nan}).astype(float)
-                return df
+                        X[c]=X[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                return X
 
-            def save(self, path):
-                joblib.dump(self, path)
+            def fit_transform(self, X, y=None):
+                X=X.replace([np.inf,-np.inf], np.nan)
+                X=self._impute(X)
+                X=self._outliers_fit_stage(X)
+                X=self._scale(X)
+                X=self._encode(X, y=y, training=True)
+                X=X.replace([np.inf,-np.inf], np.nan)
+                for c in X.columns:
+                    if X[c].dtype=="object":
+                        try: X[c]=pd.to_numeric(X[c], errors="coerce")
+                        except: pass
+                return X
 
-            @staticmethod
-            def load(path):
-                return joblib.load(path)
+            def transform(self, X):
+                X=X.replace([np.inf,-np.inf], np.nan)
+                X=self._impute(X)
+                if self.cfg.get("outlier_strategy")=="winsorize" and self.outlier_limits:
+                    for c in self.num_cols:
+                        lo=self.outlier_limits["lower"][c]; hi=self.outlier_limits["upper"][c]
+                        X[c]=X[c].clip(lower=lo, upper=hi)
+                X=self._scale(X)
+                X=self._encode(X, y=None, training=False)
+                X=X.replace([np.inf,-np.inf], np.nan)
+                return X
 
-        def _cls_name(obj):
-            try:
-                return obj.__class__.__name__
-            except Exception:
-                return str(obj)
-
-        def print_before_preview(df, target_col):
-            print("BEFORE PREPROCESSING: df.head()")
-            try:
-                print(df.head().to_string())
-            except Exception:
-                print(df.head())
-            print("BEFORE PREPROCESSING: dtypes ")
-            print(df.dtypes.astype(str))
-            print("BEFORE PREPROCESSING: missing counts")
-            print(df.isna().sum())
-
-        def print_plan(pre, config):
-            print("PLAN: per-column strategies selected during fit()")
-            print("Numeric columns:", pre.num_cols)
-            print("Categorical columns:", pre.cat_cols)
-            for c in pre.num_cols:
-                cfg = pre.col_config.get(c, {})
-                imp = cfg.get('imputer', ('none', None))
-                sc = cfg.get('scaler_obj')
-                print(f"[NUM] {c} | missing_frac={cfg.get('missing_frac')} | imputer={imp[0]} | scaler={_cls_name(sc) if sc else 'auto'}")
-            for c in pre.cat_cols:
-                cfg = pre.col_config.get(c, {})
-                print(f"[CAT] {c} | n_unique={cfg.get('n_unique')} | high_card={cfg.get('high_card')} | encoder={cfg.get('encoder_type')} | rare_threshold={cfg.get('rare_threshold_frac')}")
-
-        def print_after_report(X_processed, pre):
-            print("AFTER PREPROCESSING: df.head() ")
-            try:
-                print(X_processed.head().to_string())
-            except Exception:
-                print(X_processed.head())
-            print("AFTER PREPROCESSING: dtypes ")
-            print(X_processed.dtypes.astype(str))
-            print("AFTER PREPROCESSING: missing counts ")
-            print(X_processed.isna().sum())
-            print("AFTER PREPROCESSING: per-original-column transformations applied")
-            for c in pre.global_metadata.get('num_cols', []):
-                cfg = pre.col_config.get(c, {})
-                imp = cfg.get('imputer', ('none', None))
-                sc = cfg.get('scaler_obj')
-                col_dtype = str(X_processed[c].dtype) if c in X_processed.columns else 'transformed/removed'
-                print(f"[NUM] {c} -> dtype={col_dtype} | imputer={imp[0]} | scaler={_cls_name(sc)}")
-            for c in pre.global_metadata.get('cat_cols', []):
-                cfg = pre.col_config.get(c, {})
-                enc = cfg.get('encoder_type')
-                if enc == 'onehot':
-                    cols = cfg.get('ohe_columns', [])
-                    show = ', '.join(cols[:10]) + (' ...' if len(cols) > 10 else '')
-                    print(f"[CAT] {c} -> onehot columns={len(cols)}: {show}")
+        class FeatureSelector:
+            def __init__(self, task):
+                self.task=task
+                self.mi_selector=None
+                self.model_selector=None
+                self.selected_features=[]
+            def _auto_k(self, p):
+                return max(5, min(int(round(math.sqrt(p)*2)), p))
+            def fit(self, X, y):
+                p=X.shape[1]
+                k=self._auto_k(p)
+                if self.task=="classification":
+                    self.mi_selector = SelectKBest(score_func=mutual_info_classif, k=k).fit(X, y)
                 else:
-                    dtype = str(X_processed[c].dtype) if c in X_processed.columns else 'n/a'
-                    print(f"[CAT] {c} -> encoded as {enc} | dtype={dtype}")
+                    self.mi_selector = SelectKBest(score_func=mutual_info_regression, k=k).fit(X, y)
+                X1=self.mi_selector.transform(X)
+                if self.task=="classification":
+                    clf=LogisticRegression(penalty="l1", solver="saga", C=1.0, max_iter=2000)
+                    self.model_selector = SelectFromModel(estimator=clf, max_features=X1.shape[1], threshold="median").fit(X1, y)
+                else:
+                    lasso=LassoCV(cv=5, random_state=0)
+                    self.model_selector = SelectFromModel(estimator=lasso, max_features=X1.shape[1], threshold="median").fit(X1, y)
+                mask1=self.mi_selector.get_support()
+                mask2=self.model_selector.get_support()
+                cols=np.array(X.columns)[mask1][mask2]
+                self.selected_features=list(cols)
+                return self
+            def transform(self, X):
+                X1=self.mi_selector.transform(X)
+                X2=self.model_selector.transform(X1)
+                return pd.DataFrame(X2, columns=self.selected_features, index=X.index)
 
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--in_file', type=str, required=True)
-        parser.add_argument('--target_column', type=str, required=True)
-        parser.add_argument('--outlier_strategy', type=str, default="drop_iqr")
-        parser.add_argument('--outlier_fold', type=float, default=1.5)
-        parser.add_argument('--max_knn_rows', type=int, default=5000)
-        parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
-        parser.add_argument('--rare_threshold', type=float, default=0.01)
-        parser.add_argument('--enable_string_similarity', type=str, default="false")
-        parser.add_argument('--preview_rows', type=int, default=20)
-        parser.add_argument('--mode', type=str, default="fit")
-        parser.add_argument('--preprocessor_in', type=str, default="")
-        parser.add_argument('--X', type=str, required=True)
-        parser.add_argument('--y', type=str, required=True)
-        parser.add_argument('--preprocessor', type=str, required=True)
-        parser.add_argument('--preprocess_metadata', type=str, required=True)
-        args = parser.parse_args()
+        def print_before(df, target):
+            print("BEFORE: head"); print(df.head())
+            print("BEFORE: dtypes"); print(df.dtypes.astype(str))
+            print("BEFORE: missing"); print(df.isna().sum())
+
+        def print_after(X, selected_cols):
+            print("AFTER: head"); 
+            try: print(X.head().to_string())
+            except: print(X.head())
+            print("AFTER: dtypes"); print(X.dtypes.astype(str))
+            print("AFTER: missing"); print(X.isna().sum())
+            print("SELECTED FEATURES:", selected_cols)
+
+        parser=argparse.ArgumentParser()
+        parser.add_argument("--in_file", type=str, required=True)
+        parser.add_argument("--target_column", type=str, required=True)
+        parser.add_argument("--model_type", type=str, required=True)
+        parser.add_argument("--outlier_strategy", type=str, default="drop_iqr")
+        parser.add_argument("--outlier_fold", type=float, default=1.5)
+        parser.add_argument("--max_knn_rows", type=int, default=5000)
+        parser.add_argument("--numeric_detection_threshold", type=float, default=0.6)
+        parser.add_argument("--rare_threshold", type=float, default=0.01)
+        parser.add_argument("--enable_string_similarity", type=str, default="false")
+        parser.add_argument("--preview_rows", type=int, default=20)
+        parser.add_argument("--X", type=str, required=True)
+        parser.add_argument("--y", type=str, required=True)
+        parser.add_argument("--preprocessor", type=str, required=True)
+        parser.add_argument("--feature_selector", type=str, required=True)
+        parser.add_argument("--preprocess_metadata", type=str, required=True)
+        args=parser.parse_args()
 
         try:
-            in_path = args.in_file
-            target_col = args.target_column
-            outlier_strategy = args.outlier_strategy
-            outlier_fold = float(args.outlier_fold)
-            max_knn_rows = int(args.max_knn_rows)
-            detect_thresh = float(args.numeric_detection_threshold)
-            rare_threshold = float(args.rare_threshold)
-            enable_string_similarity = str(args.enable_string_similarity).lower() in ("1","true","t","yes","y")
-            preview_rows = int(args.preview_rows)
-            mode = str(args.mode).strip().lower()
-            pre_in = args.preprocessor_in or ""
-            out_X = args.X
-            out_y = args.y
-            preproc_path = args.preprocessor
-            meta_path = args.preprocess_metadata
+            df=load_table(args.in_file)
+            df=df.drop_duplicates(keep="first").reset_index(drop=True)
+            if args.target_column not in df.columns:
+                print(f"ERROR missing target: {args.target_column}", file=sys.stderr); sys.exit(1)
+            print_before(df, args.target_column)
 
-            if not os.path.exists(in_path):
-                print("ERROR: input file does not exist:", in_path, file=sys.stderr)
-                sys.exit(1)
-            print("Loading:", in_path)
-            df = read_with_pandas(in_path)
-            print("Loaded shape:", df.shape)
-
-            before = len(df)
-            df = df.drop_duplicates(keep='first')
-            print(f"Removed duplicates: {before - len(df)} rows dropped")
-
-            if target_col not in df.columns and mode == "fit":
-                print(f"ERROR: target column '{target_col}' not found in data", file=sys.stderr)
-                sys.exit(1)
-
-            print_before_preview(df, target_col if target_col in df.columns else None)
-
-            conv_report = {}
-            date_report = {}
-
-            if mode == "fit":
-                before = len(df)
-                df = df[df[target_col].notna()].reset_index(drop=True)
-                print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
-
-                print("Converting object columns to numeric where possible...")
-                df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
-
-                print("Detecting date-like columns...")
-                df, date_report = detect_and_extract_dates(df, date_parse_enabled=True)
-
-                config = {
-                    'outlier_strategy': outlier_strategy,
-                    'outlier_fold': outlier_fold,
-                    'max_knn_rows': max_knn_rows,
-                    'numeric_detection_threshold': detect_thresh,
-                    'rare_threshold': rare_threshold,
-                    'enable_string_similarity': enable_string_similarity
-                }
-
-                pre = Preprocessor()
-                y_ser = df[[target_col]].copy()
-                X_df_init = df.drop(columns=[target_col]).copy()
-                pre.fit(X_df_init, y=y_ser[target_col] if not y_ser.empty else None, config=config)
-
-                print_plan(pre, config)
-
-                print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
-                X_processed = pre.transform(X_df_init, training_mode=True)
-
-            elif mode == "transform":
-                if not pre_in or not os.path.exists(pre_in):
-                    print("ERROR: mode=transform requires --preprocessor_in path to an existing pickle", file=sys.stderr)
-                    sys.exit(1)
-
-                pre = Preprocessor.load(pre_in)
-                loaded_cfg = pre.global_metadata.get('config', {}) or {}
-                print("Loaded preprocessor config:", json.dumps(loaded_cfg))
-
-                print("Converting object columns to numeric where possible (inference)...")
-                df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
-
-                print("Detecting date-like columns (inference)...")
-                df, date_report = detect_and_extract_dates(df, date_parse_enabled=True)
-
-                expected_num = pre.global_metadata.get('num_cols', [])
-                expected_cat = pre.global_metadata.get('cat_cols', [])
-                expected_all = list(dict.fromkeys(expected_num + expected_cat))
-                missing = [c for c in expected_all if c not in df.columns]
-                extra = [c for c in df.columns if c not in expected_all]
-                if missing:
-                    print("Warning: missing expected columns at inference:", missing)
-                if extra:
-                    print("Info: extra columns at inference will be ignored:", extra)
-                X_df_init = df.reindex(columns=expected_all, fill_value=np.nan)
-
-                pre.global_metadata['config'] = dict(loaded_cfg)
-                pre.global_metadata['config']['outlier_strategy'] = 'none'
-
-                y_ser = df[[target_col]].copy() if target_col in df.columns else pd.DataFrame()
-
-                print("Applying transform with loaded preprocessor...")
-                X_processed = pre.transform(X_df_init, training_mode=False)
-
-            else:
-                print("ERROR: --mode must be 'fit' or 'transform'", file=sys.stderr)
-                sys.exit(1)
-
-            for c in list(X_processed.columns):
-                if X_processed[c].dtype == 'object':
-                    try:
-                        X_processed[c] = pd.to_numeric(X_processed[c], errors='coerce')
-                    except Exception:
-                        pass
-
-            print("Optimizing numeric dtypes...")
-            for col in X_processed.select_dtypes(include=[np.number]).columns:
-                col_min = X_processed[col].min(skipna=True)
-                col_max = X_processed[col].max(skipna=True)
-                if pd.api.types.is_integer_dtype(X_processed[col].dtype) or np.allclose(X_processed[col].dropna(), np.round(X_processed[col].dropna())):
-                    try:
-                        if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
-                            X_processed[col] = X_processed[col].astype('Int8')
-                        elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
-                            X_processed[col] = X_processed[col].astype('Int16')
-                        elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
-                            X_processed[col] = X_processed[col].astype('Int32')
-                        else:
-                            X_processed[col] = X_processed[col].astype('Int64')
-                    except Exception:
-                        X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
+            y=df[args.target_column].copy()
+            model_type=args.model_type.strip().lower()
+            if model_type=="classification":
+                mapping_bool={"true":1,"false":0,"yes":1,"no":0,"y":1,"n":0,"t":1,"f":0,"1":1,"0":0}
+                def labelize(v):
+                    if pd.isna(v): return np.nan
+                    s=str(v).strip().lower()
+                    if s in mapping_bool: return mapping_bool[s]
+                    if s in {"male","m"}: return 1
+                    if s in {"female","f"}: return 0
+                    if s in {"other","others","o"}: return 2
+                    try: return int(float(s))
+                    except: return s
+                y_lab = y.map(labelize)
+                if not pd.api.types.is_numeric_dtype(y_lab):
+                    y_codes, _ = pd.factorize(y_lab, sort=True)
+                    y = pd.Series(y_codes, index=y.index).astype(int)
                 else:
-                    X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
-
-            print_after_report(X_processed, pre)
-
-            def makedirs_for(p):
-                d = os.path.dirname(p)
-                if d and not os.path.exists(d):
-                    os.makedirs(d, exist_ok=True)
-            makedirs_for(out_X); makedirs_for(out_y); makedirs_for(preproc_path); makedirs_for(meta_path)
-
-            X_processed.to_parquet(out_X, index=False)
-            print("Wrote X parquet:", out_X)
-
-            if 'y_ser' in locals() and not y_ser.empty:
-                y_ser.to_parquet(out_y, index=False)
-                print("Wrote y parquet:", out_y)
+                    y = y_lab.astype(int)
             else:
-                import pandas as pd
-                pd.DataFrame().to_parquet(out_y)
-                print("Wrote empty y parquet:", out_y)
+                y = pd.to_numeric(y, errors="coerce")
 
-            if mode == "fit":
-                pre.save(preproc_path)
-                print("Saved preprocessor pickle:", preproc_path)
-            else:
-                if os.path.exists(pre_in):
-                    import shutil
-                    shutil.copy(pre_in, preproc_path)
-                    print("Copied existing preprocessor pickle to output path:", preproc_path)
+            mask = y.notna()
+            df = df.loc[mask].reset_index(drop=True)
+            y = y.loc[mask].reset_index(drop=True)
 
-            metadata = {
-                'timestamp': datetime.utcnow().isoformat() + 'Z',
-                'mode': mode,
-                'config_effective': pre.global_metadata.get('config', {}),
-                'conversion_report': conv_report,
-                'date_report': date_report,
-                'col_config': {k: {kk: (str(v) if not hasattr(v, '__name__') else v.__name__) for kk, v in cfg.items()} for k, cfg in pre.col_config.items()},
-                'num_cols': pre.global_metadata.get('num_cols', []),
-                'cat_cols': pre.global_metadata.get('cat_cols', [])
+            df, conv_rep = convert_objects_to_numeric(df, thr=args.numeric_detection_threshold)
+            df, date_rep = detect_dates(df)
+
+            X = df.drop(columns=[args.target_column]).copy()
+
+            cfg={
+                "model_type": model_type,
+                "outlier_strategy": args.outlier_strategy,
+                "outlier_fold": float(args.outlier_fold),
+                "max_knn_rows": int(args.max_knn_rows),
+                "rare_threshold": float(args.rare_threshold),
             }
-            with open(meta_path, 'w', encoding='utf-8') as fh:
-                json.dump(metadata, fh, indent=2, ensure_ascii=False)
-            print("Saved preprocess metadata:", meta_path)
+            pre = Preprocessor(cfg)
+            Xp = pre.fit_transform(X, y=y if model_type=="classification" else None)
 
-            print("SUCCESS: Preprocessing complete.")
-        except Exception as exc:
-            print("ERROR during preprocessing:", exc, file=sys.stderr)
+            Xp = Xp.replace([np.inf,-np.inf], np.nan)
+            for c in Xp.columns:
+                if Xp[c].dtype=="object":
+                    try: Xp[c]=pd.to_numeric(Xp[c], errors="coerce")
+                    except: pass
+            Xp = Xp.fillna(0.0)
+
+            fs = FeatureSelector("classification" if model_type=="classification" else "regression")
+            fs.fit(Xp, y if model_type=="classification" else pd.to_numeric(y, errors="coerce").fillna(y.mean()))
+            Xs = fs.transform(Xp)
+
+            print_after(Xs, fs.selected_features)
+
+            ensure_dir_for(args.X); ensure_dir_for(args.y); ensure_dir_for(args.preprocessor); ensure_dir_for(args.feature_selector); ensure_dir_for(args.preprocess_metadata)
+            Xs.to_parquet(args.X, index=False)
+            y.to_parquet(args.y, index=False)
+            joblib.dump(pre, args.preprocessor)
+            joblib.dump(fs, args.feature_selector)
+
+            meta={
+                "timestamp": datetime.utcnow().isoformat()+"Z",
+                "model_type": model_type,
+                "conversion_report": conv_rep,
+                "date_report": date_rep,
+                "selected_features": fs.selected_features,
+            }
+            with open(args.preprocess_metadata, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, indent=2, ensure_ascii=False)
+            print("SUCCESS saved outputs.")
+        except Exception as e:
+            print("ERROR during preprocessing:", e, file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
     args:
@@ -850,6 +547,8 @@ implementation:
       - {inputPath: in_file}
       - --target_column
       - {inputValue: target_column}
+      - --model_type
+      - {inputValue: model_type}
       - --outlier_strategy
       - {inputValue: outlier_strategy}
       - --outlier_fold
@@ -864,15 +563,13 @@ implementation:
       - {inputValue: enable_string_similarity}
       - --preview_rows
       - {inputValue: preview_rows}
-      - --mode
-      - {inputValue: mode}
-      - --preprocessor_in
-      - {inputPath: preprocessor_in}
       - --X
       - {outputPath: X}
       - --y
       - {outputPath: y}
       - --preprocessor
       - {outputPath: preprocessor}
+      - --feature_selector
+      - {outputPath: feature_selector}
       - --preprocess_metadata
       - {outputPath: preprocess_metadata}
