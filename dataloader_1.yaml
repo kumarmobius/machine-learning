@@ -43,7 +43,7 @@ implementation:
         parser.add_argument('--train_file', type=str, required=True)
         parser.add_argument('--test_x_file', type=str, required=True)
         parser.add_argument('--test_y_file', type=str, required=True)
-        parser.add_argument('--test_split', type=int, default=20 help='Test split percent (1-99)')
+        parser.add_argument('--test_split', type=int, default=20,help='Test split percent (1-99)')
         args = parser.parse_args()
 
         # Load access token
