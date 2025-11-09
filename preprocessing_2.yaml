@@ -1,4 +1,4 @@
-name: Load & Preprocess V2
+name: Load & Preprocess V3
 description: |
   End-to-end robust preprocessing + automatic feature selection.
   - Smart numeric parsing: currencies, multipliers (k/m/b/t), percents, mixed tokens.
@@ -532,14 +532,14 @@ implementation:
 
             # make y a DataFrame to avoid Series.to_parquet errors
             if isinstance(y, pd.Series):
-                y_df = y.to_frame(name=target_column)
+                y_df = y.to_frame(name=args.target_column)
             elif isinstance(y, pd.DataFrame):
                 y_df = y
             else:
                 y_df = pd.DataFrame({target_column: y})
             
             Xs.to_parquet(args.X, index=False)
-            y_df.to_parquet(args.y, index=False)
+            y_df.to_parquet(args.y, index=False, engine="pyarrow")
             joblib.dump(pre, args.preprocessor)
             joblib.dump(fs, args.feature_selector)
 
