@@ -529,8 +529,17 @@ implementation:
             print_after(Xs, fs.selected_features)
 
             ensure_dir_for(args.X); ensure_dir_for(args.y); ensure_dir_for(args.preprocessor); ensure_dir_for(args.feature_selector); ensure_dir_for(args.preprocess_metadata)
+
+            # make y a DataFrame to avoid Series.to_parquet errors
+            if isinstance(y, pd.Series):
+                y_df = y.to_frame(name=target_col)
+            elif isinstance(y, pd.DataFrame):
+                y_df = y
+            else:
+                y_df = pd.DataFrame({target_col: y})
+            
             Xs.to_parquet(args.X, index=False)
-            y.to_parquet(args.y, index=False)
+            y_df.to_parquet(args.y, index=False)
             joblib.dump(pre, args.preprocessor)
             joblib.dump(fs, args.feature_selector)
 
