@@ -1,4 +1,4 @@
-name: Load & Preprocess + Auto Feature Select (v2)
+name: Load & Preprocess V1
 description: |
   End-to-end robust preprocessing + automatic feature selection.
   - Smart numeric parsing: currencies, multipliers (k/m/b/t), percents, mixed tokens.
@@ -462,8 +462,14 @@ implementation:
         args=parser.parse_args()
 
         try:
-            df=load_table(args.in_file)
-            df=df.drop_duplicates(keep="first").reset_index(drop=True)
+            df = load_table(args.in_file)
+            df__dupesafe = df.applymap(
+                lambda x: json.dumps(x, sort_keys=True) if isinstance(x, (dict, list)) else x
+            )
+            before = len(df)
+            df = df.loc[~df__dupesafe.duplicated(keep="first")].reset_index(drop=True)
+            if before:
+                print(f"Removed duplicates: {before - len(df)} rows dropped")
             if args.target_column not in df.columns:
                 print(f"ERROR missing target: {args.target_column}", file=sys.stderr); sys.exit(1)
             print_before(df, args.target_column)
