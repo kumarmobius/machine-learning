@@ -1,27 +1,13 @@
-name: Unified Data Loader
-description: Loads data from API, prints info, splits into train and test, and saves outputs
+name: Load JSON dataset
+description: Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. No preprocessing is applied; prints dataframe diagnostics.
 inputs:
-  - name: api_url
-    type: String
-    description: 'API URL to fetch JSON data'
-  - name: access_token
-    type: string
-    description: 'Bearer access token for API auth'
-  - name: test_split
-    type: Integer
-    description: 'Percentage of test split (e.g., 10 means 0.1 fraction)'
-    default: "10"
+  - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
+  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
+  - {name: split_size, type: Integer, description: 'Test split size as integer percent (e.g. 20) or fraction (e.g. 0.2)'}
 outputs:
-  - name: train_file
-    type: Data
-    description: 'Combined train set with features and target'
-  - name: test_x_file
-    type: Data
-    description: 'Test feature set (X)'
-  - name: test_y_file
-    type: Data
-    description: 'Test target set (y)'
-
+  - {name: train_set, type: Data}
+  - {name: test_x, type: Data}
+  - {name: test_y, type: Data}
 implementation:
   container:
     image: python:3.9
@@ -36,73 +22,107 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, requests, pandas as pd
+        import argparse
+        import os
+        import pandas as pd
+        import numpy as np
+        import requests
         from sklearn.model_selection import train_test_split
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        import logging
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--api_url', type=str, required=True)
-        parser.add_argument('--access_token', type=str, required=True)
-        parser.add_argument('--test_split', type=int, default=10)
-        parser.add_argument('--train_file', type=str, required=True)
-        parser.add_argument('--test_x_file', type=str, required=True)
-        parser.add_argument('--test_y_file', type=str, required=True)
+        parser.add_argument('--api_url', type=str, required=True, help='API URL to fetch JSON dataset')
+        parser.add_argument('--access_token', type=str, required=True, help='Bearer token for API')
+        parser.add_argument('--split_size', type=float, required=True, help='Test split size as integer percent or fraction')
+        parser.add_argument('--train_set', type=str, required=True, help='Path to output train dataset')
+        parser.add_argument('--test_x', type=str, required=True, help='Path to output test X dataset')
+        parser.add_argument('--test_y', type=str, required=True, help='Path to output test Y dataset')
         args = parser.parse_args()
 
+        # Read access token
         with open(args.access_token, 'r') as f:
-            token = f.read().strip()
+            access_token = f.read().strip()
 
-        headers = {"Authorization": f"Bearer {token}"}
-        print("DEBUG: Fetching data from API:", args.api_url)
-        resp = requests.get(args.api_url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("api_retry")
 
-        if isinstance(data, dict) and 'content' in data:
-            df = pd.DataFrame(data['content'])
-        else:
-            df = pd.DataFrame(data)
+        # Setup HTTP session with retry
+        session = requests.Session()
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["POST"])
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
 
-        print("DEBUG: Data loaded successfully")
-        print("Number of rows:", len(df))
-        print("Number of columns:", len(df.columns))
-        print("Column names:", list(df.columns))
-        print("DataFrame info:")
-        print(df.info())
-        print("DataFrame head preview:")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
+        payload = {"dbType": "TIDB", "entityId": "", "entityIds": [], "ownedOnly": False, "projections": [], "filter": {}, "startTime": 0, "endTime": 0}
+
+        try:
+            logger.info(" Sending request to API with retries enabled")
+            resp = session.post(args.api_url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            raw_data = resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f" API request failed after retries: {e}")
+            raise
+
+        df = pd.DataFrame(raw_data)
+
+        # Print dataframe diagnostics
+        print("DF_HEAD:")
         print(df.head().to_string())
+        print("DF_INFO:")
+        df.info()
+        print("DF_DTYPES:")
+        print(df.dtypes.to_string())
+        print("DF_DESCRIBE:")
+        print(df.describe(include='all').to_string())
+        print("DF_NULL_COUNTS:")
+        print(df.isnull().sum().to_string())
 
-        if 'target' not in df.columns:
-            raise ValueError("Expected a 'target' column for splitting y variable")
+        # Define anomaly labels
+        if "reachable_frac" in df.columns:
+            anomaly_labels = (df["reachable_frac"] == 0.0).astype(np.int32)
+        else:
+            logger.info(" reachable_frac column not found. Creating zero anomaly labels")
+            anomaly_labels = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index)
 
-        test_size = args.test_split / 100.0 if args.test_split > 1 else args.test_split
-        X = df.drop(columns=['target'])
-        y = df['target']
-        train_x, test_x, train_y, test_y = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
+        # Convert split size: integer percent → fraction
+        split_size_input = float(args.split_size)
+        if split_size_input >= 1.0:
+            test_size = split_size_input / 100.0
+        else:
+            test_size = split_size_input
 
-        train_combined = pd.concat([train_x, train_y], axis=1)
+        if not (0.0 < test_size < 1.0):
+            raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
 
-        os.makedirs(os.path.dirname(args.train_file) or ".", exist_ok=True)
-        os.makedirs(os.path.dirname(args.test_x_file) or ".", exist_ok=True)
-        os.makedirs(os.path.dirname(args.test_y_file) or ".", exist_ok=True)
+        stratify_param = anomaly_labels if anomaly_labels.nunique() > 1 else None
 
-        train_combined.to_parquet(args.train_file, index=False)
-        test_x.to_parquet(args.test_x_file, index=False)
-        test_y.to_frame().to_parquet(args.test_y_file, index=False)
+        train_df, test_df, train_labels, test_labels = train_test_split(
+            df, anomaly_labels, test_size=test_size, random_state=42, stratify=stratify_param
+        )
 
-        print(f"DEBUG: Train file saved to {args.train_file} with {len(train_combined)} rows")
-        print(f"DEBUG: Test X saved to {args.test_x_file} with {len(test_x)} rows")
-        print(f"DEBUG: Test y saved to {args.test_y_file} with {len(test_y)} rows")
+        # Save outputs in Parquet format
+        os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
+        train_df.to_parquet(args.train_set, index=False)
 
+        os.makedirs(os.path.dirname(args.test_x) or ".", exist_ok=True)
+        test_df.to_parquet(args.test_x, index=False)
+
+        os.makedirs(os.path.dirname(args.test_y) or ".", exist_ok=True)
+        pd.DataFrame(test_labels, columns=["anomaly_label"]).to_parquet(args.test_y, index=False)
     args:
       - --api_url
       - {inputValue: api_url}
       - --access_token
       - {inputPath: access_token}
-      - --test_split
-      - {inputValue: test_split}
-      - --train_file
-      - {outputPath: train_file}
-      - --test_x_file
-      - {outputPath: test_x_file}
-      - --test_y_file
-      - {outputPath: test_y_file}
+      - --split_size
+      - {inputValue: split_size}
+      - --train_set
+      - {outputPath: train_set}
+      - --test_x
+      - {outputPath: test_x}
+      - --test_y
+      - {outputPath: test_y}
