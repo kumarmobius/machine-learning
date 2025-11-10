@@ -1,5 +1,4 @@
-
-name: Advanced Preprocess v8
+name: Advanced Preprocess v9
 description: |
   Robust auto-preprocessing + feature selection.
   - Safe file loading (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC, gz/zip, dirs)
@@ -20,14 +19,14 @@ inputs:
   - {name: target_column, type: String, description: "Name of the target column"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none (applies only during fit)", optional: true, default: "drop_iqr"}
-  - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule", optional: true, default: 1.5}
-  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer else fallback", optional: true, default: 5000}
-  - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: 0.6}
-  - {name: rare_threshold, type: Float, description: "Rare label threshold as fraction or absolute count", optional: true, default: 0.01}
+  - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
+  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer else fallback", optional: true, default: "5000"}
+  - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
+  - {name: rare_threshold, type: Float, description: "Rare label threshold as fraction or absolute count", optional: true, default: "0.01"}
   - {name: enable_string_similarity, type: String, description: "true/false high-cardinality grouping", optional: true, default: "false"}
-  - {name: tfidf_max_features, type: Integer, description: "Max vocabulary per text column", optional: true, default: 20000}
-  - {name: svd_dims, type: Integer, description: "SVD dims per text column when applied", optional: true, default: 30}
-  - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: 20}
+  - {name: tfidf_max_features, type: Integer, description: "Max vocabulary per text column", optional: true, default: "20000"}
+  - {name: svd_dims, type: Integer, description: "SVD dims per text column when applied", optional: true, default: "30"}
+  - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
 outputs:
   - {name: X, type: Data, description: "Processed features parquet"}
   - {name: y, type: Data, description: "Target parquet"}
@@ -851,37 +850,37 @@ implementation:
             traceback.print_exc()
             sys.exit(1)
     args:
-      - --in_file
-      - {inputPath: in_file}
-      - --target_column
-      - {inputValue: target_column}
-      - --model_type
-      - {inputValue: model_type}
-      - --outlier_strategy
-      - {inputValue: outlier_strategy}
-      - --outlier_fold
-      - {inputValue: outlier_fold}
-      - --max_knn_rows
-      - {inputValue: max_knn_rows}
-      - --numeric_detection_threshold
-      - {inputValue: numeric_detection_threshold}
-      - --rare_threshold
-      - {inputValue: rare_threshold}
-      - --enable_string_similarity
-      - {inputValue: enable_string_similarity}
-      - --tfidf_max_features
-      - {inputValue: tfidf_max_features}
-      - --svd_dims
-      - {inputValue: svd_dims}
-      - --preview_rows
-      - {inputValue: preview_rows}
-      - --X
-      - {outputPath: X}
-      - --y
-      - {outputPath: y}
-      - --preprocessor
-      - {outputPath: preprocessor}
-      - --feature_selector
-      - {outputPath: feature_selector}
-      - --preprocess_metadata
-      - {outputPath: preprocess_metadata}
+          - --in_file
+          - {inputPath: in_file}
+          - --target_column
+          - {inputValue: target_column}
+          - --model_type
+          - {inputValue: model_type}
+          - --outlier_strategy
+          - {inputValue: outlier_strategy}
+          - --outlier_fold
+          - {inputValue: outlier_fold}
+          - --max_knn_rows
+          - {inputValue: max_knn_rows}
+          - --numeric_detection_threshold
+          - {inputValue: numeric_detection_threshold}
+          - --rare_threshold
+          - {inputValue: rare_threshold}
+          - --enable_string_similarity
+          - {inputValue: enable_string_similarity}
+          - --preview_rows
+          - {inputValue: preview_rows}
+          - --text_tfidf_max_features
+          - {inputValue: text_tfidf_max_features}
+          - --text_svd_max_components
+          - {inputValue: text_svd_max_components}
+          - --X
+          - {outputPath: X}
+          - --y
+          - {outputPath: y}
+          - --preprocessor
+          - {outputPath: preprocessor}
+          - --feature_selector
+          - {outputPath: feature_selector}
+          - --preprocess_metadata
+          - {outputPath: preprocess_metadata}
