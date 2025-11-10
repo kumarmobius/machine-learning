@@ -1,9 +1,10 @@
 name: Load JSON dataset
-description: Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. No preprocessing is applied; prints dataframe diagnostics.
+description: Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. Drops unused columns and prints dataframe diagnostics.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
-  - {name: split_size, type: Integer, description: 'Test split size as integer percent (e.g. 20) or fraction (e.g. 0.2)'}
+  - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
+  - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
 outputs:
   - {name: train_set, type: Data}
   - {name: test_x, type: Data}
@@ -35,7 +36,8 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument('--api_url', type=str, required=True, help='API URL to fetch JSON dataset')
         parser.add_argument('--access_token', type=str, required=True, help='Bearer token for API')
-        parser.add_argument('--split_size', type=float, required=True, help='Test split size as integer percent or fraction')
+        parser.add_argument('--split_size', type=float, default=15, help='Test split size as integer percent or fraction (default 15)')
+        parser.add_argument('--target_column', type=str, required=True, help='Name of target column for anomaly labeling')
         parser.add_argument('--train_set', type=str, required=True, help='Path to output train dataset')
         parser.add_argument('--test_x', type=str, required=True, help='Path to output test X dataset')
         parser.add_argument('--test_y', type=str, required=True, help='Path to output test Y dataset')
@@ -83,11 +85,11 @@ implementation:
         print("DF_NULL_COUNTS:")
         print(df.isnull().sum().to_string())
 
-        # Define anomaly labels
-        if "reachable_frac" in df.columns:
-            anomaly_labels = (df["reachable_frac"] == 0.0).astype(np.int32)
+        # Define anomaly labels based on user-provided target column
+        if args.target_column in df.columns:
+            anomaly_labels = (df[args.target_column] == 0.0).astype(np.int32)
         else:
-            logger.info(" reachable_frac column not found. Creating zero anomaly labels")
+            logger.warning(f" Target column '{args.target_column}' not found. Creating zero anomaly labels.")
             anomaly_labels = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index)
 
         # Convert split size: integer percent → fraction
@@ -122,6 +124,8 @@ implementation:
       - {inputPath: access_token}
       - --split_size
       - {inputValue: split_size}
+      - --target_column
+      - {inputValue: target_column}
       - --train_set
       - {outputPath: train_set}
       - --test_x
