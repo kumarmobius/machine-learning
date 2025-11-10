@@ -1,15 +1,23 @@
-name: Preprocess+TFIDF v1
+name: Advanced Preprocess v7.1
 description: |
-  Robust preprocessing and feature selection with TF-IDF text features.
-  Adds TF-IDF + TruncatedSVD per suitable text column without trimming prior logic.
-  Keeps safe duplicate removal, numeric parsing, date features, categorical encoders, smart scalers,
-  optional outliers during training, model_type-aware label handling, and MI+model feature selection.
-
+  End-to-end robust preprocessing and feature selection component.
+  - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
+  - Drops duplicates safely even with dict/list columns.
+  - Drops known non-modeling columns: piMetadata, execution_timestamp, pipelineid, component_id, projectid (if present).
+  - Converts object numerics/percents/currencies and k/m/b suffixes to float.
+  - Detects dates, extracts calendar features.
+  - Encodes categoricals with OneHot/Ordinal/Target/Count heuristics.
+  - Scales numerics with per-column auto Standard/Robust/MinMax or Power+Standard.
+  - Optional string-similarity grouping for high-cardinality categoricals.
+  - Optional outlier handling (IQR drop or winsorize) only in training mode.
+  - Text columns: add cheap stats and, when suitable, TF-IDF + TruncatedSVD features per column.
+  - Saves fitted Preprocessor and FeatureSelector for reuse.
+  - Feature selection: Mutual Information (auto-k) + Model-based selector (ExtraTrees) cascaded.
+  - Works for classification or regression; auto label-encodes y for classification.
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
-  - {name: drop_cols_csv, type: String, description: "Comma-separated cols to drop if present", optional: true, default: "piMetadata,execution_timestamp,pipelineid,component_id,projectid"}
   - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none (applies only during fit)", optional: true, default: "drop_iqr"}
   - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
   - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer else fallback", optional: true, default: "5000"}
@@ -19,14 +27,12 @@ inputs:
   - {name: tfidf_max_features, type: Integer, description: "Max vocabulary per text column", optional: true, default: "20000"}
   - {name: svd_dims, type: Integer, description: "SVD dims per text column when applied", optional: true, default: "30"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
-
 outputs:
   - {name: X, type: Data, description: "Processed features parquet"}
   - {name: y, type: Data, description: "Target parquet"}
   - {name: preprocessor, type: Data, description: "joblib dump of fitted Preprocessor"}
   - {name: feature_selector, type: Data, description: "joblib dump of fitted FeatureSelector"}
   - {name: preprocess_metadata, type: Data, description: "JSON metadata"}
-
 implementation:
   container:
     image: python:3.10-slim
@@ -37,6 +43,7 @@ implementation:
       - |
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
         from datetime import datetime
+        from collections import defaultdict
         def pip_install(pkgs):
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
         try:
@@ -71,9 +78,11 @@ implementation:
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 
+        # ---------------- IO helpers ----------------
         def ensure_dir_for(p):
             d=os.path.dirname(p)
-            if d and not os.path.exists(d): os.makedirs(d, exist_ok=True)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
 
         def sample_file_bytes(path, n=8192):
             try:
@@ -92,7 +101,8 @@ implementation:
 
         def read_with_pandas(path):
             if os.path.isdir(path):
-                files=[os.path.join(path,f) for f in os.listdir(path) if os.path.isfile(os.path.join(path,f)) and not f.startswith(".")]
+                entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
+                files=[p for p in entries if os.path.isfile(p)]
                 if not files: raise ValueError("No files in dir: "+path)
                 path = max(files, key=lambda p: os.path.getsize(p))
                 print(f"Info selected file: {path}")
@@ -142,6 +152,7 @@ implementation:
             except Exception: pass
             raise ValueError("Unsupported format: "+path)
 
+        # ------------- Safe duplicate removal -------------
         def make_hashable_for_dupes(df):
             df = df.copy()
             for c in df.columns:
@@ -152,6 +163,7 @@ implementation:
                     df[c] = df[c].astype(str)
             return df
 
+        # -------------- Numeric parsing -------------------
         CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
         MULTIPLIER_MAP = {'k':1e3,'m':1e6,'b':1e9,'t':1e12}
         TOKEN_RE = re.compile(r'^\s*(?P<sign>[-+]?)(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?P<mult>[kKmMbBtT])?\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$')
@@ -200,6 +212,7 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
+        # -------------- Dates ------------------------------
         def detect_and_extract_dates(df, enabled=True):
             df=df.copy(); report={'date_columns':[],'skipped':[]}
             if not enabled: return df, report
@@ -225,6 +238,7 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
+        # -------------- Rare labels and similarity --------
         def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
             counts=series.value_counts(dropna=False); n=len(series)
             rare = set(counts[counts <= threshold_count].index) if threshold_count is not None else set(counts[counts <= max(1,int(threshold_frac*n))].index)
@@ -235,35 +249,49 @@ implementation:
             mapping={}; used=set()
             for v in vals:
                 if v in used: continue
-                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
+                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=90)
                 group=[m[0] for m in matches]
                 for g in group: mapping[g]=v; used.add(g)
             return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
 
+        # -------------- Outliers --------------------------
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
             if not numeric_cols: return df,0
-            q1=df[numeric_cols].quantile(0.25); q3=df[numeric_cols].quantile(0.75); iqr=q3-q1
-            lower=q1 - fold*iqr; upper=q3 + fold*iqr
-            mask=pd.Series(True,index=df.index)
+            q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
+            q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
+            iqr = q3 - q1
+            lower = (q1 - fold * iqr).to_dict()
+            upper = (q3 + fold * iqr).to_dict()
+            mask = pd.Series(True, index=df.index)
             for c in numeric_cols:
-                lc=float(lower[c]) if hasattr(lower[c],'__float__') else lower[c]
-                uc=float(upper[c]) if hasattr(upper[c],'__float__') else upper[c]
-                col=df[c]
-                mask = mask & col.ge(lc) & col.le(uc)
-            before=len(df); df2=df.loc[mask.values].reset_index(drop=True)
-            return df2, before-len(df2)
+                s = df[c]
+                lo = lower.get(c, None); hi = upper.get(c, None)
+                cond = pd.Series(True, index=df.index)
+                if lo is not None:
+                    cond = cond & s.ge(lo)
+                if hi is not None:
+                    cond = cond & s.le(hi)
+                cond = cond.reindex(df.index).fillna(True)
+                mask = (mask & cond)
+            before=len(df)
+            df2 = df.loc[mask].copy()
+            removed = before - len(df2)
+            df2.reset_index(drop=True, inplace=True)
+            return df2, removed
 
         def winsorize_df(df, numeric_cols, fold=1.5):
             if not numeric_cols: return df,0
-            q1=df[numeric_cols].quantile(0.25); q3=df[numeric_cols].quantile(0.75); iqr=q3-q1
-            lower=q1 - fold*iqr; upper=q3 + fold*iqr
+            q1=df[numeric_cols].quantile(0.25, numeric_only=True); q3=df[numeric_cols].quantile(0.75, numeric_only=True)
+            iqr=q3-q1
+            lower=(q1 - fold*iqr).to_dict(); upper=(q3 + fold*iqr).to_dict()
             df2=df.copy()
             for c in numeric_cols:
-                lc=float(lower[c]) if hasattr(lower[c],'__float__') else lower[c]
-                uc=float(upper[c]) if hasattr(upper[c],'__float__') else upper[c]
-                df2[c]=df2[c].clip(lower=lc, upper=uc)
+                lo = lower.get(c, None); hi = upper.get(c, None)
+                if lo is not None or hi is not None:
+                    df2[c]=df2[c].clip(lower=lo, upper=hi)
             return df2,0
 
+        # -------------- Scalers ---------------------------
         def choose_scaler_for_series(s):
             v=s.dropna()
             if v.empty: return StandardScaler()
@@ -275,6 +303,7 @@ implementation:
             if extreme_frac>0.01 or abs(kurt)>10: return RobustScaler()
             return StandardScaler()
 
+        # -------------- Encoder choice --------------------
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
             n=len(series); nunique=series.nunique(dropna=True); high_card=(nunique>max(50,0.05*n))
             if high_card:
@@ -291,27 +320,28 @@ implementation:
                     enc=OrdinalEncoder(); return 'ordinal', enc, {}
 
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
-            X_col=df[col].astype(object).fillna('__NA__'); global_mean=float(pd.Series(y).mean())
+            X_col=df[col].astype(object).fillna('__NA__'); global_mean=y.mean()
             oof=pd.Series(index=df.index, dtype=float)
             kf=KFold(n_splits=min(n_splits,max(2,len(df)//10)), shuffle=True, random_state=random_state)
             for tr_idx, val_idx in kf.split(df):
-                means=pd.Series(y).iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
+                means=y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
                 oof.iloc[val_idx]=X_col.iloc[val_idx].map(lambda v: means.get(v, global_mean))
             counts=X_col.value_counts(); smooth_map={}
             for cat,cnt in counts.items():
-                cat_mean=float(pd.Series(y)[X_col==cat].mean()) if cnt>0 else global_mean
+                cat_mean=y[X_col==cat].mean() if cnt>0 else global_mean
                 alpha=cnt/(cnt+smoothing); smooth_map[cat]=alpha*cat_mean+(1-alpha)*global_mean
             return oof.fillna(global_mean), smooth_map, float(global_mean)
 
+        # -------------- Text Featurizer -------------------
         def _should_textify(ser, min_words=3, min_len=10):
             s = ser.astype(str).fillna("")
-            word_cnt_med = s.str.count(r"\b\w+\b").median()
+            word_cnt_med = s.str.count(r"\\b\\w+\\b").median()
             len_med = s.str.len().median()
             numeric_frac = pd.to_numeric(s, errors="coerce").notna().mean()
             uniq_ratio = ser.nunique(dropna=True) / max(len(ser), 1)
             alpha_len = s.str.replace(r"[^A-Za-z]", "", regex=True).str.len()
             alpha_ratio_med = (alpha_len / s.str.len().replace(0, 1)).median()
-            tokens = s.str.findall(r"\b\w+\b")
+            tokens = s.str.findall(r"\\b\\w+\\b")
             long_token_cnt_med = tokens.map(lambda ts: sum(len(t) >= 10 for t in ts)).median()
             cond_words_or_len = (word_cnt_med >= min_words) or (len_med >= min_len) or (long_token_cnt_med >= 2)
             cond_alpha = alpha_ratio_med >= 0.5
@@ -326,6 +356,7 @@ implementation:
                 self.svd_dims = int(svd_dims)
                 self.vectorizers = {}
                 self.svds = {}
+                self.stats_cols = {}
                 self.fitted_cols = []
 
             def fit(self, X):
@@ -340,9 +371,10 @@ implementation:
                         continue
                     k = min(self.svd_dims, max(2, min(M.shape)-1)) if min(M.shape)>2 else 2
                     svd = TruncatedSVD(n_components=k, random_state=42)
-                    svd.fit(M)
+                    Z = svd.fit_transform(M)
                     self.vectorizers[col] = vec
                     self.svds[col] = svd
+                    self.stats_cols[col] = [f"{col}__len", f"{col}__word_count", f"{col}__digit_count", f"{col}__alpha_ratio"]
                     self.fitted_cols.append(col)
                 return self
 
@@ -360,8 +392,8 @@ implementation:
                         Z_df = pd.DataFrame(index=X.index)
                     stats = pd.DataFrame({
                         f"{col}__len": s.str.len(),
-                        f"{col}__word_count": s.str.count(r"\b\w+\b"),
-                        f"{col}__digit_count": s.str.count(r"\d"),
+                        f"{col}__word_count": s.str.count(r"\\b\\w+\\b"),
+                        f"{col}__digit_count": s.str.count(r"\\d"),
                         f"{col}__alpha_ratio": s.str.replace(r"[^A-Za-z]", "", regex=True).str.len() / s.str.len().replace(0,1)
                     }, index=X.index)
                     out.append(pd.concat([Z_df, stats], axis=1))
@@ -370,6 +402,7 @@ implementation:
                     X = pd.concat([X.drop(columns=[c for c in self.fitted_cols if c in X.columns]), feat], axis=1)
                 return X
 
+        # -------------- Preprocessor ----------------------
         class Preprocessor:
             def __init__(self):
                 self.num_cols=[]; self.cat_cols=[]; self.col_config={}; self.global_metadata={}
@@ -528,6 +561,7 @@ implementation:
             @staticmethod
             def load(path): return joblib.load(path)
 
+        # -------------- Feature Selector ------------------
         class FeatureSelector:
             def __init__(self, task):
                 self.task=task; self.mi_selector=None; self.model_selector=None; self.selected_features=[]
@@ -560,49 +594,58 @@ implementation:
             @staticmethod
             def load(path): return joblib.load(path)
 
-        def print_before(df):
-            print("BEFORE PREPROCESSING df.head()"); 
+        # -------------- Printing --------------------------
+        def print_before(df, target_col):
+            print("BEFORE PREPROCESSING df.head()")
             try: print(df.head().to_string())
             except Exception: print(df.head())
-            print("BEFORE PREPROCESSING dtypes"); print(df.dtypes.astype(str))
-            print("BEFORE PREPROCESSING missing counts"); print(df.isna().sum())
+            print("BEFORE PREPROCESSING dtypes")
+            print(df.dtypes.astype(str))
+            print("BEFORE PREPROCESSING missing counts")
+            print(df.isna().sum())
 
         def print_plan(pre):
-            print("PLAN per-column strategies"); print("Numeric columns:", pre.num_cols); print("Categorical columns:", pre.cat_cols)
+            print("PLAN per-column strategies")
+            print("Numeric columns:", pre.num_cols)
+            print("Categorical columns:", pre.cat_cols)
             for c in pre.num_cols:
                 cfg=pre.col_config.get(c,{}); imp=cfg.get('imputer',('none',None)); sc=cfg.get('scaler_obj')
                 print(f"[NUM] {c} missing_frac={cfg.get('missing_frac')} imputer={imp[0]} scaler={sc.__class__.__name__ if sc else 'auto'}")
             for c in pre.cat_cols:
-                cfg=pre.col_config.get(c,{}); print(f"[CAT] {c} n_unique={cfg.get('n_unique')} high_card={cfg.get('high_card')} encoder={cfg.get('encoder_type')} rare_threshold={cfg.get('rare_threshold_frac')}")
+                cfg=pre.col_config.get(c,{})
+                print(f"[CAT] {c} n_unique={cfg.get('n_unique')} high_card={cfg.get('high_card')} encoder={cfg.get('encoder_type')} rare_threshold={cfg.get('rare_threshold_frac')}")
 
         def print_after(X_processed, selected_cols=None):
-            print("AFTER PREPROCESSING df.head()"); 
+            print("AFTER PREPROCESSING df.head()")
             try: print(X_processed.head().to_string())
             except Exception: print(X_processed.head())
-            print("AFTER PREPROCESSING dtypes"); print(X_processed.dtypes.astype(str))
-            print("AFTER PREPROCESSING missing counts"); print(X_processed.isna().sum())
-            if selected_cols is not None: print("SELECTED FEATURES:", selected_cols)
+            print("AFTER PREPROCESSING dtypes")
+            print(X_processed.dtypes.astype(str))
+            print("AFTER PREPROCESSING missing counts")
+            print(X_processed.isna().sum())
+            if selected_cols is not None:
+                print("SELECTED FEATURES:", selected_cols)
 
-        ap=argparse.ArgumentParser()
-        ap.add_argument('--in_file', type=str, required=True)
-        ap.add_argument('--target_column', type=str, required=True)
-        ap.add_argument('--model_type', type=str, default="classification")
-        ap.add_argument('--drop_cols_csv', type=str, default="piMetadata,execution_timestamp,pipelineid,component_id,projectid")
-        ap.add_argument('--outlier_strategy', type=str, default="drop_iqr")
-        ap.add_argument('--outlier_fold', type=str, default="1.5")
-        ap.add_argument('--max_knn_rows', type=str, default="5000")
-        ap.add_argument('--numeric_detection_threshold', type=str, default="0.6")
-        ap.add_argument('--rare_threshold', type=str, default="0.01")
-        ap.add_argument('--enable_string_similarity', type=str, default="false")
-        ap.add_argument('--tfidf_max_features', type=str, default="20000")
-        ap.add_argument('--svd_dims', type=str, default="30")
-        ap.add_argument('--preview_rows', type=str, default="20")
-        ap.add_argument('--X', type=str, required=True)
-        ap.add_argument('--y', type=str, required=True)
-        ap.add_argument('--preprocessor', type=str, required=True)
-        ap.add_argument('--feature_selector', type=str, required=True)
-        ap.add_argument('--preprocess_metadata', type=str, required=True)
-        args=ap.parse_args()
+        # -------------- Main ------------------------------
+        parser=argparse.ArgumentParser()
+        parser.add_argument('--in_file', type=str, required=True)
+        parser.add_argument('--target_column', type=str, required=True)
+        parser.add_argument('--model_type', type=str, default="classification")
+        parser.add_argument('--outlier_strategy', type=str, default="drop_iqr")
+        parser.add_argument('--outlier_fold', type=float, default=1.5)
+        parser.add_argument('--max_knn_rows', type=int, default=5000)
+        parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
+        parser.add_argument('--rare_threshold', type=float, default=0.01)
+        parser.add_argument('--enable_string_similarity', type=str, default="false")
+        parser.add_argument('--tfidf_max_features', type=int, default=20000)
+        parser.add_argument('--svd_dims', type=int, default=30)
+        parser.add_argument('--preview_rows', type=int, default=20)
+        parser.add_argument('--X', type=str, required=True)
+        parser.add_argument('--y', type=str, required=True)
+        parser.add_argument('--preprocessor', type=str, required=True)
+        parser.add_argument('--feature_selector', type=str, required=True)
+        parser.add_argument('--preprocess_metadata', type=str, required=True)
+        args=parser.parse_args()
 
         try:
             in_path=args.in_file; target_col=args.target_column; model_type=args.model_type.strip().lower()
@@ -620,7 +663,7 @@ implementation:
             df = read_with_pandas(in_path)
             print(f"Loaded shape: {df.shape}")
 
-            drop_cols = [c.strip() for c in args.drop_cols_csv.split(',') if c.strip()]
+            drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
             present=[c for c in drop_cols if c in df.columns]
             if present:
                 df = df.drop(columns=present)
@@ -632,7 +675,7 @@ implementation:
             if target_col not in df.columns:
                 print(f"ERROR target column '{target_col}' not found", file=sys.stderr); sys.exit(1)
 
-            print_before(df)
+            print_before(df, target_col)
 
             y_raw = df[target_col].copy()
             if model_type=="classification":
@@ -642,13 +685,15 @@ implementation:
                     y_df=pd.DataFrame({target_col:y_enc})
                     y_map={cl:int(lbl) for lbl,cl in enumerate(le.classes_)}
                 else:
-                    y_df=pd.DataFrame({target_col:pd.to_numeric(y_pre, errors='coerce')}); y_map=None
+                    y_int = pd.to_numeric(y_pre, errors='coerce')
+                    y_df=pd.DataFrame({target_col:y_int.astype('Int64') if pd.isna(y_int).any() else y_int.astype(int)}); y_map=None
             else:
-                y_df=pd.DataFrame({target_col: pd.to_numeric(y_raw, errors='coerce')})
+                y_num = pd.to_numeric(y_raw, errors='coerce')
+                y_df=pd.DataFrame({target_col: y_num})
 
-            keep_mask = y_df[target_col].notna()
-            df = df.loc[keep_mask.values].reset_index(drop=True); y_df = y_df.loc[keep_mask.values].reset_index(drop=True)
-            print(f"Dropped rows with null target '{target_col}': {int((~keep_mask).sum())} rows dropped")
+            before=len(df); keep_mask = y_df[target_col].notna()
+            df = df.loc[keep_mask].reset_index(drop=True); y_df = y_df.loc[keep_mask].reset_index(drop=True)
+            print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
 
             print("Converting object columns to numeric where possible")
             df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
@@ -670,7 +715,7 @@ implementation:
 
             pre=Preprocessor()
             X_init = df.drop(columns=[target_col]) if target_col in df.columns else df.copy()
-            pre.fit(X_init, y=y_df[target_col], config=config, text_params=text_params)
+            pre.fit(X_init, y=y_df[target_col] if model_type=="classification" else y_df[target_col], config=config, text_params=text_params)
 
             print_plan(pre)
 
@@ -686,7 +731,18 @@ implementation:
             print("Optimizing numeric dtypes")
             for col in Xp.select_dtypes(include=[np.number]).columns:
                 try:
-                    Xp[col]=pd.to_numeric(Xp[col], downcast='float')
+                    s = Xp[col]
+                    if np.allclose(s.dropna(), np.round(s.dropna())):
+                        if s.min() >= np.iinfo(np.int8).min and s.max() <= np.iinfo(np.int8).max:
+                            Xp[col] = s.astype('Int8')
+                        elif s.min() >= np.iinfo(np.int16).min and s.max() <= np.iinfo(np.int16).max:
+                            Xp[col] = s.astype('Int16')
+                        elif s.min() >= np.iinfo(np.int32).min and s.max() <= np.iinfo(np.int32).max:
+                            Xp[col] = s.astype('Int32')
+                        else:
+                            Xp[col] = s.astype('Int64')
+                    else:
+                        Xp[col]=pd.to_numeric(Xp[col], downcast='float')
                 except Exception:
                     pass
 
@@ -722,40 +778,38 @@ implementation:
             print("ERROR during preprocessing:", exc, file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
-      args:
-        - --in_file
-        - {inputPath: in_file}
-        - --target_column
-        - {inputValue: target_column}
-        - --model_type
-        - {inputValue: model_type}
-        - --drop_cols_csv
-        - {inputValue: drop_cols_csv}
-        - --outlier_strategy
-        - {inputValue: outlier_strategy}
-        - --outlier_fold
-        - {inputValue: outlier_fold}
-        - --max_knn_rows
-        - {inputValue: max_knn_rows}
-        - --numeric_detection_threshold
-        - {inputValue: numeric_detection_threshold}
-        - --rare_threshold
-        - {inputValue: rare_threshold}
-        - --enable_string_similarity
-        - {inputValue: enable_string_similarity}
-        - --tfidf_max_features
-        - {inputValue: tfidf_max_features}
-        - --svd_dims
-        - {inputValue: svd_dims}
-        - --preview_rows
-        - {inputValue: preview_rows}
-        - --X
-        - {outputPath: X}
-        - --y
-        - {outputPath: y}
-        - --preprocessor
-        - {outputPath: preprocessor}
-        - --feature_selector
-        - {outputPath: feature_selector}
-        - --preprocess_metadata
-        - {outputPath: preprocess_metadata}
+    args:
+      - --in_file
+      - {inputPath: in_file}
+      - --target_column
+      - {inputValue: target_column}
+      - --model_type
+      - {inputValue: model_type}
+      - --outlier_strategy
+      - {inputValue: outlier_strategy}
+      - --outlier_fold
+      - {inputValue: outlier_fold}
+      - --max_knn_rows
+      - {inputValue: max_knn_rows}
+      - --numeric_detection_threshold
+      - {inputValue: numeric_detection_threshold}
+      - --rare_threshold
+      - {inputValue: rare_threshold}
+      - --enable_string_similarity
+      - {inputValue: enable_string_similarity}
+      - --tfidf_max_features
+      - {inputValue: tfidf_max_features}
+      - --svd_dims
+      - {inputValue: svd_dims}
+      - --preview_rows
+      - {inputValue: preview_rows}
+      - --X
+      - {outputPath: X}
+      - --y
+      - {outputPath: y}
+      - --preprocessor
+      - {outputPath: preprocessor}
+      - --feature_selector
+      - {outputPath: feature_selector}
+      - --preprocess_metadata
+      - {outputPath: preprocess_metadata}
