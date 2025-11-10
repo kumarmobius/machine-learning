@@ -1,5 +1,5 @@
 
-name: Advanced Preprocess v8
+name: Advanced Preprocess v9
 description: |
   Robust auto-preprocessing + feature selection.
   - Safe file loading (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC, gz/zip, dirs)
@@ -30,11 +30,11 @@ inputs:
   - {name: text_tfidf_max_features, type: Integer, description: "Max TF-IDF features per text column", optional: true, default: "10000"}
   - {name: text_svd_max_components, type: Integer, description: "Max SVD components per text column", optional: true, default: "50"}
 outputs:
-  - {name: X, type: Data, description: "Processed features parquet"}
-  - {name: y, type: Data, description: "Target parquet"}
-  - {name: preprocessor, type: Data, description: "Pickled Preprocessor"}
-  - {name: feature_selector, type: Data, description: "Pickled FeatureSelector"}
-  - {name: preprocess_metadata, type: Data, description: "JSON metadata of decisions and diagnostics"}
+  - {name: X, type: Data, description: "Feature matrix (parquet) after preprocessing"}
+  - {name: y, type: Data, description: "Target column (parquet) after preprocessing"}
+  - {name: preprocessor, type: Data, description: "Pickle file with fitted preprocessor"}
+  - {name: feature_selector, type: Data, description: "Pickle with fitted feature selector"}
+  - {name: preprocess_metadata, type: Data, description: "JSON metadata for preprocessing"}
 implementation:
   container:
     image: python:3.10-slim
