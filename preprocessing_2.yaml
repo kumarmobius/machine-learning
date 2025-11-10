@@ -868,12 +868,12 @@ implementation:
           - {inputValue: rare_threshold}
           - --enable_string_similarity
           - {inputValue: enable_string_similarity}
+          - --tfidf_max_features
+          - {inputValue: tfidf_max_features}
+          - --svd_dims
+          - {inputValue: svd_dims}
           - --preview_rows
           - {inputValue: preview_rows}
-          - --text_tfidf_max_features
-          - {inputValue: text_tfidf_max_features}
-          - --text_svd_max_components
-          - {inputValue: text_svd_max_components}
           - --X
           - {outputPath: X}
           - --y
