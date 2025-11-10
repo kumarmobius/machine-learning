@@ -23,14 +23,14 @@ inputs:
   - {name: model_type, type: String, description: "classification|regression|auto", optional: true, default: "auto"}
   - {name: drop_cols_csv, type: String, description: "Columns to drop early (comma-separated)", optional: true, default: "piMetadata,execution_timestamp,pipelineid,component_id,projectid"}
   - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none (applies only during fit)", optional: true, default: "drop_iqr"}
-  - {name: outlier_fold, type: String, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
-  - {name: max_knn_rows, type: String, description: "Max rows for KNN imputer else fallback", optional: true, default: "5000"}
-  - {name: numeric_detection_threshold, type: String, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
-  - {name: rare_threshold, type: String, description: "Rare label threshold as fraction or absolute count", optional: true, default: "0.01"}
+  - {name: outlier_fold, type: Integer, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
+  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer else fallback", optional: true, default: "5000"}
+  - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
+  - {name: rare_threshold, type: Float, description: "Rare label threshold as fraction or absolute count", optional: true, default: "0.01"}
   - {name: enable_string_similarity, type: String, description: "true/false for high-card grouping", optional: true, default: "false"}
-  - {name: text_tfidf_max_features, type: String, description: "Max vocabulary per text column", optional: true, default: "10000"}
-  - {name: text_svd_max_components, type: String, description: "SVD dims per text column when applied", optional: true, default: "50"}
-  - {name: preview_rows, type: String, description: "Rows to include in preview prints", optional: true, default: "20"}
+  - {name: text_tfidf_max_features, type: Integer, description: "Max vocabulary per text column", optional: true, default: "10000"}
+  - {name: text_svd_max_components, type: Integer, description: "SVD dims per text column when applied", optional: true, default: "50"}
+  - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
 outputs:
   - {name: X, type: Data, description: "Processed features parquet"}
   - {name: y, type: Data, description: "Target parquet"}
