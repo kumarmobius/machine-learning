@@ -1,4 +1,4 @@
-name: Load & Preprocess V3
+name: Load & Preprocess V4
 description: |
   End-to-end robust preprocessing + automatic feature selection.
   - Smart numeric parsing: currencies, multipliers (k/m/b/t), percents, mixed tokens.
@@ -225,6 +225,10 @@ implementation:
             if thr_count is not None: rare=set(vc[vc<=thr_count].index)
             else: rare=set(vc[vc<=max(1,int(thr_frac*n))].index)
             return series.map(lambda x: "__RARE__" if x in rare else x), list(rare)
+        def print_dtypes(tag, df):
+            print(f"D_TYPES {tag}:")
+            for col, dt in df.dtypes.astype(str).items():
+                print(f"{col}: {dt}")
 
         def choose_scaler(values):
             v=pd.Series(values).dropna()
@@ -514,6 +518,8 @@ implementation:
             }
             pre = Preprocessor(cfg)
             Xp = pre.fit_transform(X, y=y if model_type=="classification" else None)
+            print("DTYPES_AFTER_PREPROCESSING", {c: str(dt) for c, dt in Xp.dtypes.items()})
+
 
             Xp = Xp.replace([np.inf,-np.inf], np.nan)
             for c in Xp.columns:
@@ -525,6 +531,7 @@ implementation:
             fs = FeatureSelector("classification" if model_type=="classification" else "regression")
             fs.fit(Xp, y if model_type=="classification" else pd.to_numeric(y, errors="coerce").fillna(y.mean()))
             Xs = fs.transform(Xp)
+            print("DTYPES_AFTER_SELECTION", {c: str(dt) for c, dt in Xs.dtypes.items()})
 
             print_after(Xs, fs.selected_features)
 
