@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.3
+name: Advanced Preprocess v7.4
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -257,49 +257,49 @@ implementation:
         # -------------- Outliers --------------------------
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
             if not numeric_cols:
-                return df, 0
-            num = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-            q1 = num.quantile(0.25)
-            q3 = num.quantile(0.75)
+                # return df unchanged, zero removed, and a keep-all mask
+                return df, 0, pd.Series(True, index=df.index)
+        
+            q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
+            q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
             iqr = q3 - q1
             lower = (q1 - fold * iqr).to_dict()
             upper = (q3 + fold * iqr).to_dict()
         
-            n = len(df)
-            mask = np.ones(n, dtype=bool)
+            mask = pd.Series(True, index=df.index)
             for c in numeric_cols:
-                if c not in num.columns:
-                    continue
-                col = num[c]
-                lo = lower.get(c, None); hi = upper.get(c, None)
+                s = df[c]
                 cond = pd.Series(True, index=df.index)
+                lo = lower.get(c, None)
+                hi = upper.get(c, None)
                 if lo is not None:
-                    cond &= col.ge(lo)
+                    cond &= s >= lo
                 if hi is not None:
-                    cond &= col.le(hi)
-                mask &= cond.fillna(True).to_numpy()
+                    cond &= s <= hi
+                mask &= cond
         
-            keep_idx = np.flatnonzero(mask)
-            df2 = df.iloc[keep_idx].reset_index(drop=True)
-            return df2, n - len(df2)
+            kept = mask.fillna(True)
+            df2 = df.loc[kept].copy()     # preserve original index here
+            removed = int((~kept).sum())
+            # do NOT reset index here; keep original index so y can be aligned later
+            return df2, removed, kept
+        
         def winsorize_df(df, numeric_cols, fold=1.5):
             if not numeric_cols:
                 return df, 0
-            num = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-            q1 = num.quantile(0.25)
-            q3 = num.quantile(0.75)
+            q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
+            q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
             iqr = q3 - q1
             lower = (q1 - fold * iqr).to_dict()
             upper = (q3 + fold * iqr).to_dict()
-        
             df2 = df.copy()
             for c in numeric_cols:
-                if c not in num.columns:
-                    continue
-                lo = lower.get(c, None); hi = upper.get(c, None)
-                col = pd.to_numeric(df2[c], errors='coerce')
-                df2[c] = col.clip(lower=lo, upper=hi)
+                lo = lower.get(c, None)
+                hi = upper.get(c, None)
+                if lo is not None or hi is not None:
+                    df2[c] = df2[c].clip(lower=lo, upper=hi)
             return df2, 0
+
         # -------------- Scalers ---------------------------
         def choose_scaler_for_series(s):
             v=s.dropna()
@@ -519,10 +519,17 @@ implementation:
                 cfg_global=self.global_metadata.get('config') or {}
                 if training_mode:
                     if cfg_global.get('outlier_strategy','drop_iqr')=='drop_iqr':
-                        df, n_removed = drop_outliers_iqr(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
-                        self.global_metadata['outliers_removed']=int(n_removed)
+                        df, n_removed, kept_mask = drop_outliers_iqr(
+                            df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5)
+                        )
+                        self.global_metadata['outliers_removed'] = int(n_removed)
+                        # store mask so caller can align y
+                        self.global_metadata['kept_mask_after_outlier'] = kept_mask
                     elif cfg_global.get('outlier_strategy')=='winsorize':
-                        df,_=winsorize_df(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
+                        df, _ = winsorize_df(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
+                        # winsorize does not drop rows; still expose a keep-all mask
+                        self.global_metadata['kept_mask_after_outlier'] = pd.Series(True, index=df.index)
+
                 for c in self.num_cols:
                     sc=self.col_config[c].get('scaler_obj')
                     if sc is None: sc=choose_scaler_for_series(df[c].fillna(df[c].median()))
@@ -732,6 +739,20 @@ implementation:
 
             print("Applying preprocessing pipeline")
             Xp = pre.transform(X_init, training_mode=True)
+            kept_mask = pre.global_metadata.get('kept_mask_after_outlier', None)
+            if kept_mask is not None:
+                # make sure mask is aligned to current y_df index
+                kept_mask = kept_mask.reindex(y_df.index, fill_value=True)
+                y_df = y_df.loc[kept_mask]
+            
+            # hard align by Xp's index (covers any remaining mismatch)
+            common_idx = Xp.index.intersection(y_df.index)
+            Xp = Xp.loc[common_idx]
+            y_df = y_df.loc[common_idx]
+            
+            # reset to clean, dense indices
+            Xp = Xp.reset_index(drop=True)
+            y_df = y_df.reset_index(drop=True)
 
             for c in list(Xp.columns):
                 if Xp[c].dtype=='object':
