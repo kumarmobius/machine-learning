@@ -68,6 +68,8 @@ implementation:
             raise
 
         df = pd.DataFrame(raw_data)
+        drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
 
         # Print dataframe diagnostics
         print("DF_HEAD:")
