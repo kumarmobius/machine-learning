@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.2
+name: Advanced Preprocess v7.3
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -258,7 +258,6 @@ implementation:
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
             if not numeric_cols:
                 return df, 0
-            # numeric snapshot to avoid object/string issues
             num = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
             q1 = num.quantile(0.25)
             q3 = num.quantile(0.75)
@@ -280,7 +279,7 @@ implementation:
                     cond &= col.le(hi)
                 mask &= cond.fillna(True).to_numpy()
         
-            keep_idx = np.where(mask)[0]
+            keep_idx = np.flatnonzero(mask)
             df2 = df.iloc[keep_idx].reset_index(drop=True)
             return df2, n - len(df2)
         def winsorize_df(df, numeric_cols, fold=1.5):
@@ -301,7 +300,6 @@ implementation:
                 col = pd.to_numeric(df2[c], errors='coerce')
                 df2[c] = col.clip(lower=lo, upper=hi)
             return df2, 0
-
         # -------------- Scalers ---------------------------
         def choose_scaler_for_series(s):
             v=s.dropna()
@@ -680,7 +678,7 @@ implementation:
                 df = df.drop(columns=present)
                 print("Dropped columns:", present)
 
-            before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
+            before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first').reset_index(drop=True)
             print(f"Removed duplicates: {before - len(df)} rows dropped")
 
             if target_col not in df.columns:
@@ -702,8 +700,10 @@ implementation:
                 y_num = pd.to_numeric(y_raw, errors='coerce')
                 y_df=pd.DataFrame({target_col: y_num})
 
-            before=len(df); keep_mask = y_df[target_col].notna()
-            df = df.loc[keep_mask].reset_index(drop=True); y_df = y_df.loc[keep_mask].reset_index(drop=True)
+            keep_mask = y_df[target_col].notna()
+            idx = np.flatnonzero(keep_mask.values)
+            df = df.iloc[idx].reset_index(drop=True)
+            y_df = y_df.iloc[idx].reset_index(drop=True)
             print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
 
             print("Converting object columns to numeric where possible")
