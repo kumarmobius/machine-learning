@@ -1,1 +1,239 @@
+name: Train Logistic Regression on Parquet
+description: |
+  Reads X and y from parquet, trains LogisticRegression for classification, handles class imbalance when enbalance=true,
+  and saves the model as a pickle plus basic metrics.
 
+inputs:
+  - {name: X_data, type: Data, description: "Parquet file for features (DataFrame)"}
+  - {name: y_data, type: Data, description: "Parquet file for target (Series or single-column DataFrame)"}
+  - {name: model_type, type: String, description: "classification only (kept for interface symmetry)", optional: true, default: "classification"}
+  - {name: enbalance, type: String, description: "true/false for class imbalance handling", optional: true, default: "true"}
+  - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
+  - {name: max_iter, type: Integer, description: "LogisticRegression max_iter", optional: true, default: 1000}
+  - {name: C, type: Float, description: "Inverse of regularization strength", optional: true, default: 1.0}
+  - {name: penalty, type: String, description: "regularization: l2 or none", optional: true, default: "l2"}
+  - {name: solver, type: String, description: "lbfgs or saga (if many features)", optional: true, default: "lbfgs"}
+
+outputs:
+  - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
+  - {name: metrics_json, type: Data, description: "Training metrics JSON (accuracy and label mapping if used)"}
+
+implementation:
+  container:
+    image: python:3.10-slim
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, subprocess, traceback
+        def pip_install(pkgs):
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
+
+        # Try imports, install if missing
+        try:
+            import pandas as pd
+            import numpy as np
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.preprocessing import LabelEncoder
+            from sklearn.metrics import accuracy_score
+            import joblib
+        except Exception:
+            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet"])
+            import pandas as pd
+            import numpy as np
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.preprocessing import LabelEncoder
+            from sklearn.metrics import accuracy_score
+            import joblib
+
+        def ensure_dir_for(p):
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def bool_from_str(s):
+            return str(s).strip().lower() in ("1","true","t","yes","y")
+
+        def load_parquet_df(path):
+            return pd.read_parquet(path, engine="auto")
+
+        def coerce_class_labels(y_series):
+            # Map common boolean-ish labels to {0,1} if binary-ish.
+            s = y_series.copy()
+            # Keep integers as integers if already integer dtype
+            if pd.api.types.is_integer_dtype(s):
+                return s, None
+
+            # Normalize strings for typical boolean mappings
+            s_str = s.astype(str).str.strip().str.lower()
+            mapped = s.copy()
+            mask_pos = s_str.isin(["1","true","yes","y","male","m","positive","pos"])
+            mask_neg = s_str.isin(["0","false","no","n","female","f","negative","neg"])
+            if (mask_pos | mask_neg).mean() >= 0.9:
+                mapped = np.where(mask_pos, 1, np.where(mask_neg, 0, np.nan))
+                mapped = pd.Series(mapped, index=s.index)
+                return mapped.astype("Int64"), {"pos_set":["1","true","yes","y","male","m","positive","pos"],
+                                                "neg_set":["0","false","no","n","female","f","negative","neg"]}
+
+            # Else use a label encoder
+            le = LabelEncoder()
+            enc = le.fit_transform(s.astype(str))
+            return pd.Series(enc, index=s.index, dtype="int64"), {"label_encoder_classes": le.classes_.tolist()}
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--X_data', type=str, required=True)
+        ap.add_argument('--y_data', type=str, required=True)
+        ap.add_argument('--model_type', type=str, default="classification")
+        ap.add_argument('--enbalance', type=str, default="true")
+        ap.add_argument('--target_column', type=str, default="")
+        ap.add_argument('--max_iter', type=int, default=1000)
+        ap.add_argument('--C', type=float, default=1.0)
+        ap.add_argument('--penalty', type=str, default="l2")
+        ap.add_argument('--solver', type=str, default="lbfgs")
+        ap.add_argument('--model_pickle', type=str, required=True)
+        ap.add_argument('--metrics_json', type=str, required=True)
+        args = ap.parse_args()
+
+        try:
+            # Load
+            print("Loading X from:", args.X_data)
+            X = load_parquet_df(args.X_data)
+            print("X shape:", X.shape)
+
+            print("Loading y from:", args.y_data)
+            y_df = load_parquet_df(args.y_data)
+
+            # If y has more than one column, select requested
+            if isinstance(y_df, pd.DataFrame):
+                if y_df.shape[1] == 1:
+                    y = y_df.iloc[:,0]
+                else:
+                    if not args.target_column:
+                        raise ValueError("y parquet has multiple columns. Provide --target_column.")
+                    if args.target_column not in y_df.columns:
+                        raise ValueError(f"target_column '{args.target_column}' not found in y parquet.")
+                    y = y_df[args.target_column]
+            else:
+                # Series
+                y = y_df
+
+            print("y length:", len(y))
+
+            # Align lengths by index if necessary
+            if len(X) != len(y):
+                # Try aligning on shared index labels
+                common_idx = X.index.intersection(y.index)
+                if len(common_idx) == 0:
+                    # fallback: align by position to min length
+                    m = min(len(X), len(y))
+                    print(f"Warning: X and y length mismatch; aligning by position to {m} rows.")
+                    X = X.reset_index(drop=True).iloc[:m, :]
+                    y = y.reset_index(drop=True).iloc[:m]
+                else:
+                    X = X.loc[common_idx]
+                    y = y.loc[common_idx]
+                    # keep original order of X
+                    X = X.sort_index()
+                    y = y.sort_index()
+
+            # Keep integer dtypes for X where possible
+            for c in X.columns:
+                if pd.api.types.is_float_dtype(X[c]) and np.allclose(X[c].dropna(), np.round(X[c].dropna())):
+                    # safe downcast to integer if it was integer-like
+                    try:
+                        X[c] = X[c].astype('Int64')
+                    except Exception:
+                        pass
+
+            if args.model_type.strip().lower() != "classification":
+                raise ValueError("This component trains LogisticRegression. Set --model_type=classification.")
+
+            # Prepare y for classification
+            y_prepared, label_info = coerce_class_labels(y)
+            # Drop rows with missing y after coercion
+            keep = y_prepared.notna()
+            if keep.mean() < 1.0:
+                X = X.loc[keep].reset_index(drop=True)
+                y_prepared = y_prepared.loc[keep].reset_index(drop=True)
+
+            # Instantiate LogisticRegression
+            imbalance = bool_from_str(args.enbalance)
+            class_weight = "balanced" if imbalance else None
+
+            # penalty/solver compatibility adjustments
+            penalty = args.penalty.strip().lower()
+            solver = args.solver.strip().lower()
+            if penalty == "none":
+                penalty = None
+                if solver not in ("lbfgs","saga","newton-cg"):
+                    solver = "lbfgs"
+            else:
+                if penalty not in ("l2",):
+                    penalty = "l2"
+                if solver not in ("lbfgs","saga","newton-cg","liblinear"):
+                    solver = "lbfgs"
+
+            lr = LogisticRegression(
+                max_iter=int(args.max_iter),
+                C=float(args.C),
+                penalty=("none" if penalty is None else penalty),
+                solver=solver,
+                class_weight=class_weight,
+                n_jobs=-1 if solver in ("saga","liblinear") else None,
+                multi_class="auto",
+                random_state=42
+            )
+
+            # Fit on all provided data
+            lr.fit(X, y_prepared)
+
+            # Simple training metric
+            y_hat = lr.predict(X)
+            acc = float(accuracy_score(y_prepared, y_hat))
+
+            # Save artifacts
+            ensure_dir_for(args.model_pickle)
+            ensure_dir_for(args.metrics_json)
+            joblib.dump(lr, args.model_pickle)
+
+            metrics = {
+                "task": "classification",
+                "samples": int(len(y_prepared)),
+                "features": int(X.shape[1]),
+                "accuracy_train": acc,
+                "class_weight": ("balanced" if class_weight == "balanced" else None),
+                "label_info": label_info
+            }
+            with open(args.metrics_json, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+            print("SUCCESS: Trained LogisticRegression. Train accuracy:", acc)
+        except Exception as e:
+            print("ERROR during training:", e, file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+
+  args:
+    - --X_data
+    - {inputPath: X_data}
+    - --y_data
+    - {inputPath: y_data}
+    - --model_type
+    - {inputValue: model_type}
+    - --enbalance
+    - {inputValue: enbalance}
+    - --target_column
+    - {inputValue: target_column}
+    - --max_iter
+    - {inputValue: max_iter}
+    - --C
+    - {inputValue: C}
+    - --penalty
+    - {inputValue: penalty}
+    - --solver
+    - {inputValue: solver}
+    - --model_pickle
+    - {outputPath: model_pickle}
+    - --metrics_json
+    - {outputPath: metrics_json}
