@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.1
+name: Advanced Preprocess v7.2
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -256,40 +256,51 @@ implementation:
 
         # -------------- Outliers --------------------------
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
-            if not numeric_cols: return df,0
-            q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
-            q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
+            if not numeric_cols:
+                return df, 0
+            # numeric snapshot to avoid object/string issues
+            num = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            q1 = num.quantile(0.25)
+            q3 = num.quantile(0.75)
             iqr = q3 - q1
             lower = (q1 - fold * iqr).to_dict()
             upper = (q3 + fold * iqr).to_dict()
-            mask = pd.Series(True, index=df.index)
+        
+            n = len(df)
+            mask = np.ones(n, dtype=bool)
             for c in numeric_cols:
-                s = df[c]
+                if c not in num.columns:
+                    continue
+                col = num[c]
                 lo = lower.get(c, None); hi = upper.get(c, None)
                 cond = pd.Series(True, index=df.index)
                 if lo is not None:
-                    cond = cond & s.ge(lo)
+                    cond &= col.ge(lo)
                 if hi is not None:
-                    cond = cond & s.le(hi)
-                cond = cond.reindex(df.index).fillna(True)
-                mask = (mask & cond)
-            before=len(df)
-            df2 = df.loc[mask].copy()
-            removed = before - len(df2)
-            df2.reset_index(drop=True, inplace=True)
-            return df2, removed
-
+                    cond &= col.le(hi)
+                mask &= cond.fillna(True).to_numpy()
+        
+            keep_idx = np.where(mask)[0]
+            df2 = df.iloc[keep_idx].reset_index(drop=True)
+            return df2, n - len(df2)
         def winsorize_df(df, numeric_cols, fold=1.5):
-            if not numeric_cols: return df,0
-            q1=df[numeric_cols].quantile(0.25, numeric_only=True); q3=df[numeric_cols].quantile(0.75, numeric_only=True)
-            iqr=q3-q1
-            lower=(q1 - fold*iqr).to_dict(); upper=(q3 + fold*iqr).to_dict()
-            df2=df.copy()
+            if not numeric_cols:
+                return df, 0
+            num = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            q1 = num.quantile(0.25)
+            q3 = num.quantile(0.75)
+            iqr = q3 - q1
+            lower = (q1 - fold * iqr).to_dict()
+            upper = (q3 + fold * iqr).to_dict()
+        
+            df2 = df.copy()
             for c in numeric_cols:
+                if c not in num.columns:
+                    continue
                 lo = lower.get(c, None); hi = upper.get(c, None)
-                if lo is not None or hi is not None:
-                    df2[c]=df2[c].clip(lower=lo, upper=hi)
-            return df2,0
+                col = pd.to_numeric(df2[c], errors='coerce')
+                df2[c] = col.clip(lower=lo, upper=hi)
+            return df2, 0
 
         # -------------- Scalers ---------------------------
         def choose_scaler_for_series(s):
