@@ -1,4 +1,5 @@
-name: Advanced Preprocessing v6
+
+name: Advanced Load & Preprocess + Feature Select v3
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
