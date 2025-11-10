@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.4
+name: Advanced Preprocess v7.5
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -56,10 +56,11 @@ implementation:
             from sklearn.impute import IterativeImputer
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.decomposition import TruncatedSVD
-            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel
+            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
             from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
             import joblib
             import category_encoders as ce
+            from sklearn.inspection import permutation_importance
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
         except Exception:
             pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl"])
@@ -72,9 +73,10 @@ implementation:
             from sklearn.impute import IterativeImputer
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.decomposition import TruncatedSVD
-            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel
+            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
             from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
             import joblib
+            from sklearn.inspection import permutation_importance
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 
@@ -579,36 +581,201 @@ implementation:
 
         # -------------- Feature Selector ------------------
         class FeatureSelector:
-            def __init__(self, task):
-                self.task=task; self.mi_selector=None; self.model_selector=None; self.selected_features=[]
-
+            def __init__(
+                self,
+                task,                               # "classification" or "regression"
+                var_threshold=0.0,                  # drop near-constant features
+                corr_threshold=0.95,                # prune highly correlated features
+                mrmr=False,                         # if True, use greedy mRMR in relevance pass
+                mrmr_beta=0.5,                      # redundancy penalty weight
+                k=None,                             # explicit k, else auto 2*sqrt(p)
+                n_permutations=10,                  # permutation repeats
+                min_gain=0.0,                       # drop features with mean perm. importance <= min_gain
+                model=None,                         # optional estimator; default ExtraTrees
+                random_state=42
+            ):
+                self.task = task
+                self.var_threshold = float(var_threshold)
+                self.corr_threshold = float(corr_threshold)
+                self.mrmr = bool(mrmr)
+                self.mrmr_beta = float(mrmr_beta)
+                self.k_user = None if k is None else int(k)
+                self.n_permutations = int(n_permutations)
+                self.min_gain = float(min_gain)
+                self.model = model
+                self.random_state = int(random_state)
+        
+                # learned state
+                self._vt = None
+                self._kept_after_var = None
+                self._kept_after_corr = None
+                self.mi_selector = None
+                self._mi_scores = None
+                self.model_selector = None  # not used now, kept for backwards compatibility
+                self._estimator = None
+                self._perm_importances = None
+                self.selected_features = []
+        
             def _auto_k(self, p):
-                return max(5, min(int(round(math.sqrt(p)*2)), p))
-
-            def fit(self, X, y):
-                p=X.shape[1]; k=self._auto_k(p)
-                if self.task=="classification":
-                    self.mi_selector = SelectKBest(score_func=mutual_info_classif, k=k).fit(X, y)
-                    model = ExtraTreesClassifier(n_estimators=600, max_features="sqrt", random_state=42, n_jobs=-1)
+                return max(5, min(int(round(2 * math.sqrt(max(p, 0)))), p))
+        
+            def _ensure_df(self, X):
+                if isinstance(X, pd.DataFrame):
+                    return X.copy()
+                return pd.DataFrame(X).copy()
+        
+            # ---------- Filter: variance then correlation ----------
+            def _filter_pass(self, X):
+                # Variance threshold
+                self._vt = VarianceThreshold(threshold=self.var_threshold)
+                Xv = self._vt.fit_transform(X)
+                kept_var = np.array(X.columns)[self._vt.get_support()].tolist()
+                Xv = pd.DataFrame(Xv, columns=kept_var, index=X.index)
+                self._kept_after_var = kept_var
+        
+                if Xv.shape[1] <= 1:
+                    self._kept_after_corr = kept_var
+                    return Xv
+        
+                # Spearman correlation pruning
+                corr = Xv.corr(method="spearman").abs()
+                # Greedy keep: iterate in column order
+                keep = []
+                for col in corr.columns:
+                    if not keep:
+                        keep.append(col)
+                    else:
+                        if all(corr.loc[col, k] < self.corr_threshold for k in keep):
+                            keep.append(col)
+                self._kept_after_corr = keep
+                return Xv[keep]
+        
+            # ---------- Relevance: MI or mRMR ----------
+            def _relevance_pass(self, X, y):
+                p = X.shape[1]
+                if p == 0:
+                    self.mi_selector = None
+                    self._mi_scores = np.array([])
+                    return X, []
+        
+                k = self.k_user if self.k_user is not None else self._auto_k(p)
+        
+                if self.task == "classification":
+                    mi = mutual_info_classif(X, y, random_state=self.random_state)
                 else:
-                    self.mi_selector = SelectKBest(score_func=mutual_info_regression, k=k).fit(X, y)
-                    model = ExtraTreesRegressor(n_estimators=600, max_features="sqrt", random_state=42, n_jobs=-1)
-                X1 = self.mi_selector.transform(X)
-                self.model_selector = SelectFromModel(estimator=model, threshold="median", max_features=X1.shape[1]).fit(X1, y)
-                mask1=self.mi_selector.get_support()
-                mask2=self.model_selector.get_support()
-                cols=np.array(X.columns)[mask1][mask2]
-                self.selected_features=list(cols)
+                    mi = mutual_info_regression(X, y, random_state=self.random_state)
+                self._mi_scores = mi
+        
+                cols = np.array(X.columns)
+        
+                if not self.mrmr:
+                    # Top-k by MI
+                    order = np.argsort(-mi)[:k]
+                    keep = cols[order].tolist()
+                    return X[keep], keep
+        
+                # mRMR greedy: MI(target) - beta * max corr with already selected
+                corr = X.corr(method="spearman").abs().fillna(0.0)
+                selected = []
+                remaining = set(cols.tolist())
+                while remaining and len(selected) < k:
+                    best_col = None
+                    best_score = -np.inf
+                    for c in list(remaining):
+                        rel = mi[cols.tolist().index(c)]
+                        if not selected:
+                            score = rel
+                        else:
+                            red = max(corr.loc[c, selected]) if selected else 0.0
+                            score = rel - self.mrmr_beta * red
+                        if score > best_score:
+                            best_score = score
+                            best_col = c
+                    selected.append(best_col)
+                    remaining.remove(best_col)
+                return X[selected], selected
+        
+            # ---------- Black-box: permutation importance ----------
+            def _blackbox_pass(self, X, y, candidates):
+                if len(candidates) == 0:
+                    self.selected_features = []
+                    self._estimator = None
+                    self._perm_importances = None
+                    return X.iloc[:, []]
+        
+                Xc = X[candidates].replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+                if self.model is not None:
+                    est = self.model
+                else:
+                    if self.task == "classification":
+                        est = ExtraTreesClassifier(
+                            n_estimators=600, max_features="sqrt", random_state=self.random_state, n_jobs=-1
+                        )
+                    else:
+                        est = ExtraTreesRegressor(
+                            n_estimators=600, max_features="sqrt", random_state=self.random_state, n_jobs=-1
+                        )
+                est.fit(Xc, y)
+                self._estimator = est
+        
+                pi = permutation_importance(
+                    est, Xc, y,
+                    n_repeats=self.n_permutations,
+                    random_state=self.random_state,
+                    n_jobs=-1
+                )
+                imp_mean = pi.importances_mean
+                self._perm_importances = dict(zip(candidates, imp_mean))
+        
+                keep = [f for f, g in zip(candidates, imp_mean) if g > self.min_gain]
+                if not keep:
+                    # fallback: keep the top half by importance
+                    order = np.argsort(-imp_mean)
+                    half = max(1, len(candidates) // 2)
+                    keep = [candidates[i] for i in order[:half]]
+        
+                self.selected_features = keep
+                return X[keep]
+        
+            # ---------- Public API ----------
+            def fit(self, X, y):
+                X = self._ensure_df(X)
+                # 1) Filter
+                Xf = self._filter_pass(X)
+                # 2) Relevance
+                Xr, rel_keep = self._relevance_pass(Xf, y)
+                # 3) Black-box
+                _ = self._blackbox_pass(Xf, y, rel_keep)
                 return self
-
+        
             def transform(self, X):
-                X1=self.mi_selector.transform(X)
-                X2=self.model_selector.transform(X1)
-                return pd.DataFrame(X2, columns=self.selected_features, index=X.index)
-
-            def save(self, path): joblib.dump(self, path)
+                X = self._ensure_df(X)
+                # Apply exact same filtering masks
+                if self._vt is None:
+                    raise RuntimeError("FeatureSelector must be fit before transform().")
+        
+                # Variance mask
+                mask_var = self._vt.get_support()
+                cols_var = np.array(X.columns)[mask_var] if mask_var.size == X.shape[1] else [c for c in X.columns if c in (self._kept_after_var or [])]
+                Xv = pd.DataFrame(self._vt.transform(X[cols_var]), columns=cols_var, index=X.index)
+        
+                # Correlation keep
+                keep_corr = [c for c in (self._kept_after_corr or []) if c in Xv.columns]
+                Xc = Xv[keep_corr] if keep_corr else Xv.iloc[:, :0]
+        
+                # Final selected features
+                final_keep = [c for c in (self.selected_features or []) if c in Xc.columns]
+                if not final_keep:
+                    return pd.DataFrame(index=X.index)  # no features selected
+                return Xc[final_keep]
+        
+            def save(self, path):
+                joblib.dump(self, path)
+        
             @staticmethod
-            def load(path): return joblib.load(path)
+            def load(path):
+                return joblib.load(path)
 
         # -------------- Printing --------------------------
         def print_before(df, target_col):
