@@ -323,9 +323,12 @@ implementation:
                 self.max_tfidf_features = int(max_tfidf_features)
                 self.svd_dims = int(svd_dims)
                 self.vectorizers = {}
-                self.svds = {}
+                self.svds = {}                # col -> TruncatedSVD or None
+                self.use_svd = {}             # col -> bool
+                self.tfidf_names = {}         # col -> list of raw TF-IDF column names if no SVD
                 self.stats_cols = {}
                 self.fitted_cols = []
+
 
             def fit(self, X):
                 if self.text_cols is None or len(self.text_cols)==0:
@@ -337,11 +340,22 @@ implementation:
                         M = vec.fit_transform(s.values)
                     except Exception:
                         continue
-                    k = min(self.svd_dims, max(2, min(M.shape)-1)) if min(M.shape)>2 else 2
-                    svd = TruncatedSVD(n_components=k, random_state=42)
-                    Z = svd.fit_transform(M)
+                    n_docs, n_terms = M.shape
+                    
+                    # decide SVD safely
+                    if n_terms >= 2 and self.svd_dims > 0:
+                        k = min(self.svd_dims, n_terms - 1)   # SVD requires k < n_terms
+                        svd = TruncatedSVD(n_components=k, random_state=42).fit(M)
+                        self.svds[col] = svd
+                        self.use_svd[col] = True
+                        self.tfidf_names[col] = None
+                    else:
+                        # skip SVD; keep raw TF-IDF column names for transform
+                        self.svds[col] = None
+                        self.use_svd[col] = False
+                        self.tfidf_names[col] = [f"{col}__tfidf{i+1}" for i in range(n_terms)]
+                    
                     self.vectorizers[col] = vec
-                    self.svds[col] = svd
                     self.stats_cols[col] = [f"{col}__len", f"{col}__word_count", f"{col}__digit_count", f"{col}__alpha_ratio"]
                     self.fitted_cols.append(col)
                 return self
@@ -351,14 +365,20 @@ implementation:
                 out = []
                 for col in self.fitted_cols:
                     if col not in X.columns:
-                        # create an empty placeholder so transform never KeyErrors
                         X[col] = ""
                     s = X[col].astype(str)
                     vec = self.vectorizers[col]; svd = self.svds[col]
                     try:
                         M = vec.transform(s.values)
-                        Z = svd.transform(M)
-                        Z_df = pd.DataFrame(Z, index=X.index, columns=[f"{col}__svd{i+1}" for i in range(Z.shape[1])])
+                        if self.use_svd.get(col, False):
+                            Z = svd.transform(M)
+                            Z_df = pd.DataFrame(Z, index=X.index,
+                                                columns=[f"{col}__svd{i+1}" for i in range(Z.shape[1])])
+                        else:
+                            # pass raw TF-IDF if SVD was skipped
+                            arr = M.toarray()
+                            cols = self.tfidf_names.get(col, [f"{col}__tfidf{i+1}" for i in range(arr.shape[1])])
+                            Z_df = pd.DataFrame(arr, index=X.index, columns=cols)
                     except Exception:
                         Z_df = pd.DataFrame(index=X.index)
                     stats = pd.DataFrame({
