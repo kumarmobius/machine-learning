@@ -1,1 +1,237 @@
+name: Evaluate Model v1
+description: |
+  Evaluate a trained model on test data.
+  - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
+  - Applies saved Preprocessor (transform only) and FeatureSelector (transform only).
+  - Loads pickled model and computes metrics.
+  - Classification: accuracy, precision_weighted, recall_weighted, f1_weighted.
+  - Regression: r2_score.
+inputs:
+  - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"
+    }
+  - {name: y_test, type: Data, description: "Path to test target file (single-column file)"
+    }
+  - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (joblib/pickle)"
+    }
+  - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (joblib/pickle). Optional", optional: true
+    }
+  - {name: model_pickle, type: Data, description: "Path to saved model (joblib/pickle)"
+    }
+  - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"
+    }
+outputs:
+  - {name: metrics_json, type: Data, description: "Evaluation metrics JSON"
+    }
+  - {name: predictions, type: Data, description: "Parquet with y_true and y_pred (and proba if available)"
+    }
+implementation:
+  container:
+    image: python:3.10-slim
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, io, gzip, zipfile, traceback, subprocess
+        def pip_install(pkgs):
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
 
+        try:
+            import pandas as pd, numpy as np, joblib
+            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
+        except Exception:
+            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet","openpyxl"])
+            import pandas as pd, numpy as np, joblib
+            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
+
+        # ---------- IO helpers ----------
+        def sample_file_bytes(path, n=8192):
+            try:
+                with open(path, "rb") as fh: return fh.read(n)
+            except Exception: return b""
+
+        def is_likely_json(sample_bytes):
+            if not sample_bytes: return False
+            try: txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
+            except Exception: return False
+            if not txt: return False
+            if txt[0] in ("{","["): return True
+            if "\\n{" in txt or "\\n[" in txt: return True
+            return False
+
+        def read_with_pandas(path):
+            if os.path.isdir(path):
+                entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
+                files=[p for p in entries if os.path.isfile(p)]
+                if not files: raise ValueError("No files in dir: "+path)
+                path = max(files, key=lambda p: os.path.getsize(p))
+                print(f"[info] directory input. picked file: {path}")
+            ext=os.path.splitext(path)[1].lower()
+            if ext==".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
+                try:
+                    with gzip.open(path,"rt",encoding="utf-8",errors="ignore") as fh:
+                        sample=fh.read(8192); fh.seek(0)
+                        if is_likely_json(sample.encode() if isinstance(sample,str) else sample):
+                            fh.seek(0)
+                            try: return pd.read_json(fh, lines=True)
+                            except Exception: fh.seek(0); return pd.read_csv(fh)
+                        fh.seek(0); return pd.read_csv(fh)
+                except Exception: pass
+            if ext==".zip":
+                with zipfile.ZipFile(path,"r") as z:
+                    members=[n for n in z.namelist() if not n.endswith("/")]
+                    member=max(members, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
+                    with z.open(member) as fh:
+                        sample=fh.read(8192)
+                        if is_likely_json(sample):
+                            with z.open(member) as fh2:
+                                return pd.read_json(io.TextIOWrapper(fh2,encoding="utf-8"), lines=True)
+                        else:
+                            with z.open(member) as fh2:
+                                return pd.read_csv(io.TextIOWrapper(fh2,encoding="utf-8"))
+            try:
+                if ext==".csv": return pd.read_csv(path)
+                if ext in (".tsv",".tab"): return pd.read_csv(path, sep="\\t")
+                if ext in (".json",".ndjson",".jsonl"):
+                    try: return pd.read_json(path, lines=True)
+                    except ValueError: return pd.read_json(path)
+                if ext in (".xls",".xlsx"): return pd.read_excel(path)
+                if ext in (".parquet",".pq"): return pd.read_parquet(path, engine="auto")
+                if ext==".feather": return pd.read_feather(path)
+                if ext==".orc": return pd.read_orc(path)
+            except Exception: pass
+            # last attempts
+            try: return pd.read_parquet(path, engine="auto")
+            except Exception: pass
+            try: return pd.read_csv(path)
+            except Exception: pass
+            raise ValueError("Unsupported format: "+path)
+
+        def ensure_dir_for(p):
+            d=os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--X_test", type=str, required=True)
+        parser.add_argument("--y_test", type=str, required=True)
+        parser.add_argument("--preprocessor", type=str, required=True)
+        parser.add_argument("--feature_selector", type=str, required=False, default="")
+        parser.add_argument("--model_pickle", type=str, required=True)
+        parser.add_argument("--model_type", type=str, default="classification")
+        parser.add_argument("--metrics_json", type=str, required=True)
+        parser.add_argument("--predictions", type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            # Load artifacts
+            pre = joblib.load(args.preprocessor)
+            fs = None
+            if args.feature_selector and os.path.exists(args.feature_selector):
+                try: fs = joblib.load(args.feature_selector)
+                except Exception as e:
+                    print("[warn] could not load feature_selector:", e)
+
+            model = joblib.load(args.model_pickle)
+
+            # Load data
+            X_raw = read_with_pandas(args.X_test)
+            y_df = read_with_pandas(args.y_test)
+
+            # force y to a 1D series
+            if isinstance(y_df, pd.DataFrame):
+                if y_df.shape[1] == 1:
+                    y = y_df.iloc[:,0]
+                else:
+                    # try to locate a 'target' column name
+                    cand = [c for c in y_df.columns if c.lower() in ("y","target","label")]
+                    y = y_df[cand[0]] if cand else y_df.iloc[:,0]
+            else:
+                y = pd.Series(y_df)
+
+            # Transform X using saved preprocessor (no fitting)
+            Xp = pre.transform(X_raw, training_mode=False)
+
+            # Optional feature selector
+            if fs is not None:
+                Xs = fs.transform(Xp)
+            else:
+                Xs = Xp
+
+            # Align y length to X
+            if len(y) != len(Xs):
+                print(f"[warn] len(X)={len(Xs)} != len(y)={len(y)}. aligning by position.")
+                n = min(len(y), len(Xs))
+                Xs = Xs.iloc[:n].reset_index(drop=True)
+                y = pd.Series(y).iloc[:n].reset_index(drop=True)
+
+            # Predict
+            if hasattr(model, "predict_proba"):
+                y_pred = model.predict(Xs)
+                try:
+                    y_proba = model.predict_proba(Xs)
+                except Exception:
+                    y_proba = None
+            else:
+                y_pred = model.predict(Xs)
+                y_proba = None
+
+            metrics = {}
+            if str(args.model_type).strip().lower() == "regression":
+                # Regression
+                try:
+                    y_true_num = pd.to_numeric(y, errors="coerce")
+                except Exception:
+                    y_true_num = y
+                metrics["r2"] = float(r2_score(y_true_num, y_pred))
+            else:
+                # Classification
+                y_true = y
+                # If one is numeric and the other not, cast to string for fair comparison
+                try:
+                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or \
+                       (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
+                        y_true = y_true.astype(str)
+                        y_pred = pd.Series(y_pred).astype(str)
+                except Exception:
+                    pass
+                metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
+                metrics["precision_weighted"] = float(precision_score(y_true, y_pred, average="weighted", zero_division=0))
+                metrics["recall_weighted"] = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
+                metrics["f1_weighted"] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+
+            # Save metrics
+            ensure_dir_for(args.metrics_json)
+            with open(args.metrics_json, "w", encoding="utf-8") as f:
+                import json
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+            # Save predictions
+            ensure_dir_for(args.predictions)
+            out = pd.DataFrame({"y_true": y, "y_pred": y_pred})
+            if isinstance(y_proba, np.ndarray):
+                out["y_proba_max"] = y_proba.max(axis=1)
+            out.to_parquet(args.predictions, index=False)
+
+            print("SUCCESS evaluation complete")
+        except Exception as e:
+            print("ERROR during evaluation:", e, file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --X_test
+      - {inputPath: X_test}
+      - --y_test
+      - {inputPath: y_test}
+      - --preprocessor
+      - {inputPath: preprocessor}
+      - --feature_selector
+      - {inputPath: feature_selector}
+      - --model_pickle
+      - {inputPath: model_pickle}
+      - --model_type
+      - {inputValue: model_type}
+      - --metrics_json
+      - {outputPath: metrics_json}
+      - --predictions
+      - {outputPath: predictions}
