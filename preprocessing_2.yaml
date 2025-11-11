@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.4.1
+name: Advanced Preprocess v7.4.2
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -80,7 +80,7 @@ implementation:
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
             import cloudpickle, gzip
 
-        # ---------------- IO helpers ----------------
+        # IO helpers
         def ensure_dir_for(p):
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
@@ -154,7 +154,7 @@ implementation:
             except Exception: pass
             raise ValueError("Unsupported format: "+path)
 
-        # ------------- Safe duplicate removal -------------
+        # Safe duplicate removal
         def make_hashable_for_dupes(df):
             df = df.copy()
             for c in df.columns:
@@ -165,7 +165,7 @@ implementation:
                     df[c] = df[c].astype(str)
             return df
 
-        # -------------- Numeric parsing -------------------
+        # Numeric parsing
         CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
         MULTIPLIER_MAP = {'k':1e3,'m':1e6,'b':1e9,'t':1e12}
         TOKEN_RE = re.compile(r'^\s*(?P<sign>[-+]?)(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?P<mult>[kKmMbBtT])?\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$')
@@ -214,7 +214,7 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
-        # -------------- Dates ------------------------------
+        # Dates 
         def detect_and_extract_dates(df, enabled=True):
             df=df.copy(); report={'date_columns':[],'skipped':[]}
             if not enabled: return df, report
@@ -240,7 +240,7 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
-        # -------------- Rare labels and similarity --------
+        # Rare labels and similarity
         def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
             counts=series.value_counts(dropna=False); n=len(series)
             rare = set(counts[counts <= threshold_count].index) if threshold_count is not None else set(counts[counts <= max(1,int(threshold_frac*n))].index)
@@ -256,7 +256,7 @@ implementation:
                 for g in group: mapping[g]=v; used.add(g)
             return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
 
-        # -------------- Outliers --------------------------
+        # Outliers 
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
             if not numeric_cols:
                 # return df unchanged, zero removed, and a keep-all mask
@@ -302,7 +302,7 @@ implementation:
                     df2[c] = df2[c].clip(lower=lo, upper=hi)
             return df2, 0
 
-        # -------------- Scalers ---------------------------
+        # Scalers
         def choose_scaler_for_series(s):
             v=s.dropna()
             if v.empty: return StandardScaler()
@@ -314,7 +314,7 @@ implementation:
             if extreme_frac>0.01 or abs(kurt)>10: return RobustScaler()
             return StandardScaler()
 
-        # -------------- Encoder choice --------------------
+        # Encoder choice
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
             n=len(series); nunique=series.nunique(dropna=True); high_card=(nunique>max(50,0.05*n))
             if high_card:
@@ -413,7 +413,7 @@ implementation:
                     X = pd.concat([X.drop(columns=[c for c in self.fitted_cols if c in X.columns]), feat], axis=1)
                 return X
 
-        # -------------- Preprocessor ----------------------
+        # Preprocessor
         class Preprocessor:
             def __init__(self):
                 self.num_cols=[]; self.cat_cols=[]; self.col_config={}; self.global_metadata={}
@@ -470,110 +470,168 @@ implementation:
                             counts=df_txt[c].astype(object).value_counts().to_dict(); cfg['count_map']=counts
                 self.global_metadata['num_cols']=self.num_cols; self.global_metadata['cat_cols']=self.cat_cols
                 return self
-
             def transform(self, df, training_mode=False):
-                df=df.copy()
-                if self.text is not None: df = self.text.transform(df)
-                temp_df=df.copy()
+                df = df.copy()
+            
+                # text features first
+                if self.text is not None:
+                    df = self.text.transform(df)
+            
+                # NEW: normalize common string tokens to NaN
+                df.replace(["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf"], np.nan, inplace=True)
+            
+                # NEW: force columns learned as numeric at fit-time to numeric dtype
+                for c in list(self.num_cols):
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors='coerce')
+            
+                temp_df = df.copy()
+            
+                # imputers that need a filled placeholder before fitting scalers
                 for c in self.num_cols:
-                    imputer_info=self.col_config.get(c,{}).get('imputer',('none',None))
-                    if imputer_info[0] in ('knn','iterative'):
-                        med=temp_df[c].median(); temp_df[c]=temp_df[c].fillna(med)
-                scaler_objs={}
+                    imputer_info = self.col_config.get(c, {}).get('imputer', ('none', None))
+                    if imputer_info[0] in ('knn', 'iterative'):
+                        # NEW: compute median after numeric coercion
+                        med = pd.to_numeric(temp_df[c], errors='coerce').median()
+                        temp_df[c] = temp_df[c].fillna(med)
+            
+                # choose & fit scalers column-wise on temp_df
+                scaler_objs = {}
                 for c in self.num_cols:
-                    sample=temp_df[c]; scaler=choose_scaler_for_series(sample)
-                    try: scaler.fit(sample.values.reshape(-1,1))
-                    except Exception: scaler=StandardScaler(); scaler.fit(sample.values.reshape(-1,1))
-                    scaler_objs[c]=scaler; self.col_config[c]['scaler_obj']=scaler
-                num_matrix=temp_df[self.num_cols].copy()
-                scaled_matrix=np.zeros_like(num_matrix.values, dtype=float)
-                for i,c in enumerate(self.num_cols):
-                    sc=scaler_objs[c]; col_vals=num_matrix[c].values.reshape(-1,1)
-                    try: scaled_col=sc.transform(col_vals).reshape(-1)
-                    except Exception: scaled_col=StandardScaler().fit_transform(col_vals).reshape(-1)
-                    scaled_matrix[:,i]=scaled_col
-                scaled_df=pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
-                need_knn=[c for c in self.num_cols if self.col_config[c]['imputer'][0]=='knn']
+                    sample = temp_df[c]
+                    scaler = choose_scaler_for_series(sample)
+                    try:
+                        scaler.fit(sample.values.reshape(-1, 1))
+                    except Exception:
+                        scaler = StandardScaler()
+                        scaler.fit(sample.values.reshape(-1, 1))
+                    scaler_objs[c] = scaler
+                    self.col_config[c]['scaler_obj'] = scaler
+            
+                # build scaled matrix for KNN imputer space
+                num_matrix = temp_df[self.num_cols].copy()
+                scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
+                for i, c in enumerate(self.num_cols):
+                    sc = scaler_objs[c]
+                    col_vals = num_matrix[c].values.reshape(-1, 1)
+                    try:
+                        scaled_col = sc.transform(col_vals).reshape(-1)
+                    except Exception:
+                        scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
+                    scaled_matrix[:, i] = scaled_col
+                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index(num_matrix.index))
+            
+                # KNN imputation in scaled space then invert scale
+                need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'knn']
                 if need_knn:
-                    base_imp=self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
-                    knn_neighbors=base_imp.get('n_neighbors',5) if isinstance(base_imp,dict) else 5
-                    knn=KNNImputer(n_neighbors=knn_neighbors)
-                    imputed_scaled=knn.fit_transform(scaled_df)
-                    imputed_scaled_df=pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
+                    base_imp = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
+                    knn_neighbors = base_imp.get('n_neighbors', 5) if isinstance(base_imp, dict) else 5
+                    knn = KNNImputer(n_neighbors=knn_neighbors)
+                    imputed_scaled = knn.fit_transform(scaled_df)
+                    imputed_scaled_df = pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
                     for c in self.num_cols:
-                        sc=scaler_objs[c]
-                        try: inv=sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
-                        except Exception: inv=imputed_scaled_df[c].values.reshape(-1)
-                        df[c]=inv
-                need_iter=[c for c in self.num_cols if self.col_config[c]['imputer'][0]=='iterative']
+                        sc = scaler_objs[c]
+                        try:
+                            inv = sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1, 1)).reshape(-1)
+                        except Exception:
+                            inv = imputed_scaled_df[c].values.reshape(-1)
+                        df[c] = inv
+            
+                # Iterative imputer in original scale
+                need_iter = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'iterative']
                 if need_iter:
-                    iter_max_iter=10; base_imp2=self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
-                    if isinstance(base_imp2,dict): iter_max_iter=base_imp2.get('max_iter',10)
-                    iter_imp=IterativeImputer(max_iter=iter_max_iter, random_state=0)
-                    arr=df[self.num_cols].astype(float).replace([np.inf,-np.inf], np.nan).values
-                    iter_out=iter_imp.fit_transform(arr)
-                    df[self.num_cols]=pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
-                    for c in need_iter: self.col_config[c]['imputer_obj']=iter_imp
+                    iter_max_iter = 10
+                    base_imp2 = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
+                    if isinstance(base_imp2, dict):
+                        iter_max_iter = base_imp2.get('max_iter', 10)
+                    iter_imp = IterativeImputer(max_iter=iter_max_iter, random_state=0)
+                    arr = df[self.num_cols].astype(float).replace([np.inf, -np.inf], np.nan).values
+                    iter_out = iter_imp.fit_transform(arr)
+                    df[self.num_cols] = pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
+                    for c in need_iter:
+                        self.col_config[c]['imputer_obj'] = iter_imp
+            
+                # simple median imputer
                 for c in self.num_cols:
-                    cfg=self.col_config[c]
-                    if cfg['imputer'][0]=='simple_median':
-                        imp=cfg['imputer'][1]; df[c]=imp.transform(df[[c]])
-                cfg_global=self.global_metadata.get('config') or {}
+                    cfg = self.col_config[c]
+                    if cfg['imputer'][0] == 'simple_median':
+                        imp = cfg['imputer'][1]
+                        df[c] = imp.transform(df[[c]])
+            
+                # optional outlier handling during training-only
+                cfg_global = self.global_metadata.get('config') or {}
                 if training_mode:
-                    if cfg_global.get('outlier_strategy','drop_iqr')=='drop_iqr':
+                    if cfg_global.get('outlier_strategy', 'drop_iqr') == 'drop_iqr':
                         df, n_removed, kept_mask = drop_outliers_iqr(
-                            df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5)
+                            df, self.num_cols, fold=cfg_global.get('outlier_fold', 1.5)
                         )
                         self.global_metadata['outliers_removed'] = int(n_removed)
-                        # store mask so caller can align y
                         self.global_metadata['kept_mask_after_outlier'] = kept_mask
-                    elif cfg_global.get('outlier_strategy')=='winsorize':
-                        df, _ = winsorize_df(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
-                        # winsorize does not drop rows; still expose a keep-all mask
+                    elif cfg_global.get('outlier_strategy') == 'winsorize':
+                        df, _ = winsorize_df(df, self.num_cols, fold=cfg_global.get('outlier_fold', 1.5))
                         self.global_metadata['kept_mask_after_outlier'] = pd.Series(True, index=df.index)
-
+            
+                # final scaling on numeric columns
                 for c in self.num_cols:
-                    sc=self.col_config[c].get('scaler_obj')
-                    if sc is None: sc=choose_scaler_for_series(df[c].fillna(df[c].median()))
-                    try: transformed=sc.transform(df[[c]].values); df[c]=transformed.reshape(-1)
+                    sc = self.col_config[c].get('scaler_obj')
+                    if sc is None:
+                        sc = choose_scaler_for_series(df[c].fillna(df[c].median()))
+                    try:
+                        transformed = sc.transform(df[[c]].values)
+                        df[c] = transformed.reshape(-1)
                     except Exception:
-                        try: df[c]=sc.fit_transform(df[[c]].values).reshape(-1)
-                        except Exception: df[c]=StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
-                    self.col_config[c]['scaler_obj']=sc
+                        try:
+                            df[c] = sc.fit_transform(df[[c]].values).reshape(-1)
+                        except Exception:
+                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
+                    self.col_config[c]['scaler_obj'] = sc
+            
+                # categorical encoding (unchanged logic)
                 for c in [cc for cc in self.cat_cols if cc in df.columns]:
-                    cfg=self.col_config[c]; s=df[c].astype(object)
-                    rare_thresh=cfg.get('rare_threshold_frac',0.01)
-                    if rare_thresh<1.0: collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
-                    else: collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
-                    df[c]=collapsed; cfg['rare_values']=list(rare_set)
-                    if cfg_global.get('enable_string_similarity', False) and cfg['n_unique']>20:
-                        grouped, mapping = string_similarity_group(df[c], score_threshold=90); df[c]=grouped; cfg['string_similarity_map']=mapping
-                    enc_type=cfg.get('encoder_type')
-                    if enc_type=='onehot':
-                        ohe=OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                        resh=df[[c]].astype(str); ohe.fit(resh); arr=ohe.transform(resh)
-                        cols=[f"{c}__{cat}" for cat in ohe.categories_[0]]
-                        df_ohe=pd.DataFrame(arr, columns=cols, index=df.index)
-                        df=pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
-                        cfg['encoder_obj']=ohe; cfg['ohe_columns']=cols
-                    elif enc_type=='ordinal':
-                        ord_enc=OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-                        resh=df[[c]].astype(object)
-                        try: ord_enc.fit(resh); df[c]=ord_enc.transform(resh).astype(float); cfg['encoder_obj']=ord_enc
-                        except Exception: df[c]=df[c].astype('category').cat.codes.astype(float)
-                    elif enc_type=='count':
-                        cnt_map=df[c].value_counts().to_dict(); df[c]=df[c].map(lambda x: cnt_map.get(x,0)); cfg['count_map']=cnt_map
-                    elif enc_type=='target':
-                        mapping=cfg.get('target_mapping',{}); global_mean=cfg.get('target_global_mean',0.0)
-                        df[c]=df[c].map(lambda x: mapping.get(x, global_mean))
+                    cfg = self.col_config[c]; s = df[c].astype(object)
+                    rare_thresh = cfg.get('rare_threshold_frac', 0.01)
+                    if rare_thresh < 1.0:
+                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
                     else:
-                        df[c]=df[c].astype('category').cat.codes.replace({-1:np.nan}).astype(float)
+                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
+                    df[c] = collapsed; cfg['rare_values'] = list(rare_set)
+                    if cfg_global.get('enable_string_similarity', False) and cfg['n_unique'] > 20:
+                        grouped, mapping = string_similarity_group(df[c], score_threshold=90)
+                        df[c] = grouped; cfg['string_similarity_map'] = mapping
+                    enc_type = cfg.get('encoder_type')
+                    if enc_type == 'onehot':
+                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                        resh = df[[c]].astype(str); ohe.fit(resh); arr = ohe.transform(resh)
+                        cols = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
+                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                        cfg['encoder_obj'] = ohe; cfg['ohe_columns'] = cols
+                    elif enc_type == 'ordinal':
+                        ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                        resh = df[[c]].astype(object)
+                        try:
+                            ord_enc.fit(resh); df[c] = ord_enc.transform(resh).astype(float); cfg['encoder_obj'] = ord_enc
+                        except Exception:
+                            df[c] = df[c].astype('category').cat.codes.astype(float)
+                    elif enc_type == 'count':
+                        cnt_map = df[c].value_counts().to_dict()
+                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0)); cfg['count_map'] = cnt_map
+                    elif enc_type == 'target':
+                        mapping = cfg.get('target_mapping', {}); global_mean = cfg.get('target_global_mean', 0.0)
+                        df[c] = df[c].map(lambda x: mapping.get(x, global_mean))
+                    else:
+                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+            
+                # ensure leftover object numerics are coerced
                 for c in list(df.columns):
-                    if df[c].dtype=='object':
-                        try: df[c]=pd.to_numeric(df[c], errors='coerce')
-                        except Exception: pass
-                df.replace([np.inf,-np.inf], np.nan, inplace=True)
+                    if df[c].dtype == 'object':
+                        try:
+                            df[c] = pd.to_numeric(df[c], errors='coerce')
+                        except Exception:
+                            pass
+                df.replace([np.inf, -np.inf], np.nan, inplace=True)
                 return df
+
 
             def save(self, path):
                 with gzip.open(path, "wb") as f:
@@ -583,7 +641,7 @@ implementation:
                 with gzip.open(path, "rb") as f:
                     return cloudpickle.load(f)
 
-        # -------------- Feature Selector ------------------
+        # Feature Selector
         class FeatureSelector:
             def __init__(self, task):
                 self.task=task; self.mi_selector=None; self.model_selector=None; self.selected_features=[]
@@ -620,7 +678,7 @@ implementation:
                 with gzip.open(path, "rb") as f:
                     return cloudpickle.load(f)
 
-        # -------------- Printing --------------------------
+        # Printing
         def print_before(df, target_col):
             print("BEFORE PREPROCESSING df.head()")
             try: print(df.head().to_string())
@@ -652,7 +710,7 @@ implementation:
             if selected_cols is not None:
                 print("SELECTED FEATURES:", selected_cols)
 
-        # -------------- Main ------------------------------
+        # Main
         parser=argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
