@@ -155,12 +155,12 @@ implementation:
 
             lr = LogisticRegression(
                 max_iter=int(args.max_iter),
+                multi_class='multinomial',
                 C=float(args.C),
                 penalty=("none" if penalty is None else penalty),
                 solver=solver,
                 class_weight=class_weight,
                 n_jobs=-1 if solver in ("saga","liblinear") else None,
-                multi_class="auto",
                 random_state=42
             )
 
