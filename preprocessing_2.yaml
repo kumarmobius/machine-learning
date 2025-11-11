@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.4
+name: Advanced Preprocess v7.4.1
 description: |
   End-to-end robust preprocessing and feature selection component.
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -61,8 +61,9 @@ implementation:
             import joblib
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+            import cloudpickle, gzip
         except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
             import pandas as pd, numpy as np
             from sklearn.impute import SimpleImputer, KNNImputer
             from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder, LabelEncoder
@@ -77,6 +78,7 @@ implementation:
             import joblib
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+            import cloudpickle, gzip
 
         # ---------------- IO helpers ----------------
         def ensure_dir_for(p):
@@ -573,9 +575,13 @@ implementation:
                 df.replace([np.inf,-np.inf], np.nan, inplace=True)
                 return df
 
-            def save(self, path): joblib.dump(self, path)
+            def save(self, path):
+                with gzip.open(path, "wb") as f:
+                    cloudpickle.dump(self, f)
             @staticmethod
-            def load(path): return joblib.load(path)
+            def load(path):
+                with gzip.open(path, "rb") as f:
+                    return cloudpickle.load(f)
 
         # -------------- Feature Selector ------------------
         class FeatureSelector:
@@ -606,9 +612,13 @@ implementation:
                 X2=self.model_selector.transform(X1)
                 return pd.DataFrame(X2, columns=self.selected_features, index=X.index)
 
-            def save(self, path): joblib.dump(self, path)
+            def save(self, path): 
+                with gzip.open(path, "wb") as f:
+                    cloudpickle.dump(self, f)
             @staticmethod
-            def load(path): return joblib.load(path)
+            def load(path):
+                with gzip.open(path, "rb") as f:
+                    return cloudpickle.load(f)
 
         # -------------- Printing --------------------------
         def print_before(df, target_col):
@@ -787,8 +797,10 @@ implementation:
             ensure_dir_for(out_X); ensure_dir_for(out_y); ensure_dir_for(preproc_path); ensure_dir_for(fs_path); ensure_dir_for(meta_path)
             Xs.to_parquet(out_X, index=False)
             y_df.to_parquet(out_y, index=False)
-            pre.save(preproc_path)
-            fs.save(fs_path)
+            with gzip.open(preproc_path, "wb") as f:
+                cloudpickle.dump(pre, f)
+            with gzip.open(fs_path, "wb") as f:
+                cloudpickle.dump(fs, f)
 
             metadata={
                 'timestamp': datetime.utcnow().isoformat()+'Z',
