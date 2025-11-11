@@ -1,5 +1,5 @@
-name: Load JSON dataset
-description: Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. Drops unused columns and prints dataframe diagnostics.
+name: Data loader v1
+description: Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. Prints dataframe diagnostics and ensures train/test splits follow requested column rules.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
@@ -69,11 +69,10 @@ implementation:
             logger.error(f" API request failed after retries: {e}")
             raise
 
+        # Create DataFrame from raw JSON (do NOT drop columns here so train_set keeps everything)
         df = pd.DataFrame(raw_data)
-        drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
-        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
 
-        # === DataFrame Diagnostics ===
+        # === DataFrame Diagnostics (full) ===
         print("===== FULL DATAFRAME SUMMARY =====")
         print("Shape:", df.shape)
         print("DF_HEAD:")
@@ -85,50 +84,70 @@ implementation:
         print("DF_NULL_COUNTS:")
         print(df.isnull().sum().to_string())
 
-        # === Target Label Handling ===
+        # === Prepare labels ===
         if args.target_column in df.columns:
+            # Keep original target values for test_y
+            target_values = df[args.target_column].copy()
+            # For stratify we may want anomaly labels if binary; create anomaly label as before
             anomaly_labels = (df[args.target_column] == 0.0).astype(np.int32)
         else:
-            logger.warning(f" Target column '{args.target_column}' not found. Creating zero anomaly labels.")
+            logger.warning(f" Target column '{args.target_column}' not found. Creating zero anomaly labels and using them as test_y.")
+            # If target missing, create zero-valued target column as fallback
+            target_values = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index, name=args.target_column)
             anomaly_labels = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index)
 
-        # === Split Size Conversion ===
+        # Use anomaly_labels for stratification if it has >1 class; else None
+        stratify_param = anomaly_labels if anomaly_labels.nunique() > 1 else None
+
+        # === Convert split-size (percent or fraction) ===
         split_size_input = float(args.split_size)
         test_size = split_size_input / 100.0 if split_size_input >= 1.0 else split_size_input
         if not (0.0 < test_size < 1.0):
             raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
 
-        stratify_param = anomaly_labels if anomaly_labels.nunique() > 1 else None
-
-        train_df, test_df, train_labels, test_labels = train_test_split(
-            df, anomaly_labels, test_size=test_size, random_state=42, stratify=stratify_param
+        # === Perform split.
+        # We split using the full dataframe as X (so train_df will contain all columns),
+        # and target_values (original target column values) as y.
+        train_df, test_df, train_y, test_y = train_test_split(
+            df, target_values, test_size=test_size, random_state=42, stratify=stratify_param
         )
+
+        # For test_x, remove the target_column (if present) — so test_x contains features only.
+        if args.target_column in test_df.columns:
+            test_x_df = test_df.drop(columns=[args.target_column])
+        else:
+            # Nothing to drop
+            test_x_df = test_df.copy()
+
+        # For train_set we keep ALL columns (unchanged train_df)
+        train_set_df = train_df.copy()
 
         # === Diagnostics for Train/Test Splits ===
         print("===== TRAIN SET =====")
-        print("Shape:", train_df.shape)
-        print(train_df.dtypes.to_string())
-        print(train_df.head(3).to_string())
+        print("Shape:", train_set_df.shape)
+        print("Columns:", train_set_df.columns.tolist())
+        print(train_set_df.head(3).to_string())
 
-        print("===== TEST X =====")
-        print("Shape:", test_df.shape)
-        print(test_df.dtypes.to_string())
-        print(test_df.head(3).to_string())
+        print("===== TEST X (features only) =====")
+        print("Shape:", test_x_df.shape)
+        print("Columns:", test_x_df.columns.tolist())
+        print(test_x_df.head(3).to_string())
 
-        print("===== TEST Y =====")
-        print("Shape:", test_labels.shape)
-        print("Type:", test_labels.dtype)
-        print(test_labels.head(10).to_string(index=False))
+        print("===== TEST Y (target values only) =====")
+        print("Shape:", test_y.shape)
+        # Ensure test_y is a DataFrame with the original target column name
+        test_y_df = pd.DataFrame({args.target_column: test_y})
+        print(test_y_df.head(10).to_string(index=False))
 
-        # === Save Outputs ===
+        # === Save Outputs (Parquet) ===
         os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
-        train_df.to_parquet(args.train_set, index=False)
+        train_set_df.to_parquet(args.train_set, index=False)
 
         os.makedirs(os.path.dirname(args.test_x) or ".", exist_ok=True)
-        test_df.to_parquet(args.test_x, index=False)
+        test_x_df.to_parquet(args.test_x, index=False)
 
         os.makedirs(os.path.dirname(args.test_y) or ".", exist_ok=True)
-        pd.DataFrame(test_labels, columns=["anomaly_label"]).to_parquet(args.test_y, index=False)
+        test_y_df.to_parquet(args.test_y, index=False)
     args:
       - --api_url
       - {inputValue: api_url}
