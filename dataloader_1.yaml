@@ -1,4 +1,4 @@
-name: Data loader v1
+name: Data loader v2
 description: Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. Prints dataframe diagnostics and ensures train/test splits follow requested column rules.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
@@ -71,6 +71,8 @@ implementation:
 
         # Create DataFrame from raw JSON (do NOT drop columns here so train_set keeps everything)
         df = pd.DataFrame(raw_data)
+        drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
         # === DataFrame Diagnostics (full) ===
         print("===== FULL DATAFRAME SUMMARY =====")
