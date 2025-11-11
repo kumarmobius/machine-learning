@@ -1,6 +1,6 @@
 name: Advanced Preprocess v7.4.2
 description: |
-  End-to-end robust preprocessing and feature selection component.
+  End-to-end robust preprocessing and feature selection component...
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
   - Drops duplicates safely even with dict/list columns.
   - Drops known non-modeling columns: piMetadata, execution_timestamp, pipelineid, component_id, projectid (if present).
@@ -519,7 +519,7 @@ implementation:
                     except Exception:
                         scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
                     scaled_matrix[:, i] = scaled_col
-                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index(num_matrix.index))
+                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
             
                 # KNN imputation in scaled space then invert scale
                 need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'knn']
