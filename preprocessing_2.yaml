@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8
+name: Advanced Preprocess v8.1
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target.
   Rules:
