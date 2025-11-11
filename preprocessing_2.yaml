@@ -1,4 +1,4 @@
-name: Advanced Preprocess v7.4.2
+name: Advanced Preprocess v7.5
 description: |
   End-to-end robust preprocessing and feature selection component...
   - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -343,7 +343,7 @@ implementation:
                 alpha=cnt/(cnt+smoothing); smooth_map[cat]=alpha*cat_mean+(1-alpha)*global_mean
             return oof.fillna(global_mean), smooth_map, float(global_mean)
 
-        # -------------- Text Featurizer -------------------
+        # Text Featurizer 
         def _should_textify(ser, min_words=3, min_len=10):
             s = ser.astype(str).fillna("")
             word_cnt_med = s.str.count(r"\\b\\w+\\b").median()
@@ -418,58 +418,97 @@ implementation:
             def __init__(self):
                 self.num_cols=[]; self.cat_cols=[]; self.col_config={}; self.global_metadata={}
                 self.text = None
-
+                
             def fit(self, df, y=None, config=None, text_params=None):
-                self.global_metadata['config']=config or {}
-                self.global_metadata['text_params']=text_params or {}
-                nrows=len(df)
-                self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
-                self.cat_cols=[c for c in df.columns if c not in self.num_cols]
+                self.global_metadata['config'] = config or {}
+                self.global_metadata['text_params'] = text_params or {}
+                nrows = len(df)
+            
+                # initial type split
+                self.num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                self.cat_cols = [c for c in df.columns if c not in self.num_cols]
+            
+                # text featurizer learned here and reused later
                 self.text = TextFeaturizer(
                     text_cols=None,
                     max_tfidf_features=int(self.global_metadata['text_params'].get('tfidf_max_features', 20000)),
                     svd_dims=int(self.global_metadata['text_params'].get('svd_dims', 30))
                 ).fit(df)
                 df_txt = self.text.transform(df)
-
+            
+                # recompute splits after text expansion
                 self.num_cols = [c for c in df_txt.columns if pd.api.types.is_numeric_dtype(df_txt[c])]
                 self.cat_cols = [c for c in df_txt.columns if c not in self.num_cols]
-
+            
+                # numeric columns config
                 for c in self.num_cols:
-                    s=df_txt[c]; cfg={}
-                    missing_frac=s.isna().mean(); cfg['missing_frac']=float(missing_frac)
-                    cfg['n_unique']=int(s.nunique(dropna=True))
-                    cfg['skew']=float(s.dropna().skew()) if s.dropna().shape[0]>2 else 0.0
-                    cfg['kurtosis']=float(s.dropna().kurtosis()) if s.dropna().shape[0]>3 else 0.0
-                    if missing_frac==0: cfg['imputer']=('none',None)
-                    elif missing_frac<0.02:
-                        imp=SimpleImputer(strategy='median'); imp.fit(np.array(s).reshape(-1,1)); cfg['imputer']=('simple_median',imp)
+                    s = df_txt[c]
+                    cfg = {}
+                    missing_frac = s.isna().mean(); cfg['missing_frac'] = float(missing_frac)
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['skew'] = float(s.dropna().skew()) if s.dropna().shape[0] > 2 else 0.0
+                    cfg['kurtosis'] = float(s.dropna().kurtosis()) if s.dropna().shape[0] > 3 else 0.0
+                    if missing_frac == 0:
+                        cfg['imputer'] = ('none', None)
+                    elif missing_frac < 0.02:
+                        imp = SimpleImputer(strategy='median'); imp.fit(np.array(s).reshape(-1,1))
+                        cfg['imputer'] = ('simple_median', imp)
                     else:
-                        if nrows<=self.global_metadata['config'].get('max_knn_rows',5000) and missing_frac<0.25:
-                            cfg['imputer']=('knn',{'n_neighbors':5})
+                        if nrows <= self.global_metadata['config'].get('max_knn_rows', 5000) and missing_frac < 0.25:
+                            cfg['imputer'] = ('knn', {'n_neighbors': 5})
                         else:
-                            cfg['imputer']=('iterative',{'max_iter':10,'random_state':0})
-                    cfg['scaler_choice']='auto'
-                    self.col_config[c]=cfg
+                            cfg['imputer'] = ('iterative', {'max_iter': 10, 'random_state': 0})
+                    cfg['scaler_choice'] = 'auto'
+                    self.col_config[c] = cfg
+            
+                # categorical columns config + FIT encoders here (no fitting in transform)
                 for c in self.cat_cols:
-                    s=df_txt[c].astype(object); cfg={}
-                    cfg['n_unique']=int(s.nunique(dropna=True))
-                    cfg['missing_frac']=float(s.isna().mean())
-                    cfg['high_card']=cfg['n_unique']>max(50,0.05*nrows)
-                    cfg['rare_threshold_frac']=self.global_metadata['config'].get('rare_threshold',0.01)
-                    enc_name,enc_obj,_=choose_categorical_encoder(c,s,(y if y is not None else None),train_mode=(y is not None))
-                    cfg['encoder_type']=enc_name; cfg['encoder_obj']=enc_obj
-                    self.col_config[c]=cfg
+                    s = df_txt[c].astype(object)
+                    cfg = {}
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['missing_frac'] = float(s.isna().mean())
+                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
+                    cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
+            
+                    enc_name, _, _ = choose_categorical_encoder(
+                        c, s, (y if y is not None else None), train_mode=(y is not None)
+                    )
+                    cfg['encoder_type'] = enc_name
+            
+                    if enc_name == 'onehot':
+                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                        ohe.fit(df_txt[[c]].astype(str))
+                        cfg['encoder_obj'] = ohe
+                        cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+            
+                    elif enc_name == 'ordinal':
+                        ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                        ord_enc.fit(df_txt[[c]].astype(str))
+                        cfg['encoder_obj'] = ord_enc
+            
+                    elif enc_name == 'target':
+                        # learned below using KFold
+                        pass
+            
+                    elif enc_name == 'count':
+                        counts = df_txt[c].astype(object).value_counts().to_dict()
+                        cfg['count_map'] = counts
+            
+                    self.col_config[c] = cfg
+            
+                # learn target encoder mappings if needed
                 if y is not None:
                     for c in self.cat_cols:
-                        cfg=self.col_config[c]
-                        if cfg['encoder_type']=='target':
+                        cfg = self.col_config[c]
+                        if cfg['encoder_type'] == 'target':
                             _, mapping, global_mean = fit_target_encoder_kfold(df_txt, c, y, n_splits=5)
-                            cfg['target_mapping']=mapping; cfg['target_global_mean']=float(global_mean)
-                        elif cfg['encoder_type']=='count':
-                            counts=df_txt[c].astype(object).value_counts().to_dict(); cfg['count_map']=counts
-                self.global_metadata['num_cols']=self.num_cols; self.global_metadata['cat_cols']=self.cat_cols
+                            cfg['target_mapping'] = mapping
+                            cfg['target_global_mean'] = float(global_mean)
+            
+                self.global_metadata['num_cols'] = self.num_cols
+                self.global_metadata['cat_cols'] = self.cat_cols
                 return self
+
             def transform(self, df, training_mode=False):
                 df = df.copy()
             
@@ -477,25 +516,27 @@ implementation:
                 if self.text is not None:
                     df = self.text.transform(df)
             
-                # NEW: normalize common string tokens to NaN
-                df.replace(["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf"], np.nan, inplace=True)
+                # normalize common string tokens to NaN
+                df.replace(
+                    ["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf"],
+                    np.nan, inplace=True
+                )
             
-                # NEW: force columns learned as numeric at fit-time to numeric dtype
+                # force fit-time numeric columns to numeric dtype
                 for c in list(self.num_cols):
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
             
                 temp_df = df.copy()
             
-                # imputers that need a filled placeholder before fitting scalers
+                # pre-fill for KNN/Iterative
                 for c in self.num_cols:
                     imputer_info = self.col_config.get(c, {}).get('imputer', ('none', None))
                     if imputer_info[0] in ('knn', 'iterative'):
-                        # NEW: compute median after numeric coercion
                         med = pd.to_numeric(temp_df[c], errors='coerce').median()
                         temp_df[c] = temp_df[c].fillna(med)
             
-                # choose & fit scalers column-wise on temp_df
+                # choose & fit scalers column-wise on temp_df (scaler params fixed by numeric distribution)
                 scaler_objs = {}
                 for c in self.num_cols:
                     sample = temp_df[c]
@@ -508,7 +549,7 @@ implementation:
                     scaler_objs[c] = scaler
                     self.col_config[c]['scaler_obj'] = scaler
             
-                # build scaled matrix for KNN imputer space
+                # scaled matrix for KNN space
                 num_matrix = temp_df[self.num_cols].copy()
                 scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
                 for i, c in enumerate(self.num_cols):
@@ -586,43 +627,54 @@ implementation:
                             df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
                     self.col_config[c]['scaler_obj'] = sc
             
-                # categorical encoding (unchanged logic)
+                # categorical encoding using FIT-TIME encoders/mappings (no fitting here)
                 for c in [cc for cc in self.cat_cols if cc in df.columns]:
-                    cfg = self.col_config[c]; s = df[c].astype(object)
+                    cfg = self.col_config[c]
+                    s = df[c].astype(object)
+            
+                    # rare collapse and optional string similarity remain
                     rare_thresh = cfg.get('rare_threshold_frac', 0.01)
                     if rare_thresh < 1.0:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
                     else:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
                     df[c] = collapsed; cfg['rare_values'] = list(rare_set)
+            
                     if cfg_global.get('enable_string_similarity', False) and cfg['n_unique'] > 20:
                         grouped, mapping = string_similarity_group(df[c], score_threshold=90)
                         df[c] = grouped; cfg['string_similarity_map'] = mapping
+            
                     enc_type = cfg.get('encoder_type')
+            
                     if enc_type == 'onehot':
-                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                        resh = df[[c]].astype(str); ohe.fit(resh); arr = ohe.transform(resh)
-                        cols = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        ohe = cfg.get('encoder_obj')
+                        resh = df[[c]].astype(str)
+                        arr = ohe.transform(resh)
+                        cols = cfg['ohe_columns']
                         df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
                         df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
-                        cfg['encoder_obj'] = ohe; cfg['ohe_columns'] = cols
+            
                     elif enc_type == 'ordinal':
-                        ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-                        resh = df[[c]].astype(object)
+                        ord_enc = cfg.get('encoder_obj')
+                        resh = df[[c]].astype(str)
                         try:
-                            ord_enc.fit(resh); df[c] = ord_enc.transform(resh).astype(float); cfg['encoder_obj'] = ord_enc
+                            df[c] = ord_enc.transform(resh).astype(float)
                         except Exception:
                             df[c] = df[c].astype('category').cat.codes.astype(float)
+            
                     elif enc_type == 'count':
-                        cnt_map = df[c].value_counts().to_dict()
-                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0)); cfg['count_map'] = cnt_map
+                        cnt_map = cfg.get('count_map', {})
+                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0))
+            
                     elif enc_type == 'target':
-                        mapping = cfg.get('target_mapping', {}); global_mean = cfg.get('target_global_mean', 0.0)
+                        mapping = cfg.get('target_mapping', {})
+                        global_mean = cfg.get('target_global_mean', 0.0)
                         df[c] = df[c].map(lambda x: mapping.get(x, global_mean))
+            
                     else:
                         df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
             
-                # ensure leftover object numerics are coerced
+                # coerce any leftover object numerics
                 for c in list(df.columns):
                     if df[c].dtype == 'object':
                         try:
@@ -630,7 +682,26 @@ implementation:
                         except Exception:
                             pass
                 df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            
+                # schema locking: record order on training; enforce on inference
+                if training_mode:
+                    self.final_feature_order_ = list(df.columns)
+                else:
+                    if hasattr(self, 'final_feature_order_') and self.final_feature_order_:
+                        want = list(self.final_feature_order_)
+                        # add any missing training columns with zeros
+                        for col in want:
+                            if col not in df.columns:
+                                df[col] = 0.0
+                        # drop any unexpected columns
+                        extra = [c for c in df.columns if c not in want]
+                        if extra:
+                            df = df.drop(columns=extra)
+                        # reorder to training order
+                        df = df[want]
+            
                 return df
+
 
 
             def save(self, path):
