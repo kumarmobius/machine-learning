@@ -21,7 +21,7 @@ outputs:
   - {name: predictions, type: Data, description: "Parquet with y_true and y_pred (and proba if available)"}
 implementation:
   container:
-    image: python:3.10-slim
+    image: kumar2004/ml-base:v1
     command:
       - python3
       - -u
@@ -31,15 +31,10 @@ implementation:
         def pip_install(pkgs):
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
 
-        try:
-            import pandas as pd, numpy as np, joblib
-            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
-            import cloudpickle, gzip
-        except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
-            import pandas as pd, numpy as np, joblib
-            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
-            import cloudpickle, gzip
+
+        import pandas as pd, numpy as np, joblib
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
+        import cloudpickle, gzip
 
         def is_likely_json(sample_bytes):
             if not sample_bytes: return False
