@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.3
+name: Advanced Preprocess v8.3.4
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -420,7 +420,8 @@ implementation:
             # pre-normalize T to space for patterns that expect space
             if " %H:%M" in fmt and "T" in s.astype(str).str[10:11].unique().tolist():
                 s = s.astype(str).str.replace("T", " ", n=1, regex=False)
-            return pd.to_datetime(s, format=fmt, errors="coerce")
+            dt = pd.to_datetime(s, format=fmt, errors="coerce", utc=True)
+            return dt.dt.tz_localize(None)
         
         def _choose_ambiguous(sample: pd.Series, fmts: tuple[str, str]) -> str:
             a = _try_parse_with_format(sample, fmts[0])
@@ -437,14 +438,18 @@ implementation:
             if s.empty: return None
             # 10 digits => seconds, 13 => ms, 16 => µs
             if (s.str.fullmatch(r"\d{10}", na=False).mean() >= agree_frac):
-                return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="s", utc=True).tz_convert(None)
+                dt = pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="s", utc=True)
+                return dt.dt.tz_localize(None)
             if (s.str.fullmatch(r"\d{13}", na=False).mean() >= agree_frac):
-                return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="ms", utc=True).tz_convert(None)
+                dt = pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="ms", utc=True)
+                return dt.dt.tz_localize(None)
             if (s.str.fullmatch(r"\d{16}", na=False).mean() >= agree_frac):
-                return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="us", utc=True).tz_convert(None)
+                dt = pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="us", utc=True)
+                return dt.dt.tz_localize(None)
             # yyyymmddhhmmss (14) common in logs
             if (s.str.fullmatch(r"\d{14}", na=False).mean() >= agree_frac):
-                return pd.to_datetime(series, format="%Y%m%d%H%M%S", errors="coerce")
+                dt = pd.to_datetime(series, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+                return dt.dt.tz_localize(None)
             return None
         
         # ---- 3) Main detector ----
@@ -483,7 +488,8 @@ implementation:
                     # Let pandas handle mixed ISO without raising the earlier warning.
                     # We normalize 'T' to ' ' to keep it consistent.
                     tmp = s.astype(str).str.replace("T", " ", n=1, regex=False)
-                    return pd.to_datetime(tmp, errors="coerce", infer_datetime_format=True)
+                    dt  = pd.to_datetime(tmp, errors="coerce", utc=True, infer_datetime_format=True)
+                    return dt.dt.tz_localize(None)
                 return s
         
             return _try_parse_with_format(s.astype(str), best_fmt)
@@ -505,7 +511,10 @@ implementation:
                     svd_dims=int(self.global_metadata['text_params'].get('svd_dims', 30))
                 ).fit(df)
 
+                tcol = self.global_metadata.get('target_col')
                 for c in df.columns:
+                    if c == tcol:
+                        continue
                     if df[c].dtype == 'object':
                         df[c] = safe_to_datetime(df[c])
                 df_txt = self.text.transform(df)
