@@ -38,7 +38,7 @@ implementation:
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
             import cloudpickle, gzip
 
-        # ---------- IO helpers ----------
+        # IO helpers
         def sample_file_bytes(path, n=8192):
             try:
                 with open(path, "rb") as fh: return fh.read(n)
@@ -50,7 +50,7 @@ implementation:
             except Exception: return False
             if not txt: return False
             if txt[0] in ("{","["): return True
-            if "\n{" in txt or "\n[" in txt: return True
+            if "{" in txt or "[" in txt: return True
             return False
 
         def read_with_pandas(path):
