@@ -1,16 +1,19 @@
-name: Evaluate Model v1.4
+name: Evaluate Model v1.3
 description: |
   Evaluate a trained model on test data.
+  Fixes the feature-name mismatch by aligning test features to the training schema
+  before FeatureSelector.transform(). Also loads artifacts with joblib (no gzip/cloudpickle).
   - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
-  - Applies saved Preprocessor (transform only) and FeatureSelector (transform only).
+  - Re-applies object→numeric conversion and date expansion to mirror training.
+  - Applies saved Preprocessor (transform only) and FeatureSelector (transform only) with schema alignment.
   - Loads pickled model and computes metrics.
   - Classification: accuracy, precision_weighted, recall_weighted, f1_weighted.
   - Regression: r2_score.
 inputs:
   - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Data, description: "Path to test target file (single-column file)"}
-  - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
-  - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
+  - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (joblib) from training"}
+  - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (joblib) from training. Optional", optional: true}
   - {name: model_pickle, type: Data, description: "Path to saved model (joblib/pickle)"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
 outputs:
@@ -24,19 +27,17 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, io, gzip, zipfile, traceback, subprocess
+        import argparse, os, sys, json, io, gzip, zipfile, traceback, subprocess, re
         def pip_install(pkgs):
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
 
         try:
             import pandas as pd, numpy as np, joblib
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
-            import cloudpickle, gzip
         except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet","openpyxl"])
             import pandas as pd, numpy as np, joblib
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
-            import cloudpickle, gzip
 
         # ---------- IO helpers ----------
         def sample_file_bytes(path, n=8192):
@@ -50,7 +51,7 @@ implementation:
             except Exception: return False
             if not txt: return False
             if txt[0] in ("{","["): return True
-            if "\\n{" in txt or "\\n[" in txt: return True
+            if "\n{" in txt or "\n[" in txt: return True
             return False
 
         def read_with_pandas(path):
@@ -85,7 +86,7 @@ implementation:
                                 return pd.read_csv(io.TextIOWrapper(fh2,encoding="utf-8"))
             try:
                 if ext==".csv": return pd.read_csv(path)
-                if ext in (".tsv",".tab"): return pd.read_csv(path, sep="\\t")
+                if ext in (".tsv",".tab"): return pd.read_csv(path, sep="\t")
                 if ext in (".json",".ndjson",".jsonl"):
                     try: return pd.read_json(path, lines=True)
                     except ValueError: return pd.read_json(path)
@@ -106,22 +107,77 @@ implementation:
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
 
-        # Robust loader for cloudpickle/joblib with optional gzip
-        def load_pickle_any(path):
-            # try gzip+cloudpickle
-            try:
-                with gzip.open(path, "rb") as f:
-                    return cloudpickle.load(f)
-            except Exception:
-                pass
-            # try plain cloudpickle
-            try:
-                with open(path, "rb") as f:
-                    return cloudpickle.load(f)
-            except Exception:
-                pass
-            # fallback to joblib
-            return joblib.load(path)
+        # ---------- numeric/date helpers to mirror training ----------
+        CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
+        MULTIPLIER_MAP = {'k':1e3,'m':1e6,'b':1e9,'t':1e12}
+        TOKEN_RE = re.compile(r'^\s*(?P<sign>[-+]?)(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?P<mult>[kKmMbBtT])?\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$')
+        def parse_alphanumeric_to_numeric(s, decimal_comma=False):
+            import numpy as np, pandas as pd, re
+            if pd.isna(s): return np.nan
+            orig=str(s).strip()
+            if orig=='' or orig.lower() in {'nan','none','null','na'}: return np.nan
+            tmp=re.sub(CURRENCY_SYMBOLS_REGEX,'',orig)
+            if tmp.strip().endswith('%'):
+                try: return float(tmp.strip().rstrip('%').replace(',','').replace(' ',''))/100.0
+                except Exception: pass
+            tmp=tmp.replace('\u2212','-').replace('\u2013','-').replace('\u2014','-')
+            tmp=re.sub(r'[\u00A0\u202F]','',tmp).strip()
+            if decimal_comma: tmp=tmp.replace('.','').replace(',','.')
+            else: tmp=tmp.replace(',','').replace(' ','')
+            try: return float(tmp)
+            except Exception: pass
+            m=TOKEN_RE.match(tmp)
+            if m:
+                number=m.group('number'); mult=m.group('mult'); unit=(m.group('unit') or '').lower()
+                number_clean=number.replace(',','').replace(' ','')
+                try: val=float(number_clean)
+                except Exception:
+                    try: val=float(number_clean.replace(',', '.'))
+                    except Exception: return np.nan
+                if mult: val*=MULTIPLIER_MAP.get(mult.lower(),1.0)
+                if unit and '%' in unit: val = val/100.0
+                return val
+            num_search=re.search(r'[-+]?\d+([.,]\d+)?', tmp)
+            if num_search:
+                try: return float(num_search.group(0).replace(',',''))
+                except Exception: return np.nan
+            return np.nan
+
+        def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True):
+            import numpy as np, pandas as pd
+            df=df.copy(); obj_cols=[c for c in df.columns if (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
+            for col in obj_cols:
+                ser=df[col].astype(object); total_non_null=ser.notna().sum()
+                if total_non_null==0: continue
+                parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma)) if advanced else pd.to_numeric(ser, errors='coerce')
+                frac = parsed.notna().sum()/float(total_non_null)
+                if frac>=detect_threshold:
+                    df[col]=parsed
+            return df
+
+        def detect_and_extract_dates(df, enabled=True):
+            import pandas as pd
+            df=df.copy()
+            if not enabled: return df
+            cand=[c for c in df.columns if (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
+            for col in cand:
+                ser=df[col].astype(object)
+                sample=ser.dropna().astype(str).head(500)
+                if sample.empty: continue
+                parsed=pd.to_datetime(sample, errors='coerce', utc=False)
+                frac=parsed.notna().mean()
+                if frac>=0.6:
+                    full=pd.to_datetime(ser, errors='coerce', utc=False)
+                    df[col]=full
+                    df[col+"_year"]=df[col].dt.year
+                    df[col+"_month"]=df[col].dt.month
+                    df[col+"_day"]=df[col].dt.day
+                    df[col+"_dayofweek"]=df[col].dt.dayofweek
+                    df[col+"_is_weekend"]=df[col].dt.dayofweek.isin([5,6]).astype('Int64')
+                    df[col+"_is_month_start"]=df[col].dt.is_month_start.astype('Int64')
+                    df[col+"_is_month_end"]=df[col].dt.is_month_end.astype('Int64')
+                    df[col+"_days_since_epoch"]=(df[col]-pd.Timestamp("1970-01-01"))//pd.Timedelta('1D')
+            return df
 
         parser = argparse.ArgumentParser()
         parser.add_argument("--X_test", type=str, required=True)
@@ -135,42 +191,54 @@ implementation:
         args = parser.parse_args()
 
         try:
-            # resolve paths from args
-            X_path = args.X_test
-            y_path = args.y_test
-            preprocessor_path = args.preprocessor
-            feature_selector_path = args.feature_selector or ""
-            model_path = args.model_pickle
-            metrics_path = args.metrics_json
-            preds_path = args.predictions
-            task = str(args.model_type).strip().lower()
-
-            # Load artifacts
-            pre = load_pickle_any(preprocessor_path)
-            fs = load_pickle_any(feature_selector_path) if feature_selector_path and os.path.exists(feature_selector_path) else None
-            model = joblib.load(model_path)
+            # Load artifacts with joblib
+            pre = joblib.load(args.preprocessor)
+            fs = joblib.load(args.feature_selector) if args.feature_selector and os.path.exists(args.feature_selector) else None
+            model = joblib.load(args.model_pickle)
 
             # Load data
-            X_raw = read_with_pandas(X_path)
-            y_df = read_with_pandas(y_path)
+            X_raw = read_with_pandas(args.X_test)
+            y_df = read_with_pandas(args.y_test)
 
-            # y -> 1D Series
+            # Prepare y as 1D Series
             if isinstance(y_df, pd.DataFrame):
                 if y_df.shape[1] == 1:
-                    y = y_df.iloc[:, 0]
+                    y = y_df.iloc[:,0]
                 else:
                     cand = [c for c in y_df.columns if c.lower() in ("y","target","label")]
-                    y = y_df[cand[0]] if cand else y_df.iloc[:, 0]
+                    y = y_df[cand[0]] if cand else y_df.iloc[:,0]
             else:
                 y = pd.Series(y_df)
 
-            # Transform X using saved preprocessor (no fitting)
+            # Avoid leakage: drop any y columns present in X_raw
+            if isinstance(y, pd.Series):
+                X_raw = X_raw.drop(columns=[y.name] if y.name in X_raw.columns else [], errors="ignore")
+            if isinstance(y_df, pd.DataFrame):
+                X_raw = X_raw.drop(columns=[c for c in y_df.columns if c in X_raw.columns], errors="ignore")
+
+            # Mirror train pre-steps: object->numeric + date features
+            X_raw = convert_object_columns_advanced(X_raw, detect_threshold=0.6, decimal_comma=False, advanced=True)
+            X_raw = detect_and_extract_dates(X_raw, enabled=True)
+
+            # Transform using saved Preprocessor (no training-mode ops)
             Xp = pre.transform(X_raw, training_mode=False)
 
-            # Optional feature selector
+            # Schema alignment BEFORE FS: align to features seen by mi_selector at fit time
+            base = None
+            if fs is not None:
+                if hasattr(fs, "mi_selector") and getattr(fs.mi_selector, "feature_names_in_", None) is not None:
+                    base = list(fs.mi_selector.feature_names_in_)
+                elif hasattr(fs, "base_feature_names"):
+                    base = list(getattr(fs, "base_feature_names"))
+                elif hasattr(pre, "global_metadata") and isinstance(pre.global_metadata, dict):
+                    base = list(pre.global_metadata.get("fs_expected_input_cols", []) or [])
+            if base:
+                Xp = Xp.reindex(columns=base, fill_value=0.0)
+
+            # Feature selection transform
             Xs = fs.transform(Xp) if fs is not None else Xp
 
-            # Align y length to X by position if mismatched
+            # Align lengths by position if needed
             if len(y) != len(Xs):
                 print(f"[warn] len(X)={len(Xs)} != len(y)={len(y)}. aligning by position.")
                 n = min(len(y), len(Xs))
@@ -178,26 +246,28 @@ implementation:
                 y = pd.Series(y).iloc[:n].reset_index(drop=True)
 
             # Predict
-            has_proba = hasattr(model, "predict_proba")
-            y_pred = model.predict(Xs)
-            y_proba = None
-            if has_proba:
+            if hasattr(model, "predict_proba"):
+                y_pred = model.predict(Xs)
                 try:
                     y_proba = model.predict_proba(Xs)
                 except Exception:
                     y_proba = None
+            else:
+                y_pred = model.predict(Xs)
+                y_proba = None
 
             # Metrics
             metrics = {}
-            if task == "regression":
-                y_true_num = pd.to_numeric(y, errors="coerce")
+            if str(args.model_type).strip().lower() == "regression":
+                try:
+                    y_true_num = pd.to_numeric(y, errors="coerce")
+                except Exception:
+                    y_true_num = y
                 metrics["r2"] = float(r2_score(y_true_num, y_pred))
             else:
                 y_true = y
-                # harmonize dtypes if needed
                 try:
-                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or \
-                       (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
+                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or                        (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
                         y_true = y_true.astype(str)
                         y_pred = pd.Series(y_pred).astype(str)
                 except Exception:
@@ -208,16 +278,16 @@ implementation:
                 metrics["f1_weighted"] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
 
             # Save metrics
-            ensure_dir_for(metrics_path)
-            with open(metrics_path, "w", encoding="utf-8") as f:
+            ensure_dir_for(args.metrics_json)
+            with open(args.metrics_json, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
             # Save predictions
-            ensure_dir_for(preds_path)
+            ensure_dir_for(args.predictions)
             out = pd.DataFrame({"y_true": y, "y_pred": y_pred})
             if isinstance(y_proba, np.ndarray):
                 out["y_proba_max"] = y_proba.max(axis=1)
-            out.to_parquet(preds_path, index=False)
+            out.to_parquet(args.predictions, index=False)
 
             print("SUCCESS evaluation complete")
         except Exception as e:
