@@ -1,4 +1,4 @@
-name: Evaluate Model v1.5
+name: Evaluate Model v1.6
 description: |
   Evaluate a trained model on test data.
   - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -6,6 +6,7 @@ description: |
   - Loads pickled model and computes metrics.
   - Classification: accuracy, precision_weighted, recall_weighted, f1_weighted.
   - Regression: r2_score.
+  - Optional preprocess_metadata with label_mapping to align y_test labels to train-time encoding.
 inputs:
   - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Data, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -14,6 +15,7 @@ inputs:
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
   - {name: model_pickle, type: Data, description: "Path to saved model (joblib/pickle)"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
+  - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time containing label_mapping for classification", optional: true}
 outputs:
   - {name: metrics_json, type: Data, description: "Evaluation metrics JSON"}
   - {name: predictions, type: Data, description: "Parquet with y_true and y_pred (and proba if available)"}
@@ -122,6 +124,7 @@ implementation:
         parser.add_argument("--feature_selector", type=str, required=False, default="")
         parser.add_argument("--model_pickle", type=str, required=True)
         parser.add_argument("--model_type", type=str, default="classification")
+        parser.add_argument("--preprocess_metadata", type=str, required=False, default="")
         parser.add_argument("--metrics_json", type=str, required=True)
         parser.add_argument("--predictions", type=str, required=True)
         args = parser.parse_args()
@@ -136,6 +139,7 @@ implementation:
             preds_path = args.predictions
             task = str(args.model_type).strip().lower()
             target_col = str(args.target_column or "").strip()
+            meta_path = (args.preprocess_metadata or "").strip()
 
             pre = load_pickle_any(preprocessor_path)
             fs = load_pickle_any(feature_selector_path) if feature_selector_path and os.path.exists(feature_selector_path) else None
@@ -162,8 +166,10 @@ implementation:
             if len(y) == 0:
                 raise ValueError("Loaded y_test has 0 rows. Check the artifact and target_column.")
 
+            # Transform X using saved preprocessor (no fitting)
             Xp = pre.transform(X_raw, training_mode=False)
 
+            # Optional feature selector
             if fs is not None and hasattr(fs, "selected_features"):
                 want_cols = list(fs.selected_features)
                 Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
@@ -172,9 +178,54 @@ implementation:
             else:
                 Xs = Xp
 
+            # --- Align y labels to train-time encoding if available ---
+            def _round_half_up_to_str(v):
+                if pd.isna(v):
+                    return None
+                s = str(v).strip()
+                try:
+                    from math import floor
+                    x = float(s)
+                    return str(int(floor(x + 0.5)))
+                except Exception:
+                    return s
+
+            label_map = None
+            if meta_path and os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    label_map = meta.get("label_mapping", None)
+                    if label_map:
+                        print("info loaded label_mapping from preprocess_metadata")
+                except Exception as e:
+                    print("warn could not read preprocess_metadata reason=", e)
+            if label_map is None:
+                try:
+                    gm = getattr(pre, "global_metadata", {}) or {}
+                    if "label_mapping" in gm:
+                        label_map = gm["label_mapping"]
+                        print("info loaded label_mapping from preprocessor.global_metadata")
+                except Exception:
+                    pass
+
+            if task != "regression" and label_map is not None:
+                inv_src_to_id = { _round_half_up_to_str(k): int(v) for k, v in label_map.items() }
+                y_canon = pd.Series(y).map(_round_half_up_to_str)
+                y_enc = y_canon.map(lambda k: inv_src_to_id.get(k, None))
+                if y_enc.isna().any():
+                    missing = int(y_enc.isna().sum())
+                    print("warn unmapped targets in y_test count=", missing)
+                    keep_mask = ~y_enc.isna()
+                    Xs = Xs.iloc[keep_mask.values].reset_index(drop=True)
+                    y = y_enc[keep_mask].astype(int).reset_index(drop=True)
+                else:
+                    y = y_enc.astype(int).reset_index(drop=True)
+
             if len(y) != len(Xs):
                 raise ValueError("Length mismatch: X=" + str(len(Xs)) + " vs y=" + str(len(y)) + ". Pass matching test artifacts.")
 
+            # Predict
             has_proba = hasattr(model, "predict_proba")
             y_pred = model.predict(Xs)
             y_proba = None
@@ -184,17 +235,17 @@ implementation:
                 except Exception:
                     y_proba = None
 
+            # Metrics
             metrics = {}
             if task == "regression":
                 y_true_num = pd.to_numeric(y, errors="coerce")
                 metrics["r2"] = float(r2_score(y_true_num, y_pred))
                 print("===== REGRESSION METRICS =====")
-                print("R² Score:", metrics["r2"])
+                print("R2 Score:", metrics["r2"])
             else:
                 y_true = y
                 try:
-                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or \
-                       (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
+                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or                        (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
                         y_true = y_true.astype(str)
                         y_pred = pd.Series(y_pred).astype(str)
                 except Exception:
@@ -209,10 +260,12 @@ implementation:
                 print("Recall (weighted):", metrics["recall_weighted"])
                 print("F1 Score (weighted):", metrics["f1_weighted"])
 
+            # Save metrics
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
+            # Save predictions
             ensure_dir_for(preds_path)
             out = pd.DataFrame({"y_true": y, "y_pred": y_pred})
             if isinstance(y_proba, np.ndarray):
@@ -242,6 +295,8 @@ implementation:
       - {inputPath: model_pickle}
       - --model_type
       - {inputValue: model_type}
+      - --preprocess_metadata
+      - {inputPath: preprocess_metadata}
       - --metrics_json
       - {outputPath: metrics_json}
       - --predictions
