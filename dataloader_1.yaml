@@ -74,15 +74,15 @@ implementation:
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
 
         # === DataFrame Diagnostics ===
-        print("\n===== FULL DATAFRAME SUMMARY =====")
+        print("===== FULL DATAFRAME SUMMARY =====")
         print("Shape:", df.shape)
-        print("\nDF_HEAD:")
+        print("DF_HEAD:")
         print(df.head().to_string())
-        print("\nDF_INFO:")
+        print("DF_INFO:")
         df.info()
-        print("\nDF_DTYPES:")
+        print("DF_DTYPES:")
         print(df.dtypes.to_string())
-        print("\nDF_NULL_COUNTS:")
+        print("DF_NULL_COUNTS:")
         print(df.isnull().sum().to_string())
 
         # === Target Label Handling ===
@@ -105,17 +105,17 @@ implementation:
         )
 
         # === Diagnostics for Train/Test Splits ===
-        print("\n===== TRAIN SET =====")
+        print("===== TRAIN SET =====")
         print("Shape:", train_df.shape)
         print(train_df.dtypes.to_string())
         print(train_df.head(3).to_string())
 
-        print("\n===== TEST X =====")
+        print("===== TEST X =====")
         print("Shape:", test_df.shape)
         print(test_df.dtypes.to_string())
         print(test_df.head(3).to_string())
 
-        print("\n===== TEST Y =====")
+        print("===== TEST Y =====")
         print("Shape:", test_labels.shape)
         print("Type:", test_labels.dtype)
         print(test_labels.head(10).to_string(index=False))
