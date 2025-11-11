@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.2
+name: Advanced Preprocess v8.3.3
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -54,12 +54,13 @@ implementation:
             from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
             from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
             import joblib
+            import re
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
             import gzip,cloudpickle
             from sklearn.inspection import permutation_importance
         except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle","re"])
             import pandas as pd, numpy as np
             from sklearn.impute import SimpleImputer, KNNImputer
             from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder, LabelEncoder
@@ -72,6 +73,7 @@ implementation:
             from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
             from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
             import joblib
+            import re
             import category_encoders as ce
             import gzip,cloudpickle
             from sklearn.inspection import permutation_importance
@@ -391,6 +393,123 @@ implementation:
                     X = pd.concat([X.drop(columns=[c for c in self.fitted_cols if c in X.columns]), feat], axis=1)
                 return X
 
+        DATE_PATTERNS = [
+              # ISO date
+              (re.compile(r"^\d{4}-\d{2}-\d{2}$"),                     "%Y-%m-%d"),
+              (re.compile(r"^\d{4}/\d{2}/\d{2}$"),                     "%Y/%m/%d"),
+              (re.compile(r"^\d{4}\.\d{2}\.\d{2}$"),                   "%Y.%m.%d"),
+              (re.compile(r"^\d{8}$"),                                 "%Y%m%d"),
+          
+              # ISO date + time (space or T), seconds optional, fractional optional
+              (re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}$"),                  "%Y-%m-%d %H:%M"),     # will pre-normalize 'T' to ' ' below
+              (re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$"),           "%Y-%m-%d %H:%M:%S"),
+              (re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d{1,6}$"),  "%Y-%m-%d %H:%M:%S.%f"),
+          
+              # ISO + timezone (Z or ±HH:MM or ±HHMM)
+              (re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"),             "%Y-%m-%dT%H:%M:%SZ"),
+              (re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{1,6}Z$"),    "%Y-%m-%dT%H:%M:%S.%fZ"),
+              (re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2}|[+-]\d{4})$"),      "%Y-%m-%d %H:%M:%S%z"),
+              (re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d{1,6}([+-]\d{2}:\d{2}|[+-]\d{4})$"), "%Y-%m-%d %H:%M:%S.%f%z"),
+          
+              # Month name variants
+              (re.compile(r"^\d{1,2} [A-Za-z]{3} \d{4}$"),             "%d %b %Y"),            # 11 Nov 2025
+              (re.compile(r"^\d{1,2} [A-Za-z]+ \d{4}$"),               "%d %B %Y"),            # 11 November 2025
+              (re.compile(r"^[A-Za-z]{3} \d{1,2}, \d{4}$"),            "%b %d, %Y"),           # Nov 11, 2025
+              (re.compile(r"^[A-Za-z]+ \d{1,2}, \d{4}$"),              "%B %d, %Y"),           # November 11, 2025
+              (re.compile(r"^\d{1,2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2}$"), "%d %b %Y %H:%M:%S"),
+              (re.compile(r"^\d{1,2} [A-Za-z]+ \d{4} \d{2}:\d{2}:\d{2}$"),       "%d %B %Y %H:%M:%S"),
+          
+              # RFC 2822-like
+              (re.compile(r"^[A-Za-z]{3}, \d{1,2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} [+-]\d{4}$"),
+               "%a, %d %b %Y %H:%M:%S %z"),
+              (re.compile(r"^\d{1,2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} [+-]\d{4}$"),
+               "%d %b %Y %H:%M:%S %z"),
+          
+              # Two-digit years
+              (re.compile(r"^\d{1,2}/\d{1,2}/\d{2}$"), "%m/%d/%y"),    # will disambiguate below if needed
+              (re.compile(r"^\d{1,2}-\d{1,2}-\d{2}$"), "%m-%d-%y"),
+              (re.compile(r"^\d{2}-\d{2}-\d{2}$"),      "%y-%m-%d"),
+          ]
+
+        # Ambiguous day-first vs month-first (same regex but two formats). We'll choose best fit.
+        AMBIGUOUS = [
+            (re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$"), ("%d/%m/%Y", "%m/%d/%Y")),
+            (re.compile(r"^\d{1,2}-\d{1,2}-\d{4}$"), ("%d-%m-%Y", "%m-%d-%Y")),
+        ]
+        def _matches_frac(sample_str: pd.Series, pat: re.Pattern) -> float:
+            return sample_str.str.match(pat, na=False).mean()
+        
+        def _try_parse_with_format(s: pd.Series, fmt: str) -> pd.Series:
+            # pre-normalize T to space for patterns that expect space
+            if " %H:%M" in fmt and "T" in s.astype(str).str[10:11].unique().tolist():
+                s = s.astype(str).str.replace("T", " ", n=1, regex=False)
+            return pd.to_datetime(s, format=fmt, errors="coerce")
+        
+        def _choose_ambiguous(sample: pd.Series, fmts: tuple[str, str]) -> str:
+            a = _try_parse_with_format(sample, fmts[0])
+            b = _try_parse_with_format(sample, fmts[1])
+            # score = share parsed + month/day sanity bonus
+            def score(ser):
+                ok = ser.notna().mean()
+                return ok
+            sa, sb = score(a), score(b)
+            return fmts[0] if sa >= sb else fmts[1]
+        
+        def _maybe_epoch(series: pd.Series, agree_frac: float = 0.9) -> pd.Series | None:
+            s = series.dropna().astype(str)
+            if s.empty: return None
+            # 10 digits => seconds, 13 => ms, 16 => µs
+            if (s.str.fullmatch(r"\d{10}", na=False).mean() >= agree_frac):
+                return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="s", utc=True).tz_convert(None)
+            if (s.str.fullmatch(r"\d{13}", na=False).mean() >= agree_frac):
+                return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="ms", utc=True).tz_convert(None)
+            if (s.str.fullmatch(r"\d{16}", na=False).mean() >= agree_frac):
+                return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="us", utc=True).tz_convert(None)
+            # yyyymmddhhmmss (14) common in logs
+            if (s.str.fullmatch(r"\d{14}", na=False).mean() >= agree_frac):
+                return pd.to_datetime(series, format="%Y%m%d%H%M%S", errors="coerce")
+            return None
+        
+        # ---- 3) Main detector ----
+        def safe_to_datetime(s: pd.Series, agree_frac: float = 0.9) -> pd.Series:
+            if not isinstance(s, pd.Series):
+                return s
+        
+            sample = s.dropna().astype(str).head(400)
+            if sample.empty:
+                return s
+        
+            # a) Epoch-like
+            epoch_parsed = _maybe_epoch(s, agree_frac=agree_frac)
+            if epoch_parsed is not None:
+                return epoch_parsed
+        
+            # b) Ambiguous D/M/Y vs M/D/Y
+            for pat, fmts in AMBIGUOUS:
+                if _matches_frac(sample, pat) >= agree_frac:
+                    best_fmt = _choose_ambiguous(sample, fmts)
+                    parsed = _try_parse_with_format(s.astype(str), best_fmt)
+                    return parsed
+        
+            # c) Explicit patterns
+            best = None
+            best_fmt = None
+            for pat, fmt in DATE_PATTERNS:
+                frac = _matches_frac(sample, pat)
+                if frac >= agree_frac and (best is None or frac > best):
+                    best, best_fmt = frac, fmt
+        
+            if best_fmt is None:
+                # d) ISO 8601 generic fallback when most look ISO-ish (avoid noisy fallback)
+                isoish = sample.str.match(r"^\d{4}-\d{2}-\d{2}", na=False).mean()
+                if isoish >= agree_frac * 0.9:
+                    # Let pandas handle mixed ISO without raising the earlier warning.
+                    # We normalize 'T' to ' ' to keep it consistent.
+                    tmp = s.astype(str).str.replace("T", " ", n=1, regex=False)
+                    return pd.to_datetime(tmp, errors="coerce", infer_datetime_format=True)
+                return s
+        
+            return _try_parse_with_format(s.astype(str), best_fmt)
         class Preprocessor:
             def __init__(self):
                 self.num_cols=[]; self.cat_cols=[]; self.col_config={}; self.global_metadata={}
@@ -408,10 +527,15 @@ implementation:
                     max_tfidf_features=int(self.global_metadata['text_params'].get('tfidf_max_features', 20000)),
                     svd_dims=int(self.global_metadata['text_params'].get('svd_dims', 30))
                 ).fit(df)
+
+                for c in df.columns:
+                    if df[c].dtype == 'object':
+                        df[c] = safe_to_datetime(df[c])
                 df_txt = self.text.transform(df)
 
                 self.num_cols = [c for c in df_txt.columns if pd.api.types.is_numeric_dtype(df_txt[c])]
                 self.cat_cols = [c for c in df_txt.columns if c not in self.num_cols]
+
 
                 for c in self.num_cols:
                     s=df_txt[c]; cfg={}
@@ -421,7 +545,9 @@ implementation:
                     cfg['kurtosis']=float(s.dropna().kurtosis()) if s.dropna().shape[0]>3 else 0.0
                     if missing_frac==0: cfg['imputer']=('none',None)
                     elif missing_frac<0.02:
-                        imp=SimpleImputer(strategy='median'); imp.fit(np.array(s).reshape(-1,1)); cfg['imputer']=('simple_median',imp)
+                        imp = SimpleImputer(strategy='median')
+                        imp.fit(s.to_frame(name=c))     # keep column name at fit time
+                        cfg['imputer'] = ('simple_median', imp)
                     else:
                         if nrows<=self.global_metadata['config'].get('max_knn_rows',5000) and missing_frac<0.25:
                             cfg['imputer']=('knn',{'n_neighbors':5})
@@ -452,6 +578,13 @@ implementation:
             def transform(self, df, training_mode=False):
                 import numpy as np, pandas as pd
                 df=df.copy()
+                if self.text is not None:
+                    df = self.text.transform(df)
+                # convert common string tokens to NaN if you do that
+                # then safely parse dates
+                for c in df.columns:
+                    if df[c].dtype == 'object':
+                        df[c] = safe_to_datetime(df[c])
 
                 # Never touch the target column
                 target_col = self.global_metadata.get('target_col')
@@ -597,7 +730,6 @@ implementation:
             # Public attributes:
             #   - selected_features: list[str]
             
-
             # fixed knobs to preserve constructor signature
             _VAR_THRESH = 1e-5
             _CORR_THRESH = 0.95
@@ -618,7 +750,7 @@ implementation:
             def _auto_k(self, p: int) -> int:
                 return max(5, min(int(math.ceil(math.sqrt(p) * 2.0)), p))
         
-            # -------- Filter pass helpers --------
+            # Filter pass helpers 
             @staticmethod
             def _nzv_keep(X: pd.DataFrame, threshold: float) -> list:
                 if X.shape[1] == 0:
@@ -654,7 +786,7 @@ implementation:
                     keep.remove(drop)
                 return list(keep)
         
-            # -------- Relevance pass helpers --------
+            #  Relevance pass helpers 
             def _mi_scores(self, X: pd.DataFrame, y: pd.Series) -> pd.Series:
                 cols = list(X.columns)
                 if self.task == "classification":
@@ -694,7 +826,7 @@ implementation:
                     candidates.remove(best_feat)
                 return selected
         
-            # -------- Black-box pass helper --------
+            # Black-box pass helper
             def _permutation_keep(self, X: pd.DataFrame, y: pd.Series) -> (list, pd.Series):
                 if self.task == "classification":
                     est = ExtraTreesClassifier(
@@ -715,7 +847,7 @@ implementation:
                     keep = [imp.sort_values(ascending=False).index[0]]
                 return keep, imp
         
-            # -------- Public API --------
+            # Public API 
             def fit(self, X: pd.DataFrame, y) -> "FeatureSelector":
                 # make sure y is a 1D array-like
                 if isinstance(y, (pd.DataFrame, pd.Series)):
@@ -814,8 +946,8 @@ implementation:
                 print("ERROR target column " + str(target_col) + " not found", file=sys.stderr); sys.exit(1)
 
             # Drop duplicates
-            before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
-            print("Removed duplicates: " + str(before - len(df)) + " rows dropped")
+            # before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
+            # print("Removed duplicates: " + str(before - len(df)) + " rows dropped")
 
             # Pull target aside first and never preprocess it with X
             y_raw = df[target_col].copy()
