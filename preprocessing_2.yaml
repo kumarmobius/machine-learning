@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.5
+name: Advanced Preprocess v8.3.6
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -350,7 +350,10 @@ implementation:
                 X = X.copy()
                 out = []
                 for col in self.fitted_cols:
-                    s = X[col].astype(str).fillna("")
+                    if col not in X.columns:
+                        # create an empty placeholder so transform never KeyErrors
+                        X[col] = ""
+                    s = X[col].astype(str)
                     vec = self.vectorizers[col]; svd = self.svds[col]
                     try:
                         M = vec.transform(s.values)
@@ -474,8 +477,7 @@ implementation:
                     best_fmt = _choose_ambiguous(sample, fmts)
                     parsed = _try_parse_with_format(s.astype(str), best_fmt)
                     return parsed
-        
-            # c) Explicit patterns
+
             best = None
             best_fmt = None
             for pat, fmt in DATE_PATTERNS:
@@ -507,11 +509,20 @@ implementation:
                 nrows=len(df)
                 self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
                 self.cat_cols=[c for c in df.columns if c not in self.num_cols]
+                # clone raw object cols to *_orig for stable text features (do not clone target)
+                tcol = target_col or self.global_metadata.get('target_col')
+                raw_text_bases = [c for c in df.columns if df[c].dtype == 'object' and c != tcol]
+                for c in raw_text_bases:
+                    df[c + "_orig"] = df[c].astype(str)
+                
+                self.global_metadata['text_orig_cols'] = [c + "_orig" for c in raw_text_bases]
+                
                 self.text = TextFeaturizer(
-                    text_cols=None,
+                    text_cols=self.global_metadata['text_orig_cols'],
                     max_tfidf_features=int(self.global_metadata['text_params'].get('tfidf_max_features', 20000)),
                     svd_dims=int(self.global_metadata['text_params'].get('svd_dims', 30))
                 ).fit(df)
+
 
                 tcol = self.global_metadata.get('target_col')
                 for c in df.columns:
@@ -519,7 +530,18 @@ implementation:
                         continue
                     if df[c].dtype == 'object':
                         df[c] = safe_to_datetime(df[c])
-                df_txt = self.text.transform(df)
+                df = df.copy()
+                for c_orig in self.global_metadata.get('text_orig_cols', []):
+                    base = c_orig[:-5]  # strip "_orig"
+                    if c_orig not in df.columns:
+                        if base in df.columns:
+                            df[c_orig] = df[base].astype(str)
+                        else:
+                            # base missing too; create empty placeholder
+                            df[c_orig] = ""
+                
+                if self.text is not None:
+                    df = self.text.transform(df)
 
                 self.num_cols = [c for c in df_txt.columns if pd.api.types.is_numeric_dtype(df_txt[c])]
                 self.cat_cols = [c for c in df_txt.columns if c not in self.num_cols]
@@ -569,6 +591,7 @@ implementation:
                 df = df.copy()
                 target_col = self.global_metadata.get('target_col')
                 y_hold = df[target_col] if (target_col is not None and target_col in df.columns) else None
+                df.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
             
                 # 1) Safe date parsing on non-target object columns
                 for c in df.columns:
