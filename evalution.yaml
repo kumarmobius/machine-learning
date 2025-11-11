@@ -45,7 +45,7 @@ implementation:
             except Exception: return False
             if not txt: return False
             if txt[0] in ("{","["): return True
-            if "\\n{" in txt or "\\n[" in txt: return True
+            if "{" in txt or "[" in txt: return True
             return False
 
         def read_with_pandas(path):
