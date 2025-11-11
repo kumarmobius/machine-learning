@@ -1,19 +1,13 @@
-name: Advanced Preprocess v7.5
+name: Advanced Preprocess v8
 description: |
-  End-to-end robust preprocessing and feature selection component...
-  - Loads CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
-  - Drops duplicates safely even with dict/list columns.
-  - Drops known non-modeling columns: piMetadata, execution_timestamp, pipelineid, component_id, projectid (if present).
-  - Converts object numerics/percents/currencies and k/m/b suffixes to float.
-  - Detects dates, extracts calendar features.
-  - Encodes categoricals with OneHot/Ordinal/Target/Count heuristics.
-  - Scales numerics with per-column auto Standard/Robust/MinMax or Power+Standard.
-  - Optional string-similarity grouping for high-cardinality categoricals.
-  - Optional outlier handling (IQR drop or winsorize) only in training mode.
-  - Text columns: add cheap stats and, when suitable, TF-IDF + TruncatedSVD features per column.
-  - Saves fitted Preprocessor and FeatureSelector for reuse.
-  - Feature selection: Mutual Information (auto-k) + Model-based selector (ExtraTrees) cascaded.
-  - Works for classification or regression; auto label-encodes y for classification.
+  End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target.
+  Rules:
+  - Do not preprocess the target column.
+  - If model_type is classification and target is categorical or string-like, apply label encoding.
+  - If model_type is classification and target is numeric floats, round half-up to whole numbers. Example: 0.5 -> 1, 1.5 -> 2.
+  - Outputs are train_X and train_y as separate parquet files. train_X does not contain the target column.
+  - Prints all columns, their dtypes, features chosen, and a summary of actions.
+  - Preserves the existing logic: robust file reading; duplicate removal; object->numeric parsing including percent/currency and k/m/b suffixes; date detection with calendar features; categorical encoders (onehot/ordinal/target/count) with rare-label collapsing and optional fuzzy grouping; numeric scaling per column via auto Standard/Robust/MinMax or Power+Standard; KNN and Iterative imputers; optional IQR outlier dropping or winsorizing; text TF-IDF + TruncatedSVD; cascaded feature selection: Mutual Information to auto-k followed by model-based selection with ExtraTrees.
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -28,8 +22,8 @@ inputs:
   - {name: svd_dims, type: Integer, description: "SVD dims per text column when applied", optional: true, default: "30"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
 outputs:
-  - {name: X, type: Data, description: "Processed features parquet"}
-  - {name: y, type: Data, description: "Target parquet"}
+  - {name: train_X, type: Data, description: "Processed features parquet"}
+  - {name: train_y, type: Data, description: "Target parquet"}
   - {name: preprocessor, type: Data, description: "joblib dump of fitted Preprocessor"}
   - {name: feature_selector, type: Data, description: "joblib dump of fitted FeatureSelector"}
   - {name: preprocess_metadata, type: Data, description: "JSON metadata"}
@@ -43,9 +37,10 @@ implementation:
       - |
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
         from datetime import datetime
-        from collections import defaultdict
+
         def pip_install(pkgs):
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
+
         try:
             import pandas as pd, numpy as np
             from sklearn.impute import SimpleImputer, KNNImputer
@@ -61,9 +56,8 @@ implementation:
             import joblib
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
-            import cloudpickle, gzip
         except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl"])
             import pandas as pd, numpy as np
             from sklearn.impute import SimpleImputer, KNNImputer
             from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder, LabelEncoder
@@ -78,9 +72,8 @@ implementation:
             import joblib
             import category_encoders as ce
             from rapidfuzz import process as rf_process, fuzz as rf_fuzz
-            import cloudpickle, gzip
 
-        # IO helpers
+        # ---------- helpers ----------
         def ensure_dir_for(p):
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
@@ -96,9 +89,8 @@ implementation:
             try: txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
             except Exception: return False
             if not txt: return False
-            ob=chr(123); obk=chr(91); nl=chr(10)
-            if txt[0] in (ob,obk): return True
-            if (nl+ob) in txt or (nl+obk) in txt: return True
+            if txt[0] in ("{","["): return True
+            if "\n{" in txt or "\n[" in txt: return True
             return False
 
         def read_with_pandas(path):
@@ -107,9 +99,9 @@ implementation:
                 files=[p for p in entries if os.path.isfile(p)]
                 if not files: raise ValueError("No files in dir: "+path)
                 path = max(files, key=lambda p: os.path.getsize(p))
-                print(f"Info selected file: {path}")
+                print("Info selected file: " + path)
             if not os.path.exists(path) or not os.path.isfile(path):
-                raise ValueError("Input path not found: "+path)
+                raise ValueError("Input path not found: " + str(path))
             ext=os.path.splitext(path)[1].lower()
             if ext==".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
                 try:
@@ -146,15 +138,10 @@ implementation:
             except Exception: pass
             try: return pd.read_parquet(path, engine="auto")
             except Exception: pass
-            sample=sample_file_bytes(path)
-            if is_likely_json(sample):
-                try: return pd.read_json(path, lines=True)
-                except Exception: pass
             try: return pd.read_csv(path)
             except Exception: pass
-            raise ValueError("Unsupported format: "+path)
+            raise ValueError("Unsupported format: " + str(path))
 
-        # Safe duplicate removal
         def make_hashable_for_dupes(df):
             df = df.copy()
             for c in df.columns:
@@ -165,7 +152,6 @@ implementation:
                     df[c] = df[c].astype(str)
             return df
 
-        # Numeric parsing
         CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
         MULTIPLIER_MAP = {'k':1e3,'m':1e6,'b':1e9,'t':1e12}
         TOKEN_RE = re.compile(r'^\s*(?P<sign>[-+]?)(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?P<mult>[kKmMbBtT])?\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$')
@@ -204,6 +190,7 @@ implementation:
             df=df.copy(); report={'converted':[],'skipped':[]}
             obj_cols=[c for c in df.columns if (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
             for col in obj_cols:
+                if col in ('__TARGET__TMP__',): continue
                 ser=df[col].astype(object); total_non_null=ser.notna().sum()
                 if total_non_null==0: report['skipped'].append(col); continue
                 parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma)) if advanced else pd.to_numeric(ser, errors='coerce')
@@ -214,11 +201,11 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
-        # Dates 
-        def detect_and_extract_dates(df, enabled=True):
+        def detect_and_extract_dates(df, enabled=True, exclude_cols=None):
             df=df.copy(); report={'date_columns':[],'skipped':[]}
             if not enabled: return df, report
-            cand=[c for c in df.columns if (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
+            exclude_cols=set(exclude_cols or [])
+            cand=[c for c in df.columns if c not in exclude_cols and (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
             for col in cand:
                 ser=df[col].astype(object); sample=ser.dropna().astype(str).head(500)
                 if sample.empty: report['skipped'].append({'col':col,'parsable_fraction':0.0}); continue
@@ -240,7 +227,6 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
-        # Rare labels and similarity
         def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
             counts=series.value_counts(dropna=False); n=len(series)
             rare = set(counts[counts <= threshold_count].index) if threshold_count is not None else set(counts[counts <= max(1,int(threshold_frac*n))].index)
@@ -251,58 +237,47 @@ implementation:
             mapping={}; used=set()
             for v in vals:
                 if v in used: continue
-                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=90)
+                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
                 group=[m[0] for m in matches]
                 for g in group: mapping[g]=v; used.add(g)
             return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
 
-        # Outliers 
         def drop_outliers_iqr(df, numeric_cols, fold=1.5):
-            if not numeric_cols:
-                # return df unchanged, zero removed, and a keep-all mask
-                return df, 0, pd.Series(True, index=df.index)
-        
+            if not numeric_cols: return df,0,pd.Series(True,index=df.index)
             q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
             q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
             iqr = q3 - q1
             lower = (q1 - fold * iqr).to_dict()
             upper = (q3 + fold * iqr).to_dict()
-        
             mask = pd.Series(True, index=df.index)
             for c in numeric_cols:
                 s = df[c]
+                lo = lower.get(c, None); hi = upper.get(c, None)
                 cond = pd.Series(True, index=df.index)
-                lo = lower.get(c, None)
-                hi = upper.get(c, None)
                 if lo is not None:
-                    cond &= s >= lo
+                    cond = cond & s.ge(lo)
                 if hi is not None:
-                    cond &= s <= hi
-                mask &= cond
-        
-            kept = mask.fillna(True)
-            df2 = df.loc[kept].copy()     # preserve original index here
-            removed = int((~kept).sum())
-            # do NOT reset index here; keep original index so y can be aligned later
-            return df2, removed, kept
-        
-        def winsorize_df(df, numeric_cols, fold=1.5):
-            if not numeric_cols:
-                return df, 0
-            q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
-            q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
-            iqr = q3 - q1
-            lower = (q1 - fold * iqr).to_dict()
-            upper = (q3 + fold * iqr).to_dict()
-            df2 = df.copy()
-            for c in numeric_cols:
-                lo = lower.get(c, None)
-                hi = upper.get(c, None)
-                if lo is not None or hi is not None:
-                    df2[c] = df2[c].clip(lower=lo, upper=hi)
-            return df2, 0
+                    cond = cond & s.le(hi)
+                cond = cond.reindex(df.index).fillna(True)
+                mask = (mask & cond)
+            before=len(df)
+            df2 = df.loc[mask].copy()
+            removed = before - len(df2)
+            df2.reset_index(drop=True, inplace=True)
+            return df2, removed, mask
 
-        # Scalers
+        def winsorize_df(df, numeric_cols, fold=1.5):
+            if not numeric_cols: return df,0
+            q1=df[numeric_cols].quantile(0.25, numeric_only=True); q3=df[numeric_cols].quantile(0.75, numeric_only=True)
+            iqr=q3-q1
+            lower=(q1 - fold*iqr).to_dict(); upper=(q3 + fold*iqr).to_dict()
+            df2=df.copy()
+            for c in numeric_cols:
+                lo = lower.get(c, None); hi = upper.get(c, None)
+                if lo is not None or hi is not None:
+                    df2[c]=df2[c].clip(lower=lo, upper=hi)
+            return df2,0
+
         def choose_scaler_for_series(s):
             v=s.dropna()
             if v.empty: return StandardScaler()
@@ -314,7 +289,6 @@ implementation:
             if extreme_frac>0.01 or abs(kurt)>10: return RobustScaler()
             return StandardScaler()
 
-        # Encoder choice
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
             n=len(series); nunique=series.nunique(dropna=True); high_card=(nunique>max(50,0.05*n))
             if high_card:
@@ -333,6 +307,7 @@ implementation:
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
             X_col=df[col].astype(object).fillna('__NA__'); global_mean=y.mean()
             oof=pd.Series(index=df.index, dtype=float)
+            from sklearn.model_selection import KFold
             kf=KFold(n_splits=min(n_splits,max(2,len(df)//10)), shuffle=True, random_state=random_state)
             for tr_idx, val_idx in kf.split(df):
                 means=y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
@@ -343,16 +318,15 @@ implementation:
                 alpha=cnt/(cnt+smoothing); smooth_map[cat]=alpha*cat_mean+(1-alpha)*global_mean
             return oof.fillna(global_mean), smooth_map, float(global_mean)
 
-        # Text Featurizer 
         def _should_textify(ser, min_words=3, min_len=10):
             s = ser.astype(str).fillna("")
-            word_cnt_med = s.str.count(r"\\b\\w+\\b").median()
+            word_cnt_med = s.str.count(r"\b\w+\b").median()
             len_med = s.str.len().median()
             numeric_frac = pd.to_numeric(s, errors="coerce").notna().mean()
             uniq_ratio = ser.nunique(dropna=True) / max(len(ser), 1)
             alpha_len = s.str.replace(r"[^A-Za-z]", "", regex=True).str.len()
             alpha_ratio_med = (alpha_len / s.str.len().replace(0, 1)).median()
-            tokens = s.str.findall(r"\\b\\w+\\b")
+            tokens = s.str.findall(r"\b\w+\b")
             long_token_cnt_med = tokens.map(lambda ts: sum(len(t) >= 10 for t in ts)).median()
             cond_words_or_len = (word_cnt_med >= min_words) or (len_med >= min_len) or (long_token_cnt_med >= 2)
             cond_alpha = alpha_ratio_med >= 0.5
@@ -403,8 +377,8 @@ implementation:
                         Z_df = pd.DataFrame(index=X.index)
                     stats = pd.DataFrame({
                         f"{col}__len": s.str.len(),
-                        f"{col}__word_count": s.str.count(r"\\b\\w+\\b"),
-                        f"{col}__digit_count": s.str.count(r"\\d"),
+                        f"{col}__word_count": s.str.count(r"\b\w+\b"),
+                        f"{col}__digit_count": s.str.count(r"\d"),
                         f"{col}__alpha_ratio": s.str.replace(r"[^A-Za-z]", "", regex=True).str.len() / s.str.len().replace(0,1)
                     }, index=X.index)
                     out.append(pd.concat([Z_df, stats], axis=1))
@@ -413,306 +387,203 @@ implementation:
                     X = pd.concat([X.drop(columns=[c for c in self.fitted_cols if c in X.columns]), feat], axis=1)
                 return X
 
-        # Preprocessor
         class Preprocessor:
             def __init__(self):
                 self.num_cols=[]; self.cat_cols=[]; self.col_config={}; self.global_metadata={}
                 self.text = None
-                
-            def fit(self, df, y=None, config=None, text_params=None):
-                self.global_metadata['config'] = config or {}
-                self.global_metadata['text_params'] = text_params or {}
-                nrows = len(df)
-            
-                # initial type split
-                self.num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-                self.cat_cols = [c for c in df.columns if c not in self.num_cols]
-            
-                # text featurizer learned here and reused later
+
+            def fit(self, df, y=None, config=None, text_params=None, target_col=None):
+                self.global_metadata['config']=config or {}
+                self.global_metadata['text_params']=text_params or {}
+                self.global_metadata['target_col']=target_col
+                nrows=len(df)
+                self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
+                self.cat_cols=[c for c in df.columns if c not in self.num_cols]
                 self.text = TextFeaturizer(
                     text_cols=None,
                     max_tfidf_features=int(self.global_metadata['text_params'].get('tfidf_max_features', 20000)),
                     svd_dims=int(self.global_metadata['text_params'].get('svd_dims', 30))
                 ).fit(df)
                 df_txt = self.text.transform(df)
-            
-                # recompute splits after text expansion
+
                 self.num_cols = [c for c in df_txt.columns if pd.api.types.is_numeric_dtype(df_txt[c])]
                 self.cat_cols = [c for c in df_txt.columns if c not in self.num_cols]
-            
-                # numeric columns config
+
                 for c in self.num_cols:
-                    s = df_txt[c]
-                    cfg = {}
-                    missing_frac = s.isna().mean(); cfg['missing_frac'] = float(missing_frac)
-                    cfg['n_unique'] = int(s.nunique(dropna=True))
-                    cfg['skew'] = float(s.dropna().skew()) if s.dropna().shape[0] > 2 else 0.0
-                    cfg['kurtosis'] = float(s.dropna().kurtosis()) if s.dropna().shape[0] > 3 else 0.0
-                    if missing_frac == 0:
-                        cfg['imputer'] = ('none', None)
-                    elif missing_frac < 0.02:
-                        imp = SimpleImputer(strategy='median'); imp.fit(np.array(s).reshape(-1,1))
-                        cfg['imputer'] = ('simple_median', imp)
+                    s=df_txt[c]; cfg={}
+                    missing_frac=s.isna().mean(); cfg['missing_frac']=float(missing_frac)
+                    cfg['n_unique']=int(s.nunique(dropna=True))
+                    cfg['skew']=float(s.dropna().skew()) if s.dropna().shape[0]>2 else 0.0
+                    cfg['kurtosis']=float(s.dropna().kurtosis()) if s.dropna().shape[0]>3 else 0.0
+                    if missing_frac==0: cfg['imputer']=('none',None)
+                    elif missing_frac<0.02:
+                        imp=SimpleImputer(strategy='median'); imp.fit(np.array(s).reshape(-1,1)); cfg['imputer']=('simple_median',imp)
                     else:
-                        if nrows <= self.global_metadata['config'].get('max_knn_rows', 5000) and missing_frac < 0.25:
-                            cfg['imputer'] = ('knn', {'n_neighbors': 5})
+                        if nrows<=self.global_metadata['config'].get('max_knn_rows',5000) and missing_frac<0.25:
+                            cfg['imputer']=('knn',{'n_neighbors':5})
                         else:
-                            cfg['imputer'] = ('iterative', {'max_iter': 10, 'random_state': 0})
-                    cfg['scaler_choice'] = 'auto'
-                    self.col_config[c] = cfg
-            
-                # categorical columns config + FIT encoders here (no fitting in transform)
+                            cfg['imputer']=('iterative',{'max_iter':10,'random_state':0})
+                    cfg['scaler_choice']='auto'
+                    self.col_config[c]=cfg
                 for c in self.cat_cols:
-                    s = df_txt[c].astype(object)
-                    cfg = {}
-                    cfg['n_unique'] = int(s.nunique(dropna=True))
-                    cfg['missing_frac'] = float(s.isna().mean())
-                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
-                    cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
-            
-                    enc_name, _, _ = choose_categorical_encoder(
-                        c, s, (y if y is not None else None), train_mode=(y is not None)
-                    )
-                    cfg['encoder_type'] = enc_name
-            
-                    if enc_name == 'onehot':
-                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                        ohe.fit(df_txt[[c]].astype(str))
-                        cfg['encoder_obj'] = ohe
-                        cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
-            
-                    elif enc_name == 'ordinal':
-                        ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-                        ord_enc.fit(df_txt[[c]].astype(str))
-                        cfg['encoder_obj'] = ord_enc
-            
-                    elif enc_name == 'target':
-                        # learned below using KFold
-                        pass
-            
-                    elif enc_name == 'count':
-                        counts = df_txt[c].astype(object).value_counts().to_dict()
-                        cfg['count_map'] = counts
-            
-                    self.col_config[c] = cfg
-            
-                # learn target encoder mappings if needed
+                    s=df_txt[c].astype(object); cfg={}
+                    cfg['n_unique']=int(s.nunique(dropna=True))
+                    cfg['missing_frac']=float(s.isna().mean())
+                    cfg['high_card']=cfg['n_unique']>max(50,0.05*nrows)
+                    cfg['rare_threshold_frac']=self.global_metadata['config'].get('rare_threshold',0.01)
+                    enc_name,enc_obj,_=choose_categorical_encoder(c,s,(y if y is not None else None),train_mode=(y is not None))
+                    cfg['encoder_type']=enc_name; cfg['encoder_obj']=enc_obj
+                    self.col_config[c]=cfg
                 if y is not None:
                     for c in self.cat_cols:
-                        cfg = self.col_config[c]
-                        if cfg['encoder_type'] == 'target':
+                        cfg=self.col_config[c]
+                        if cfg['encoder_type']=='target':
                             _, mapping, global_mean = fit_target_encoder_kfold(df_txt, c, y, n_splits=5)
-                            cfg['target_mapping'] = mapping
-                            cfg['target_global_mean'] = float(global_mean)
-            
-                self.global_metadata['num_cols'] = self.num_cols
-                self.global_metadata['cat_cols'] = self.cat_cols
+                            cfg['target_mapping']=mapping; cfg['target_global_mean']=float(global_mean)
+                        elif cfg['encoder_type']=='count':
+                            counts=df_txt[c].astype(object).value_counts().to_dict(); cfg['count_map']=counts
+                self.global_metadata['num_cols']=self.num_cols; self.global_metadata['cat_cols']=self.cat_cols
                 return self
 
             def transform(self, df, training_mode=False):
-                df = df.copy()
-            
-                # text features first
+                import numpy as np, pandas as pd
+                df=df.copy()
+
+                # Never touch the target column
+                target_col = self.global_metadata.get('target_col')
+                protected_cols=set([target_col]) if target_col in df.columns else set()
+
+                # text features first, excluding target if object
+                X_for_text = df[[c for c in df.columns if c not in protected_cols]].copy()
                 if self.text is not None:
-                    df = self.text.transform(df)
-            
-                # normalize common string tokens to NaN
-                df.replace(
-                    ["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf"],
-                    np.nan, inplace=True
-                )
-            
-                # force fit-time numeric columns to numeric dtype
+                    X_for_text = self.text.transform(X_for_text)
+                for c in X_for_text.columns:
+                    df[c]=X_for_text[c]
+                for c in list(df.columns):
+                    if c not in X_for_text.columns and c not in protected_cols:
+                        df.drop(columns=[c], inplace=True)
+
+                # normalize string tokens to NaN
+                df.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
+
+                # force numeric on learned numeric cols
                 for c in list(self.num_cols):
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
-            
-                temp_df = df.copy()
-            
-                # pre-fill for KNN/Iterative
+
+                temp_df=df.copy()
+
                 for c in self.num_cols:
-                    imputer_info = self.col_config.get(c, {}).get('imputer', ('none', None))
-                    if imputer_info[0] in ('knn', 'iterative'):
-                        med = pd.to_numeric(temp_df[c], errors='coerce').median()
-                        temp_df[c] = temp_df[c].fillna(med)
-            
-                # choose & fit scalers column-wise on temp_df (scaler params fixed by numeric distribution)
-                scaler_objs = {}
+                    imputer_info=self.col_config.get(c,{}).get('imputer',('none',None))
+                    if imputer_info[0] in ('knn','iterative'):
+                        med=pd.to_numeric(temp_df[c], errors='coerce').median()
+                        temp_df[c]=temp_df[c].fillna(med)
+
+                scaler_objs={}
                 for c in self.num_cols:
-                    sample = temp_df[c]
-                    scaler = choose_scaler_for_series(sample)
-                    try:
-                        scaler.fit(sample.values.reshape(-1, 1))
-                    except Exception:
-                        scaler = StandardScaler()
-                        scaler.fit(sample.values.reshape(-1, 1))
-                    scaler_objs[c] = scaler
-                    self.col_config[c]['scaler_obj'] = scaler
-            
-                # scaled matrix for KNN space
-                num_matrix = temp_df[self.num_cols].copy()
-                scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
-                for i, c in enumerate(self.num_cols):
-                    sc = scaler_objs[c]
-                    col_vals = num_matrix[c].values.reshape(-1, 1)
-                    try:
-                        scaled_col = sc.transform(col_vals).reshape(-1)
-                    except Exception:
-                        scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
-                    scaled_matrix[:, i] = scaled_col
-                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
-            
-                # KNN imputation in scaled space then invert scale
-                need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'knn']
+                    sample=temp_df[c]; scaler=choose_scaler_for_series(sample)
+                    try: scaler.fit(sample.values.reshape(-1,1))
+                    except Exception: scaler=StandardScaler(); scaler.fit(sample.values.reshape(-1,1))
+                    scaler_objs[c]=scaler; self.col_config[c]['scaler_obj']=scaler
+
+                num_matrix=temp_df[self.num_cols].copy()
+                scaled_matrix=np.zeros_like(num_matrix.values, dtype=float)
+                for i,c in enumerate(self.num_cols):
+                    sc=scaler_objs[c]; col_vals=num_matrix[c].values.reshape(-1,1)
+                    try: scaled_col=sc.transform(col_vals).reshape(-1)
+                    except Exception: scaled_col=StandardScaler().fit_transform(col_vals).reshape(-1)
+                    scaled_matrix[:,i]=scaled_col
+                scaled_df=pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
+
+                need_knn=[c for c in self.num_cols if self.col_config[c]['imputer'][0]=='knn']
                 if need_knn:
-                    base_imp = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
-                    knn_neighbors = base_imp.get('n_neighbors', 5) if isinstance(base_imp, dict) else 5
-                    knn = KNNImputer(n_neighbors=knn_neighbors)
-                    imputed_scaled = knn.fit_transform(scaled_df)
-                    imputed_scaled_df = pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
+                    base_imp=self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
+                    knn_neighbors=base_imp.get('n_neighbors',5) if isinstance(base_imp,dict) else 5
+                    knn=KNNImputer(n_neighbors=knn_neighbors)
+                    imputed_scaled=knn.fit_transform(scaled_df)
+                    imputed_scaled_df=pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
                     for c in self.num_cols:
-                        sc = scaler_objs[c]
-                        try:
-                            inv = sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1, 1)).reshape(-1)
-                        except Exception:
-                            inv = imputed_scaled_df[c].values.reshape(-1)
-                        df[c] = inv
-            
-                # Iterative imputer in original scale
-                need_iter = [c for c in self.num_cols if self.col_config[c]['imputer'][0] == 'iterative']
+                        sc=scaler_objs[c]
+                        try: inv=sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
+                        except Exception: inv=imputed_scaled_df[c].values.reshape(-1)
+                        df[c]=inv
+
+                need_iter=[c for c in self.num_cols if self.col_config[c]['imputer'][0]=='iterative']
                 if need_iter:
-                    iter_max_iter = 10
-                    base_imp2 = self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
-                    if isinstance(base_imp2, dict):
-                        iter_max_iter = base_imp2.get('max_iter', 10)
-                    iter_imp = IterativeImputer(max_iter=iter_max_iter, random_state=0)
-                    arr = df[self.num_cols].astype(float).replace([np.inf, -np.inf], np.nan).values
-                    iter_out = iter_imp.fit_transform(arr)
-                    df[self.num_cols] = pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
-                    for c in need_iter:
-                        self.col_config[c]['imputer_obj'] = iter_imp
-            
-                # simple median imputer
+                    iter_max_iter=10; base_imp2=self.col_config[self.num_cols[0]]['imputer'][1] if self.num_cols else None
+                    if isinstance(base_imp2,dict): iter_max_iter=base_imp2.get('max_iter',10)
+                    iter_imp=IterativeImputer(max_iter=iter_max_iter, random_state=0)
+                    arr=df[self.num_cols].astype(float).replace([np.inf,-np.inf], np.nan).values
+                    iter_out=iter_imp.fit_transform(arr)
+                    df[self.num_cols]=pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
+                    for c in need_iter: self.col_config[c]['imputer_obj']=iter_imp
+
                 for c in self.num_cols:
-                    cfg = self.col_config[c]
-                    if cfg['imputer'][0] == 'simple_median':
-                        imp = cfg['imputer'][1]
-                        df[c] = imp.transform(df[[c]])
-            
-                # optional outlier handling during training-only
-                cfg_global = self.global_metadata.get('config') or {}
+                    cfg=self.col_config[c]
+                    if cfg['imputer'][0]=='simple_median':
+                        imp=cfg['imputer'][1]; df[c]=imp.transform(df[[c]])
+
+                cfg_global=self.global_metadata.get('config') or {}
                 if training_mode:
-                    if cfg_global.get('outlier_strategy', 'drop_iqr') == 'drop_iqr':
-                        df, n_removed, kept_mask = drop_outliers_iqr(
-                            df, self.num_cols, fold=cfg_global.get('outlier_fold', 1.5)
-                        )
-                        self.global_metadata['outliers_removed'] = int(n_removed)
-                        self.global_metadata['kept_mask_after_outlier'] = kept_mask
-                    elif cfg_global.get('outlier_strategy') == 'winsorize':
-                        df, _ = winsorize_df(df, self.num_cols, fold=cfg_global.get('outlier_fold', 1.5))
-                        self.global_metadata['kept_mask_after_outlier'] = pd.Series(True, index=df.index)
-            
-                # final scaling on numeric columns
+                    if cfg_global.get('outlier_strategy','drop_iqr')=='drop_iqr':
+                        df2, n_removed, kept_mask = drop_outliers_iqr(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
+                        self.global_metadata['outliers_removed']=int(n_removed)
+                        self.global_metadata['kept_mask_after_outlier']=kept_mask
+                        df=df2
+                    elif cfg_global.get('outlier_strategy')=='winsorize':
+                        df,_=winsorize_df(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
+                        self.global_metadata['kept_mask_after_outlier']=pd.Series(True,index=df.index)
+
                 for c in self.num_cols:
-                    sc = self.col_config[c].get('scaler_obj')
-                    if sc is None:
-                        sc = choose_scaler_for_series(df[c].fillna(df[c].median()))
-                    try:
-                        transformed = sc.transform(df[[c]].values)
-                        df[c] = transformed.reshape(-1)
+                    sc=self.col_config[c].get('scaler_obj')
+                    if sc is None: sc=choose_scaler_for_series(df[c].fillna(df[c].median()))
+                    try: transformed=sc.transform(df[[c]].values); df[c]=transformed.reshape(-1)
                     except Exception:
-                        try:
-                            df[c] = sc.fit_transform(df[[c]].values).reshape(-1)
-                        except Exception:
-                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
-                    self.col_config[c]['scaler_obj'] = sc
-            
-                # categorical encoding using FIT-TIME encoders/mappings (no fitting here)
-                for c in [cc for cc in self.cat_cols if cc in df.columns]:
-                    cfg = self.col_config[c]
-                    s = df[c].astype(object)
-            
-                    # rare collapse and optional string similarity remain
-                    rare_thresh = cfg.get('rare_threshold_frac', 0.01)
-                    if rare_thresh < 1.0:
-                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
+                        try: df[c]=sc.fit_transform(df[[c]].values).reshape(-1)
+                        except Exception: df[c]=StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
+                    self.col_config[c]['scaler_obj']=sc
+
+                # categorical encodings; never touch target
+                for c in [cc for cc in self.cat_cols if cc in df.columns and cc != target_col]:
+                    cfg=self.col_config[c]; s=df[c].astype(object)
+                    rare_thresh=cfg.get('rare_threshold_frac',0.01)
+                    if rare_thresh<1.0: collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
+                    else: collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
+                    df[c]=collapsed; cfg['rare_values']=list(rare_set)
+                    if cfg_global.get('enable_string_similarity', False) and cfg['n_unique']>20:
+                        grouped, mapping = string_similarity_group(df[c], score_threshold=90); df[c]=grouped; cfg['string_similarity_map']=mapping
+                    enc_type=cfg.get('encoder_type')
+                    if enc_type=='onehot':
+                        ohe=OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                        resh=df[[c]].astype(str); ohe.fit(resh); arr=ohe.transform(resh)
+                        cols=[f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        df_ohe=pd.DataFrame(arr, columns=cols, index=df.index)
+                        df=pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                        cfg['encoder_obj']=ohe; cfg['ohe_columns']=cols
+                    elif enc_type=='ordinal':
+                        ord_enc=OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                        resh=df[[c]].astype(object)
+                        try: ord_enc.fit(resh); df[c]=ord_enc.transform(resh).astype(float); cfg['encoder_obj']=ord_enc
+                        except Exception: df[c]=df[c].astype('category').cat.codes.astype(float)
+                    elif enc_type=='count':
+                        cnt_map=df[c].value_counts().to_dict(); df[c]=df[c].map(lambda x: cnt_map.get(x,0)); cfg['count_map']=cnt_map
+                    elif enc_type=='target':
+                        mapping=cfg.get('target_mapping',{}); global_mean=cfg.get('target_global_mean',0.0)
+                        df[c]=df[c].map(lambda x: mapping.get(x, global_mean))
                     else:
-                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
-                    df[c] = collapsed; cfg['rare_values'] = list(rare_set)
-            
-                    if cfg_global.get('enable_string_similarity', False) and cfg['n_unique'] > 20:
-                        grouped, mapping = string_similarity_group(df[c], score_threshold=90)
-                        df[c] = grouped; cfg['string_similarity_map'] = mapping
-            
-                    enc_type = cfg.get('encoder_type')
-            
-                    if enc_type == 'onehot':
-                        ohe = cfg.get('encoder_obj')
-                        resh = df[[c]].astype(str)
-                        arr = ohe.transform(resh)
-                        cols = cfg['ohe_columns']
-                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
-                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
-            
-                    elif enc_type == 'ordinal':
-                        ord_enc = cfg.get('encoder_obj')
-                        resh = df[[c]].astype(str)
-                        try:
-                            df[c] = ord_enc.transform(resh).astype(float)
-                        except Exception:
-                            df[c] = df[c].astype('category').cat.codes.astype(float)
-            
-                    elif enc_type == 'count':
-                        cnt_map = cfg.get('count_map', {})
-                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0))
-            
-                    elif enc_type == 'target':
-                        mapping = cfg.get('target_mapping', {})
-                        global_mean = cfg.get('target_global_mean', 0.0)
-                        df[c] = df[c].map(lambda x: mapping.get(x, global_mean))
-            
-                    else:
-                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
-            
-                # coerce any leftover object numerics
+                        df[c]=df[c].astype('category').cat.codes.replace({-1:np.nan}).astype(float)
+
                 for c in list(df.columns):
-                    if df[c].dtype == 'object':
-                        try:
-                            df[c] = pd.to_numeric(df[c], errors='coerce')
-                        except Exception:
-                            pass
-                df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            
-                # schema locking: record order on training; enforce on inference
-                if training_mode:
-                    self.final_feature_order_ = list(df.columns)
-                else:
-                    if hasattr(self, 'final_feature_order_') and self.final_feature_order_:
-                        want = list(self.final_feature_order_)
-                        # add any missing training columns with zeros
-                        for col in want:
-                            if col not in df.columns:
-                                df[col] = 0.0
-                        # drop any unexpected columns
-                        extra = [c for c in df.columns if c not in want]
-                        if extra:
-                            df = df.drop(columns=extra)
-                        # reorder to training order
-                        df = df[want]
-            
+                    if df[c].dtype=='object':
+                        try: df[c]=pd.to_numeric(df[c], errors='coerce')
+                        except Exception: pass
+                df.replace([np.inf,-np.inf], np.nan, inplace=True)
                 return df
 
-
-
-            def save(self, path):
-                with gzip.open(path, "wb") as f:
-                    cloudpickle.dump(self, f)
+            def save(self, path): joblib.dump(self, path)
             @staticmethod
-            def load(path):
-                with gzip.open(path, "rb") as f:
-                    return cloudpickle.load(f)
+            def load(path): return joblib.load(path)
 
-        # Feature Selector
         class FeatureSelector:
             def __init__(self, task):
                 self.task=task; self.mi_selector=None; self.model_selector=None; self.selected_features=[]
@@ -741,47 +612,23 @@ implementation:
                 X2=self.model_selector.transform(X1)
                 return pd.DataFrame(X2, columns=self.selected_features, index=X.index)
 
-            def save(self, path): 
-                with gzip.open(path, "wb") as f:
-                    cloudpickle.dump(self, f)
+            def save(self, path): joblib.dump(self, path)
             @staticmethod
-            def load(path):
-                with gzip.open(path, "rb") as f:
-                    return cloudpickle.load(f)
+            def load(path): return joblib.load(path)
 
-        # Printing
-        def print_before(df, target_col):
-            print("BEFORE PREPROCESSING df.head()")
+        def print_head(df, title):
+            print(title)
             try: print(df.head().to_string())
             except Exception: print(df.head())
-            print("BEFORE PREPROCESSING dtypes")
-            print(df.dtypes.astype(str))
-            print("BEFORE PREPROCESSING missing counts")
-            print(df.isna().sum())
 
-        def print_plan(pre):
-            print("PLAN per-column strategies")
-            print("Numeric columns:", pre.num_cols)
-            print("Categorical columns:", pre.cat_cols)
-            for c in pre.num_cols:
-                cfg=pre.col_config.get(c,{}); imp=cfg.get('imputer',('none',None)); sc=cfg.get('scaler_obj')
-                print(f"[NUM] {c} missing_frac={cfg.get('missing_frac')} imputer={imp[0]} scaler={sc.__class__.__name__ if sc else 'auto'}")
-            for c in pre.cat_cols:
-                cfg=pre.col_config.get(c,{})
-                print(f"[CAT] {c} n_unique={cfg.get('n_unique')} high_card={cfg.get('high_card')} encoder={cfg.get('encoder_type')} rare_threshold={cfg.get('rare_threshold_frac')}")
+        def print_dtypes(df, title):
+            print(title)
+            try: 
+                d={c:str(df[c].dtype) for c in df.columns}
+                print(d)
+            except Exception:
+                print(df.dtypes.astype(str))
 
-        def print_after(X_processed, selected_cols=None):
-            print("AFTER PREPROCESSING df.head()")
-            try: print(X_processed.head().to_string())
-            except Exception: print(X_processed.head())
-            print("AFTER PREPROCESSING dtypes")
-            print(X_processed.dtypes.astype(str))
-            print("AFTER PREPROCESSING missing counts")
-            print(X_processed.isna().sum())
-            if selected_cols is not None:
-                print("SELECTED FEATURES:", selected_cols)
-
-        # Main
         parser=argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
@@ -795,8 +642,8 @@ implementation:
         parser.add_argument('--tfidf_max_features', type=int, default=20000)
         parser.add_argument('--svd_dims', type=int, default=30)
         parser.add_argument('--preview_rows', type=int, default=20)
-        parser.add_argument('--X', type=str, required=True)
-        parser.add_argument('--y', type=str, required=True)
+        parser.add_argument('--train_X', type=str, required=True)
+        parser.add_argument('--train_y', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--feature_selector', type=str, required=True)
         parser.add_argument('--preprocess_metadata', type=str, required=True)
@@ -810,56 +657,38 @@ implementation:
             enable_string_similarity=str(args.enable_string_similarity).lower() in ("1","true","t","yes","y")
             tfidf_max_features=int(args.tfidf_max_features); svd_dims=int(args.svd_dims)
             preview_rows=int(args.preview_rows)
-            out_X=args.X; out_y=args.y; preproc_path=args.preprocessor; fs_path=args.feature_selector; meta_path=args.preprocess_metadata
+            out_X=args.train_X; out_y=args.train_y; preproc_path=args.preprocessor; fs_path=args.feature_selector; meta_path=args.preprocess_metadata
 
             if not os.path.exists(in_path):
-                print("ERROR input file does not exist:", in_path, file=sys.stderr); sys.exit(1)
-            print("Loading:", in_path)
+                print("ERROR input file does not exist: " + str(in_path), file=sys.stderr); sys.exit(1)
+            print("Loading: " + in_path)
             df = read_with_pandas(in_path)
-            print(f"Loaded shape: {df.shape}")
-
-            drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
-            present=[c for c in drop_cols if c in df.columns]
-            if present:
-                df = df.drop(columns=present)
-                print("Dropped columns:", present)
-
-            before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first').reset_index(drop=True)
-            print(f"Removed duplicates: {before - len(df)} rows dropped")
+            print("Loaded shape: " + str(df.shape))
+            print("All columns: " + str(list(df.columns)))
+            print_dtypes(df, "Dtypes before any processing")
 
             if target_col not in df.columns:
-                print(f"ERROR target column '{target_col}' not found", file=sys.stderr); sys.exit(1)
+                print("ERROR target column " + str(target_col) + " not found", file=sys.stderr); sys.exit(1)
 
-            print_before(df, target_col)
+            # Drop duplicates
+            before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
+            print("Removed duplicates: " + str(before - len(df)) + " rows dropped")
 
+            # Pull target aside first and never preprocess it with X
             y_raw = df[target_col].copy()
-            if model_type=="classification":
-                y_pre = y_raw.map(lambda v: 1 if str(v).strip().lower() in ("1","true","yes","y","male","m","positive","pos") else (0 if str(v).strip().lower() in ("0","false","no","n","female","f","negative","neg") else v))
-                if not pd.api.types.is_numeric_dtype(y_pre):
-                    le=LabelEncoder(); y_enc = le.fit_transform(y_pre.astype(str))
-                    y_df=pd.DataFrame({target_col:y_enc})
-                    y_map={cl:int(lbl) for lbl,cl in enumerate(le.classes_)}
-                else:
-                    y_int = pd.to_numeric(y_pre, errors='coerce')
-                    y_df=pd.DataFrame({target_col:y_int.astype('Int64') if pd.isna(y_int).any() else y_int.astype(int)}); y_map=None
-            else:
-                y_num = pd.to_numeric(y_raw, errors='coerce')
-                y_df=pd.DataFrame({target_col: y_num})
+            X_raw = df.drop(columns=[target_col]).copy()
 
-            keep_mask = y_df[target_col].notna()
-            idx = np.flatnonzero(keep_mask.values)
-            df = df.iloc[idx].reset_index(drop=True)
-            y_df = y_df.iloc[idx].reset_index(drop=True)
-            print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
+            # Convert object columns in X only
+            print("Converting object columns in X to numeric where possible")
+            X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
+            print("Conversion report preview: " + json.dumps(conv_report, default=str)[:800])
 
-            print("Converting object columns to numeric where possible")
-            df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
-            print("Conversion report head:", json.dumps(conv_report, default=str)[:1000])
+            # Detect dates in X only
+            print("Detecting date-like columns in X")
+            X_dates, date_report = detect_and_extract_dates(X_conv, enabled=True, exclude_cols=None)
+            print("Date parse report preview: " + json.dumps(date_report, default=str)[:800])
 
-            print("Detecting date-like columns")
-            df, date_report = detect_and_extract_dates(df, enabled=True)
-            print("Date parse report head:", json.dumps(date_report, default=str)[:1000])
-
+            # Build config
             config={
                 'outlier_strategy': outlier_strategy,
                 'outlier_fold': outlier_fold,
@@ -870,72 +699,81 @@ implementation:
             }
             text_params={'tfidf_max_features': tfidf_max_features, 'svd_dims': svd_dims}
 
+            # Prepare y according to task
+            y_info={'strategy': None, 'classes_': None}
+            if model_type=="regression":
+                y_series=pd.to_numeric(y_raw, errors='coerce')
+                y_info['strategy']="numeric_coerce"
+            else:
+                # try numeric rounding half-up
+                y_num=pd.to_numeric(y_raw, errors='coerce')
+                if y_num.notna().mean() > 0.8:
+                    y_series = np.floor(y_num + 0.5).astype("Int64")
+                    y_info['strategy']="round_half_up"
+                else:
+                    # string labels -> label encode
+                    le=LabelEncoder()
+                    y_series = pd.Series(le.fit_transform(y_raw.astype(str)), index=y_raw.index)
+                    y_info['strategy']="label_encode"
+                    y_info['classes_']=list(map(str, le.classes_))
+
+            # Drop rows with null y
+            keep_mask_y = y_series.notna()
+            dropped_y = int((~keep_mask_y).sum())
+            if dropped_y>0:
+                print("Dropped rows with null target: " + str(dropped_y))
+            X_input = X_dates.loc[keep_mask_y].reset_index(drop=True)
+            y_series = y_series.loc[keep_mask_y].reset_index(drop=True)
+
+            print_head(X_input, "X head before Preprocessor.fit")
+            print_dtypes(X_input, "X dtypes before Preprocessor.fit")
+
+            # Fit preprocessor on X only, pass y for encoders if classification
             pre=Preprocessor()
-            X_init = df.drop(columns=[target_col]) if target_col in df.columns else df.copy()
-            pre.fit(X_init, y=y_df[target_col] if model_type=="classification" else y_df[target_col], config=config, text_params=text_params)
+            pre.fit(X_input, y=y_series if model_type=="classification" else y_series, config=config, text_params=text_params, target_col=target_col)
 
-            print_plan(pre)
+            print("Plan numeric columns: " + str(pre.num_cols))
+            print("Plan categorical columns: " + str(pre.cat_cols))
 
-            print("Applying preprocessing pipeline")
-            Xp = pre.transform(X_init, training_mode=True)
-            kept_mask = pre.global_metadata.get('kept_mask_after_outlier', None)
-            if kept_mask is not None:
-                # make sure mask is aligned to current y_df index
-                kept_mask = kept_mask.reindex(y_df.index, fill_value=True)
-                y_df = y_df.loc[kept_mask]
-            
-            # hard align by Xp's index (covers any remaining mismatch)
-            common_idx = Xp.index.intersection(y_df.index)
-            Xp = Xp.loc[common_idx]
-            y_df = y_df.loc[common_idx]
-            
-            # reset to clean, dense indices
-            Xp = Xp.reset_index(drop=True)
-            y_df = y_df.reset_index(drop=True)
+            # Transform X with training_mode True to apply outlier rule
+            Xp = pre.transform(X_input, training_mode=True)
 
-            for c in list(Xp.columns):
-                if Xp[c].dtype=='object':
-                    try: Xp[c]=pd.to_numeric(Xp[c], errors='coerce')
-                    except Exception: pass
-            Xp.replace([np.inf,-np.inf], np.nan, inplace=True)
+            # Align y to kept_mask if any rows were dropped by outlier removal
+            kmask = pre.global_metadata.get('kept_mask_after_outlier', None)
+            if kmask is not None and isinstance(kmask, pd.Series):
+                # kmask indexes the input passed into transform prior to drop; align to X_input index length
+                kmask = kmask.reindex(X_input.index, fill_value=True)
+                Xp = Xp.reset_index(drop=True)
+                y_series = y_series.loc[kmask].reset_index(drop=True)
 
+            # Ensure numeric dtypes optimal
             print("Optimizing numeric dtypes")
             for col in Xp.select_dtypes(include=[np.number]).columns:
                 try:
-                    s = Xp[col]
-                    if np.allclose(s.dropna(), np.round(s.dropna())):
-                        if s.min() >= np.iinfo(np.int8).min and s.max() <= np.iinfo(np.int8).max:
-                            Xp[col] = s.astype('Int8')
-                        elif s.min() >= np.iinfo(np.int16).min and s.max() <= np.iinfo(np.int16).max:
-                            Xp[col] = s.astype('Int16')
-                        elif s.min() >= np.iinfo(np.int32).min and s.max() <= np.iinfo(np.int32).max:
-                            Xp[col] = s.astype('Int32')
-                        else:
-                            Xp[col] = s.astype('Int64')
-                    else:
-                        Xp[col]=pd.to_numeric(Xp[col], downcast='float')
+                    Xp[col]=pd.to_numeric(Xp[col], downcast='float')
                 except Exception:
                     pass
 
+            # Feature selection
             print("Fitting feature selector")
             fs=FeatureSelector(task=("classification" if model_type=="classification" else "regression"))
-            fs.fit(Xp, y_df[target_col].values)
+            fs.fit(Xp, y_series.values)
             Xs = fs.transform(Xp)
-            print_after(Xs, fs.selected_features)
+            print("Selected features: " + str(fs.selected_features))
 
+            # Save outputs
             ensure_dir_for(out_X); ensure_dir_for(out_y); ensure_dir_for(preproc_path); ensure_dir_for(fs_path); ensure_dir_for(meta_path)
             Xs.to_parquet(out_X, index=False)
+            y_df=pd.DataFrame({target_col: y_series})
             y_df.to_parquet(out_y, index=False)
-            with gzip.open(preproc_path, "wb") as f:
-                cloudpickle.dump(pre, f)
-            with gzip.open(fs_path, "wb") as f:
-                cloudpickle.dump(fs, f)
+            pre.save(preproc_path)
+            fs.save(fs_path)
 
             metadata={
                 'timestamp': datetime.utcnow().isoformat()+'Z',
                 'model_type': model_type,
                 'target_column': target_col,
-                'label_mapping': (y_map if model_type=="classification" else None),
+                'y_strategy': y_info,
                 'config': config,
                 'text_params': text_params,
                 'conversion_report': conv_report,
@@ -946,9 +784,18 @@ implementation:
             }
             with open(meta_path,'w',encoding='utf-8') as fh:
                 json.dump(metadata, fh, indent=2, ensure_ascii=False)
-            print("SUCCESS Preprocessing complete")
+
+            # Final prints
+            print("Columns used in final X: " + str(list(Xs.columns)))
+            print_dtypes(Xs, "Final X dtypes")
+            print("Saved train_X to: " + out_X)
+            print("Saved train_y to: " + out_y)
+            print("Saved preprocessor to: " + preproc_path)
+            print("Saved feature_selector to: " + fs_path)
+            print("Saved metadata to: " + meta_path)
+            print("SUCCESS Preprocessing and train split complete")
         except Exception as exc:
-            print("ERROR during preprocessing:", exc, file=sys.stderr)
+            print("ERROR during preprocessing: " + str(exc), file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
     args:
@@ -976,10 +823,10 @@ implementation:
       - {inputValue: svd_dims}
       - --preview_rows
       - {inputValue: preview_rows}
-      - --X
-      - {outputPath: X}
-      - --y
-      - {outputPath: y}
+      - --train_X
+      - {outputPath: train_X}
+      - --train_y
+      - {outputPath: train_y}
       - --preprocessor
       - {outputPath: preprocessor}
       - --feature_selector
