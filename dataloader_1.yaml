@@ -11,14 +11,8 @@ outputs:
   - {name: test_y, type: Data}
 implementation:
   container:
-    image: python:3.9
+    image: kumar2004/ml-base:v1
     command:
-      - sh
-      - -c
-      - |
-        python3 -m pip install --quiet requests pandas scikit-learn pyarrow || \
-        python3 -m pip install --quiet requests pandas scikit-learn pyarrow --user
-        exec "$0" "$@"
       - python3
       - -u
       - -c
