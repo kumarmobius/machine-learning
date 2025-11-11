@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.8
+name: Advanced Preprocess v8.3.9
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -662,6 +662,8 @@ implementation:
             
                 # 6) Pre-fill for KNN/Iterative imputers
                 temp_df = df.copy()
+                if temp_df.shape[0] == 0:
+                    return df
                 for c in expected_num:
                     imputer_info = self.col_config.get(c, {}).get('imputer', ('none', None))
                     if imputer_info[0] in ('knn', 'iterative'):
@@ -738,31 +740,51 @@ implementation:
                 # 11) Optional outlier handling during training only
                 cfg_global = self.global_metadata.get('config') or {}
                 if training_mode:
-                    if cfg_global.get('outlier_strategy', 'drop_iqr') == 'drop_iqr':
-                        df2, n_removed, kept_mask = drop_outliers_iqr(df, expected_num, fold=cfg_global.get('outlier_fold', 1.5))
-                        self.global_metadata['outliers_removed'] = int(n_removed)
-                        self.global_metadata['kept_mask_after_outlier'] = kept_mask
-                        df = df2
-                    elif cfg_global.get('outlier_strategy') == 'winsorize':
-                        df, _ = winsorize_df(df, expected_num, fold=cfg_global.get('outlier_fold', 1.5))
+                    strat = cfg_global.get('outlier_strategy','drop_iqr')
+                    fold  = cfg_global.get('outlier_fold',1.5)
+                
+                    if strat == 'drop_iqr':
+                        df2, n_removed, kept_mask = drop_outliers_iqr(df, self.num_cols, fold=fold)
+                        if df2.shape[0] == 0:
+                            # fallback: keep rows, clip instead of dropping all
+                            df, _ = winsorize_df(df, self.num_cols, fold=fold)
+                            self.global_metadata['outliers_removed'] = 0
+                            self.global_metadata['kept_mask_after_outlier'] = pd.Series(True, index=df.index)
+                        else:
+                            df = df2
+                            self.global_metadata['outliers_removed'] = int(n_removed)
+                            self.global_metadata['kept_mask_after_outlier'] = kept_mask
+                
+                    elif strat == 'winsorize':
+                        df, _ = winsorize_df(df, self.num_cols, fold=fold)
                         self.global_metadata['kept_mask_after_outlier'] = pd.Series(True, index=df.index)
+
             
                 # 12) Final scaling on numeric columns
-                for c in expected_num:
+                if df.shape[0] == 0:
+                    return df  # nothing to scale
+                
+                for c in self.num_cols:
                     sc = self.col_config[c].get('scaler_obj')
                     if sc is None:
                         sc = choose_scaler_for_series(df[c].fillna(df[c].median()))
+                    # avoid sklearn on empty
+                    if df.shape[0] == 0:
+                        self.col_config[c]['scaler_obj'] = sc
+                        continue
                     try:
-                        df[c] = sc.transform(df[[c]].values).reshape(-1)
+                        transformed = sc.transform(df[[c]].values)
+                        df[c] = transformed.reshape(-1)
                     except Exception:
-                        from sklearn.preprocessing import StandardScaler
                         try:
                             df[c] = sc.fit_transform(df[[c]].values).reshape(-1)
                         except Exception:
-                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
+                            df[c] = StandardScaler().fit_transform(
+                                df[[c]].fillna(df[c].median()).values
+                            ).reshape(-1)
                     self.col_config[c]['scaler_obj'] = sc
-            
-                # 13) Categorical encodings; never touch target
+
+        
                 for c in [cc for cc in expected_cat if cc in df.columns and cc != target_col]:
                     cfg = self.col_config[c]; s = df[c].astype(object)
                     rare_thresh = cfg.get('rare_threshold_frac', 0.01)
