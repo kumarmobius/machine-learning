@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.7
+name: Advanced Preprocess v8.3.8
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -545,8 +545,9 @@ implementation:
 
 
                 tcol = self.global_metadata.get('target_col')
+                protected_text = set(self.global_metadata.get('text_orig_cols', []))
                 for c in df.columns:
-                    if c == tcol:
+                    if c == tcol or c in protected_text:
                         continue
                     if df[c].dtype == 'object':
                         df[c] = safe_to_datetime(df[c])
@@ -561,7 +562,9 @@ implementation:
                             df[c_orig] = ""
                 
                 if self.text is not None:
-                    df = self.text.transform(df)
+                    df_txt = self.text.transform(df)
+                else:
+                    df_txt = df
 
                 self.num_cols = [c for c in df_txt.columns if pd.api.types.is_numeric_dtype(df_txt[c])]
                 self.cat_cols = [c for c in df_txt.columns if c not in self.num_cols]
