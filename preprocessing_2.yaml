@@ -29,7 +29,7 @@ outputs:
   - {name: preprocess_metadata, type: Data, description: "JSON metadata"}
 implementation:
   container:
-    image: python:3.10-slim
+    image: kumar2004/ml-base:v1
     command:
       - python3
       - -u
@@ -38,46 +38,23 @@ implementation:
         import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
         from datetime import datetime
 
-        def pip_install(pkgs):
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
-
-        try:
-            import pandas as pd, numpy as np
-            from sklearn.impute import SimpleImputer, KNNImputer
-            from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder, LabelEncoder
-            from sklearn.pipeline import Pipeline
-            from sklearn.model_selection import KFold
-            from sklearn.experimental import enable_iterative_imputer  # noqa
-            from sklearn.impute import IterativeImputer
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.decomposition import TruncatedSVD
-            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
-            from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
-            import joblib
-            import re
-            import category_encoders as ce
-            from rapidfuzz import process as rf_process, fuzz as rf_fuzz
-            import gzip,cloudpickle
-            from sklearn.inspection import permutation_importance
-        except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle","re"])
-            import pandas as pd, numpy as np
-            from sklearn.impute import SimpleImputer, KNNImputer
-            from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder, LabelEncoder
-            from sklearn.pipeline import Pipeline
-            from sklearn.model_selection import KFold
-            from sklearn.experimental import enable_iterative_imputer  # noqa
-            from sklearn.impute import IterativeImputer
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.decomposition import TruncatedSVD
-            from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
-            from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
-            import joblib
-            import re
-            import category_encoders as ce
-            import gzip,cloudpickle
-            from sklearn.inspection import permutation_importance
-            from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+        import pandas as pd, numpy as np
+        from sklearn.impute import SimpleImputer, KNNImputer
+        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder, LabelEncoder
+        from sklearn.pipeline import Pipeline
+        from sklearn.model_selection import KFold
+        from sklearn.experimental import enable_iterative_imputer  # noqa
+        from sklearn.impute import IterativeImputer
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, SelectFromModel,VarianceThreshold
+        from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
+        import joblib
+        import re
+        import category_encoders as ce
+        from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+        import gzip,cloudpickle
+        from sklearn.inspection import permutation_importance
 
         # ---------- helpers ----------
         def ensure_dir_for(p):
