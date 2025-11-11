@@ -1,4 +1,4 @@
-name: Evaluate Model v1.3
+name: Evaluate Model v1.4
 description: |
   Evaluate a trained model on test data.
   - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -33,7 +33,7 @@ implementation:
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
             import cloudpickle, gzip
         except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet","openpyxl","cloudpickle"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
             import pandas as pd, numpy as np, joblib
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
             import cloudpickle, gzip
