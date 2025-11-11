@@ -1,4 +1,4 @@
-name: Evaluate Model v1.4
+name: Evaluate Model v1.5
 description: |
   Evaluate a trained model on test data.
   - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
@@ -8,7 +8,8 @@ description: |
   - Regression: r2_score.
 inputs:
   - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"}
-  - {name: y_test, type: Data, description: "Path to test target file (single-column file)"}
+  - {name: y_test, type: Data, description: "Path to test target file (single-column file or multi-column with target_column)"}
+  - {name: target_column, type: String, description: "Target column in y_test if multi-column", optional: true, default: ""}
   - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
   - {name: model_pickle, type: Data, description: "Path to saved model (joblib/pickle)"}
@@ -33,16 +34,10 @@ implementation:
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
             import cloudpickle, gzip
         except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","category_encoders","rapidfuzz","pyarrow","fastparquet","openpyxl","cloudpickle"])
+            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet","openpyxl","cloudpickle"])
             import pandas as pd, numpy as np, joblib
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
             import cloudpickle, gzip
-
-        # IO helpers
-        def sample_file_bytes(path, n=8192):
-            try:
-                with open(path, "rb") as fh: return fh.read(n)
-            except Exception: return b""
 
         def is_likely_json(sample_bytes):
             if not sample_bytes: return False
@@ -50,10 +45,11 @@ implementation:
             except Exception: return False
             if not txt: return False
             if txt[0] in ("{","["): return True
-            if "{" in txt or "[" in txt: return True
+            if "\\n{" in txt or "\\n[" in txt: return True
             return False
 
         def read_with_pandas(path):
+            import io, zipfile
             if os.path.isdir(path):
                 entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
                 files=[p for p in entries if os.path.isfile(p)]
@@ -98,33 +94,30 @@ implementation:
             except Exception: pass
             try: return pd.read_csv(path)
             except Exception: pass
-            raise ValueError("Unsupported format: "+path)
+            raise ValueError("Unsupported format: " + path)
 
         def ensure_dir_for(p):
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
 
-        # Robust loader for cloudpickle/joblib with optional gzip
         def load_pickle_any(path):
-            # try gzip+cloudpickle
             try:
                 with gzip.open(path, "rb") as f:
                     return cloudpickle.load(f)
             except Exception:
                 pass
-            # try plain cloudpickle
             try:
                 with open(path, "rb") as f:
                     return cloudpickle.load(f)
             except Exception:
                 pass
-            # fallback to joblib
             return joblib.load(path)
 
         parser = argparse.ArgumentParser()
         parser.add_argument("--X_test", type=str, required=True)
         parser.add_argument("--y_test", type=str, required=True)
+        parser.add_argument("--target_column", type=str, default="")
         parser.add_argument("--preprocessor", type=str, required=True)
         parser.add_argument("--feature_selector", type=str, required=False, default="")
         parser.add_argument("--model_pickle", type=str, required=True)
@@ -134,7 +127,6 @@ implementation:
         args = parser.parse_args()
 
         try:
-            # resolve paths
             X_path = args.X_test
             y_path = args.y_test
             preprocessor_path = args.preprocessor
@@ -143,40 +135,46 @@ implementation:
             metrics_path = args.metrics_json
             preds_path = args.predictions
             task = str(args.model_type).strip().lower()
+            target_col = str(args.target_column or "").strip()
 
-            # Load artifacts
             pre = load_pickle_any(preprocessor_path)
             fs = load_pickle_any(feature_selector_path) if feature_selector_path and os.path.exists(feature_selector_path) else None
-            model = joblib.load(model_path)
+            try:
+                model = joblib.load(model_path)
+            except Exception:
+                model = load_pickle_any(model_path)
 
-            # Load data
             X_raw = read_with_pandas(X_path)
             y_df = read_with_pandas(y_path)
 
-            # y -> 1D Series
             if isinstance(y_df, pd.DataFrame):
-                if y_df.shape[1] == 1:
+                if target_col:
+                    if target_col not in y_df.columns:
+                        raise ValueError("--target_column '" + target_col + "' not in y_test. Columns: " + str(list(y_df.columns)))
+                    y = y_df[target_col]
+                elif y_df.shape[1] == 1:
                     y = y_df.iloc[:, 0]
                 else:
-                    cand = [c for c in y_df.columns if c.lower() in ("y","target","label")]
-                    y = y_df[cand[0]] if cand else y_df.iloc[:, 0]
+                    raise ValueError("y_test has multiple columns. Provide --target_column.")
             else:
                 y = pd.Series(y_df)
 
-            # Transform X using saved preprocessor (no fitting)
+            if len(y) == 0:
+                raise ValueError("Loaded y_test has 0 rows. Check the artifact and target_column.")
+
             Xp = pre.transform(X_raw, training_mode=False)
 
-            # Optional feature selector
-            Xs = fs.transform(Xp) if fs is not None else Xp
+            if fs is not None and hasattr(fs, "selected_features"):
+                want_cols = list(fs.selected_features)
+                Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
+            elif fs is not None:
+                Xs = fs.transform(Xp)
+            else:
+                Xs = Xp
 
-            # Align y length to X by position if mismatched
             if len(y) != len(Xs):
-                print(f"[warn] len(X)={len(Xs)} != len(y)={len(y)}. aligning by position.")
-                n = min(len(y), len(Xs))
-                Xs = Xs.iloc[:n].reset_index(drop=True)
-                y = pd.Series(y).iloc[:n].reset_index(drop=True)
+                raise ValueError("Length mismatch: X=" + str(len(Xs)) + " vs y=" + str(len(y)) + ". Pass matching test artifacts.")
 
-            # Predict
             has_proba = hasattr(model, "predict_proba")
             y_pred = model.predict(Xs)
             y_proba = None
@@ -186,7 +184,6 @@ implementation:
                 except Exception:
                     y_proba = None
 
-            # Metrics
             metrics = {}
             if task == "regression":
                 y_true_num = pd.to_numeric(y, errors="coerce")
@@ -194,7 +191,8 @@ implementation:
             else:
                 y_true = y
                 try:
-                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or                        (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
+                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or \
+                       (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
                         y_true = y_true.astype(str)
                         y_pred = pd.Series(y_pred).astype(str)
                 except Exception:
@@ -204,16 +202,17 @@ implementation:
                 metrics["recall_weighted"] = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
                 metrics["f1_weighted"] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
 
-            # Save metrics
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-            # Save predictions
             ensure_dir_for(preds_path)
             out = pd.DataFrame({"y_true": y, "y_pred": y_pred})
             if isinstance(y_proba, np.ndarray):
-                out["y_proba_max"] = y_proba.max(axis=1)
+                try:
+                    out["y_proba_max"] = y_proba.max(axis=1)
+                except Exception:
+                    pass
             out.to_parquet(preds_path, index=False)
 
             print("SUCCESS evaluation complete")
@@ -226,6 +225,8 @@ implementation:
       - {inputPath: X_test}
       - --y_test
       - {inputPath: y_test}
+      - --target_column
+      - {inputValue: target_column}
       - --preprocessor
       - {inputPath: preprocessor}
       - --feature_selector
