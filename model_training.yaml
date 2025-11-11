@@ -20,7 +20,7 @@ outputs:
 
 implementation:
   container:
-    image: python:3.10-slim
+    image: kumar2004/ml-base:v1
     command:
       - python3
       - -u
@@ -30,21 +30,12 @@ implementation:
         def pip_install(pkgs):
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
 
-        try:
-            import pandas as pd
-            import numpy as np
-            from sklearn.linear_model import LogisticRegression
-            from sklearn.preprocessing import LabelEncoder
-            from sklearn.metrics import accuracy_score
-            import joblib
-        except Exception:
-            pip_install(["pandas","numpy","scikit-learn","joblib","pyarrow","fastparquet"])
-            import pandas as pd
-            import numpy as np
-            from sklearn.linear_model import LogisticRegression
-            from sklearn.preprocessing import LabelEncoder
-            from sklearn.metrics import accuracy_score
-            import joblib
+        import pandas as pd
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import LabelEncoder
+        from sklearn.metrics import accuracy_score
+        import joblib
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
