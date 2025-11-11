@@ -923,8 +923,8 @@ implementation:
                 print("ERROR target column " + str(target_col) + " not found", file=sys.stderr); sys.exit(1)
 
             # Drop duplicates
-            # before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
-            # print("Removed duplicates: " + str(before - len(df)) + " rows dropped")
+            before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
+            print("Removed duplicates: " + str(before - len(df)) + " rows dropped")
 
             # Pull target aside first and never preprocess it with X
             y_raw = df[target_col].copy()
