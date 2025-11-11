@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.1
+name: Advanced Preprocess v8.2
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target.
   Rules:
@@ -320,13 +320,13 @@ implementation:
 
         def _should_textify(ser, min_words=3, min_len=10):
             s = ser.astype(str).fillna("")
-            word_cnt_med = s.str.count(r"\b\w+\b").median()
+            word_cnt_med = s.str.count(r"\\b\w+\\b").median()
             len_med = s.str.len().median()
             numeric_frac = pd.to_numeric(s, errors="coerce").notna().mean()
             uniq_ratio = ser.nunique(dropna=True) / max(len(ser), 1)
             alpha_len = s.str.replace(r"[^A-Za-z]", "", regex=True).str.len()
             alpha_ratio_med = (alpha_len / s.str.len().replace(0, 1)).median()
-            tokens = s.str.findall(r"\b\w+\b")
+            tokens = s.str.findall(r"\\b\\w+\\b")
             long_token_cnt_med = tokens.map(lambda ts: sum(len(t) >= 10 for t in ts)).median()
             cond_words_or_len = (word_cnt_med >= min_words) or (len_med >= min_len) or (long_token_cnt_med >= 2)
             cond_alpha = alpha_ratio_med >= 0.5
@@ -377,8 +377,8 @@ implementation:
                         Z_df = pd.DataFrame(index=X.index)
                     stats = pd.DataFrame({
                         f"{col}__len": s.str.len(),
-                        f"{col}__word_count": s.str.count(r"\b\w+\b"),
-                        f"{col}__digit_count": s.str.count(r"\d"),
+                        f"{col}__word_count": s.str.count(r"\\b\\w+\\b"),
+                        f"{col}__digit_count": s.str.count(r"\\d"),
                         f"{col}__alpha_ratio": s.str.replace(r"[^A-Za-z]", "", regex=True).str.len() / s.str.len().replace(0,1)
                     }, index=X.index)
                     out.append(pd.concat([Z_df, stats], axis=1))
