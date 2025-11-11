@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.2
+name: Advanced Preprocess v8.3
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target.
   Rules:
@@ -766,8 +766,10 @@ implementation:
             Xs.to_parquet(out_X, index=False)
             y_df=pd.DataFrame({target_col: y_series})
             y_df.to_parquet(out_y, index=False)
-            pre.save(preproc_path)
-            fs.save(fs_path)
+            with gzip.open(preproc_path, "wb") as f:
+                cloudpickle.dump(pre, f)
+            with gzip.open(fs_path, "wb") as f:
+                cloudpickle.dump(fs, f)
 
             metadata={
                 'timestamp': datetime.utcnow().isoformat()+'Z',
