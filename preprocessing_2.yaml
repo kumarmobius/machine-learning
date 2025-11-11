@@ -546,11 +546,11 @@ implementation:
 
                 tcol = self.global_metadata.get('target_col')
                 protected_text = set(self.global_metadata.get('text_orig_cols', []))
-                for c in df.columns:
-                    if c == tcol or c in protected_text:
-                        continue
-                    if df[c].dtype == 'object':
-                        df[c] = safe_to_datetime(df[c])
+                # for c in df.columns:
+                #     if c == tcol or c in protected_text:
+                #         continue
+                #     if df[c].dtype == 'object':
+                #         df[c] = safe_to_datetime(df[c])
                 df = df.copy()
                 for c_orig in self.global_metadata.get('text_orig_cols', []):
                     base = c_orig[:-5]  # strip "_orig"
@@ -617,11 +617,11 @@ implementation:
                 df.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
             
                 # 1) Safe date parsing on non-target object columns
-                for c in df.columns:
-                    if c == target_col:
-                        continue
-                    if df[c].dtype == 'object':
-                        df[c] = safe_to_datetime(df[c])
+                # for c in df.columns:
+                #     if c == target_col:
+                #         continue
+                #     if df[c].dtype == 'object':
+                #         df[c] = safe_to_datetime(df[c])
             
                 # 2) Apply text featurizer ONCE to non-target columns, then reattach target
                 X_no_target = df.drop(columns=[target_col]) if (target_col is not None and target_col in df.columns) else df
