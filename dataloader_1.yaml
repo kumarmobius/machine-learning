@@ -34,13 +34,13 @@ implementation:
         import logging
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--api_url', type=str, required=True, help='API URL to fetch JSON dataset')
-        parser.add_argument('--access_token', type=str, required=True, help='Bearer token for API')
-        parser.add_argument('--split_size', type=float, default=15, help='Test split size as integer percent or fraction (default 15)')
-        parser.add_argument('--target_column', type=str, required=True, help='Name of target column for anomaly labeling')
-        parser.add_argument('--train_set', type=str, required=True, help='Path to output train dataset')
-        parser.add_argument('--test_x', type=str, required=True, help='Path to output test X dataset')
-        parser.add_argument('--test_y', type=str, required=True, help='Path to output test Y dataset')
+        parser.add_argument('--api_url', type=str, required=True)
+        parser.add_argument('--access_token', type=str, required=True)
+        parser.add_argument('--split_size', type=float, default=15)
+        parser.add_argument('--target_column', type=str, required=True)
+        parser.add_argument('--train_set', type=str, required=True)
+        parser.add_argument('--test_x', type=str, required=True)
+        parser.add_argument('--test_y', type=str, required=True)
         args = parser.parse_args()
 
         # Read access token
@@ -73,32 +73,28 @@ implementation:
         drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
 
-        # Print dataframe diagnostics
-        print("DF_HEAD:")
+        # === DataFrame Diagnostics ===
+        print("\n===== FULL DATAFRAME SUMMARY =====")
+        print("Shape:", df.shape)
+        print("\nDF_HEAD:")
         print(df.head().to_string())
-        print("DF_INFO:")
+        print("\nDF_INFO:")
         df.info()
-        print("DF_DTYPES:")
+        print("\nDF_DTYPES:")
         print(df.dtypes.to_string())
-        print("DF_DESCRIBE:")
-        print(df.describe(include='all').to_string())
-        print("DF_NULL_COUNTS:")
+        print("\nDF_NULL_COUNTS:")
         print(df.isnull().sum().to_string())
 
-        # Define anomaly labels based on user-provided target column
+        # === Target Label Handling ===
         if args.target_column in df.columns:
             anomaly_labels = (df[args.target_column] == 0.0).astype(np.int32)
         else:
             logger.warning(f" Target column '{args.target_column}' not found. Creating zero anomaly labels.")
             anomaly_labels = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index)
 
-        # Convert split size: integer percent → fraction
+        # === Split Size Conversion ===
         split_size_input = float(args.split_size)
-        if split_size_input >= 1.0:
-            test_size = split_size_input / 100.0
-        else:
-            test_size = split_size_input
-
+        test_size = split_size_input / 100.0 if split_size_input >= 1.0 else split_size_input
         if not (0.0 < test_size < 1.0):
             raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
 
@@ -108,7 +104,23 @@ implementation:
             df, anomaly_labels, test_size=test_size, random_state=42, stratify=stratify_param
         )
 
-        # Save outputs in Parquet format
+        # === Diagnostics for Train/Test Splits ===
+        print("\n===== TRAIN SET =====")
+        print("Shape:", train_df.shape)
+        print(train_df.dtypes.to_string())
+        print(train_df.head(3).to_string())
+
+        print("\n===== TEST X =====")
+        print("Shape:", test_df.shape)
+        print(test_df.dtypes.to_string())
+        print(test_df.head(3).to_string())
+
+        print("\n===== TEST Y =====")
+        print("Shape:", test_labels.shape)
+        print("Type:", test_labels.dtype)
+        print(test_labels.head(10).to_string(index=False))
+
+        # === Save Outputs ===
         os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
         train_df.to_parquet(args.train_set, index=False)
 
