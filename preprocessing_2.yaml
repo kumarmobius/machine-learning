@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.2.1
+name: Advanced Preprocess v8.2.2
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target.
   Rules:
@@ -566,36 +566,174 @@ implementation:
             def load(path): return joblib.load(path)
 
         class FeatureSelector:
+            # Three-stage selector:
+            #   1) Filter pass: near-zero variance, then correlation pruning (|rho| >= 0.95).
+            #   2) Relevance pass: MI or greedy mRMR to top k, where k = ceil(2*sqrt(p)).
+            #   3) Black-box pass: permutation importance on ExtraTrees; drop <= 0 contributions.
+        
+            # Public attributes:
+            #   - selected_features: list[str]
+  
+            # fixed knobs to preserve constructor signature
+            _VAR_THRESH = 1e-5
+            _CORR_THRESH = 0.95
+            _RELEVANCE = "mi"          # "mi" or "mrmr"
+            _PI_REPEATS = 5
+            _RANDOM_STATE = 42
+        
             def __init__(self, task):
-                self.task=task; self.mi_selector=None; self.model_selector=None; self.selected_features=[]
-
-            def _auto_k(self, p):
-                return max(5, min(int(round(math.sqrt(p)*2)), p))
-
-            def fit(self, X, y):
-                p=X.shape[1]; k=self._auto_k(p)
-                if self.task=="classification":
-                    self.mi_selector = SelectKBest(score_func=mutual_info_classif, k=k).fit(X, y)
-                    model = ExtraTreesClassifier(n_estimators=600, max_features="sqrt", random_state=42, n_jobs=-1)
-                else:
-                    self.mi_selector = SelectKBest(score_func=mutual_info_regression, k=k).fit(X, y)
-                    model = ExtraTreesRegressor(n_estimators=600, max_features="sqrt", random_state=42, n_jobs=-1)
-                X1 = self.mi_selector.transform(X)
-                self.model_selector = SelectFromModel(estimator=model, threshold="median", max_features=X1.shape[1]).fit(X1, y)
-                mask1=self.mi_selector.get_support()
-                mask2=self.model_selector.get_support()
-                cols=np.array(X.columns)[mask1][mask2]
-                self.selected_features=list(cols)
-                return self
-
-            def transform(self, X):
-                X1=self.mi_selector.transform(X)
-                X2=self.model_selector.transform(X1)
-                return pd.DataFrame(X2, columns=self.selected_features, index=X.index)
-
-            def save(self, path): joblib.dump(self, path)
+                self.task = str(task).lower()
+                self.selected_features = []
+        
+                # internals for reproducibility/debug
+                self._filter_keep_ = []
+                self._relevance_keep_ = []
+                self._mi_scores_ = pd.Series(dtype=float)
+                self._pi_importance_ = pd.Series(dtype=float)
+        
+            def _auto_k(self, p: int) -> int:
+                return max(5, min(int(math.ceil(math.sqrt(p) * 2.0)), p))
+        
+            # Filter pass helpers 
             @staticmethod
-            def load(path): return joblib.load(path)
+            def _nzv_keep(X: pd.DataFrame, threshold: float) -> list:
+                if X.shape[1] == 0:
+                    return []
+                vt = VarianceThreshold(threshold=threshold)
+                vt.fit(X.values)
+                mask = vt.get_support()
+                return list(X.columns[mask])
+        
+            @staticmethod
+            def _corr_prune_keep(X: pd.DataFrame, corr_thresh: float) -> list:
+                cols = list(X.columns)
+                if len(cols) <= 1:
+                    return cols
+                # use Spearman for monotonic robustness
+                corr = X.corr(method="spearman").abs()
+                keep = set(cols)
+                # greedy: drop the feature with larger mean absolute corr when a pair exceeds threshold
+                while True:
+                    # find maximum correlation pair among current 'keep'
+                    sub = corr.loc[list(keep), list(keep)]
+                    np.fill_diagonal(sub.values, 0.0)
+                    max_val = sub.values.max()
+                    if not np.isfinite(max_val) or max_val < corr_thresh:
+                        break
+                    # locate the pair
+                    idx = np.unravel_index(np.argmax(sub.values), sub.shape)
+                    a = sub.index[idx[0]]
+                    b = sub.columns[idx[1]]
+                    mean_a = sub[a].mean()
+                    mean_b = sub[b].mean()
+                    drop = a if mean_a >= mean_b else b
+                    keep.remove(drop)
+                return list(keep)
+        
+            #  Relevance pass helpers 
+            def _mi_scores(self, X: pd.DataFrame, y: pd.Series) -> pd.Series:
+                cols = list(X.columns)
+                if self.task == "classification":
+                    scores = mutual_info_classif(X.values, y, random_state=self._RANDOM_STATE)
+                else:
+                    # treat as regression
+                    y_num = pd.to_numeric(y, errors="ignore")
+                    scores = mutual_info_regression(X.values, y_num, random_state=self._RANDOM_STATE)
+                return pd.Series(scores, index=cols).fillna(0.0)
+        
+            @staticmethod
+            def _topk_by_series(scores: pd.Series, k: int) -> list:
+                k = max(1, min(k, scores.shape[0]))
+                return list(scores.sort_values(ascending=False).head(k).index)
+        
+            @staticmethod
+            def _mrmr_greedy(X: pd.DataFrame, mi: pd.Series, k: int) -> list:
+                # redundancy by absolute Spearman correlation
+                k = max(1, min(k, X.shape[1]))
+                corr = X.corr(method="spearman").abs().fillna(0.0)
+                selected = []
+                candidates = list(X.columns)
+                while len(selected) < k and candidates:
+                    best_feat = None
+                    best_score = -1e18
+                    for c in candidates:
+                        rel = float(mi.get(c, 0.0))
+                        if not selected:
+                            score = rel
+                        else:
+                            red = float(corr.loc[c, selected].mean())
+                            score = rel - red
+                        if score > best_score:
+                            best_score = score
+                            best_feat = c
+                    selected.append(best_feat)
+                    candidates.remove(best_feat)
+                return selected
+        
+            # Black-box pass helper
+            def _permutation_keep(self, X: pd.DataFrame, y: pd.Series) -> (list, pd.Series):
+                if self.task == "classification":
+                    est = ExtraTreesClassifier(
+                        n_estimators=400, max_features="sqrt", random_state=self._RANDOM_STATE, n_jobs=-1
+                    )
+                else:
+                    est = ExtraTreesRegressor(
+                        n_estimators=400, max_features="sqrt", random_state=self._RANDOM_STATE, n_jobs=-1
+                    )
+                est.fit(X, y)
+                pi = permutation_importance(
+                    est, X, y, n_repeats=self._PI_REPEATS, random_state=self._RANDOM_STATE, n_jobs=-1
+                )
+                imp = pd.Series(pi.importances_mean, index=X.columns).fillna(0.0)
+                keep = list(imp[imp > 0.0].index)
+                if not keep:
+                    # fallback: keep at least one feature with highest PI
+                    keep = [imp.sort_values(ascending=False).index[0]]
+                return keep, imp
+        
+            # Public API 
+            def fit(self, X: pd.DataFrame, y) -> "FeatureSelector":
+                # make sure y is a 1D array-like
+                if isinstance(y, (pd.DataFrame, pd.Series)):
+                    y_arr = pd.Series(y).values.ravel()
+                else:
+                    y_arr = np.asarray(y).ravel()
+        
+                # 1) filter pass
+                keep1 = self._nzv_keep(X, self._VAR_THRESH)
+                X1 = X[keep1]
+                keep2 = self._corr_prune_keep(X1, self._CORR_THRESH)
+                Xf = X1[keep2]
+                self._filter_keep_ = list(Xf.columns)
+        
+                # 2) relevance pass
+                mi = self._mi_scores(Xf, y_arr)
+                self._mi_scores_ = mi.copy()
+                k = self._auto_k(Xf.shape[1])
+                if self._RELEVANCE == "mrmr":
+                    keep_rel = self._mrmr_greedy(Xf, mi, k)
+                else:
+                    keep_rel = self._topk_by_series(mi, k)
+                Xr = Xf[keep_rel]
+                self._relevance_keep_ = list(Xr.columns)
+        
+                # 3) black-box pass (permutation importance)
+                keep_pi, imp = self._permutation_keep(Xr, y_arr)
+                Xb = Xr[keep_pi]
+                self._pi_importance_ = imp
+                self.selected_features = list(Xb.columns)
+                return self
+        
+            def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+                # Be strict on column order but tolerant to missing/extra columns.
+                return X.reindex(columns=self.selected_features, fill_value=0.0)
+        
+            def save(self, path: str) -> None:
+                joblib.dump(self, path)
+        
+            @staticmethod
+            def load(path: str) -> "FeatureSelector":
+                return joblib.load(path)
 
         def print_head(df, title):
             print(title)
