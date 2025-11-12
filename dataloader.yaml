@@ -1,249 +1,105 @@
-name: Load Data into Pandas - from CDN
+name: Data loader with cdn
 description: |
-  Loads a dataset file (CSV, TSV, JSON/JSONL, Excel, Parquet, Feather, ORC) produced by the
-  CDN Generic Downloader into a pandas DataFrame, then writes:
-    - processed_file (Parquet)
-    - preview_file (JSON with preview_rows)
-    - schema_file (JSON with column dtypes)
-    - row_count (text file containing the number of rows)
-
-  This component is robust: it will accept either a direct file path or a directory produced
-  by the CDN downloader. If a directory is provided it will select a sensible candidate file
-  (single file or largest regular file). It supports compressed .gz and .zip files and falls
-  back to content-sniffing (JSONL vs CSV) when extensions are missing.
+  Downloads a dataset from a CDN URL, saves it in Parquet format, and splits it into train/test sets. Prints dataframe diagnostics and ensures split follows given rules. If model_type is classification, prints target variable distribution.
 inputs:
-  - {name: in_file, type: Data, description: "Path to the downloaded file or directory (connect CDN Generic Downloader: out_file)"}
-  - {name: preview_rows, type: Integer, description: "Rows to include in preview JSON", default: "20"}
+  - {name: cdn_url, type: String, description: 'CDN URL to download dataset file (CSV, JSON, or Parquet)'}
+  - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
+  - {name: target_column, type: String, description: 'Name of target column used for splitting'}
+  - {name: model_type, type: String, default: "classification", description: 'Type of model (classification or regression)'}
 outputs:
-  - {name: processed_file, type: Data, description: "Processed dataset saved as Parquet"}
-  - {name: preview_file, type: Data, description: "Top-N preview saved as JSON"}
-  - {name: schema_file, type: Data, description: "Schema (columns -> dtypes) saved as JSON"}
-  - {name: row_count, type: Data, description: "File containing the row count (plain text)"}
+  - {name: train_set, type: Data}
+  - {name: test_x, type: Data}
+  - {name: test_y, type: Data}
 implementation:
   container:
-    image: python:3.10-slim
+    image: kumar2004/ml-base:v1
     command:
       - python3
       - -u
       - -c
       - |
-        import argparse
-        import os
-        import sys
-        import json
-        import traceback
-        import subprocess
-        import io
-        import gzip
-        import zipfile
-
-        try:
-            import pandas as pd
-        except Exception:
-            print("Installing pandas and common engines...", file=sys.stderr)
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "pandas", "pyarrow", "openpyxl", "fastparquet"])
-            import pandas as pd
-
+        import argparse, os, pandas as pd, numpy as np, requests
+        from sklearn.model_selection import train_test_split
         parser = argparse.ArgumentParser()
-        parser.add_argument('--in_file', type=str, required=True)
-        parser.add_argument('--preview_rows', type=str, default="20")
-        parser.add_argument('--processed_file', type=str, required=True)
-        parser.add_argument('--preview_file', type=str, required=True)
-        parser.add_argument('--schema_file', type=str, required=True)
-        parser.add_argument('--row_count', type=str, required=True)
+        parser.add_argument('--cdn_url', type=str, required=True)
+        parser.add_argument('--split_size', type=float, default=15)
+        parser.add_argument('--target_column', type=str, required=True)
+        parser.add_argument('--model_type', type=str, default="classification")
+        parser.add_argument('--train_set', type=str, required=True)
+        parser.add_argument('--test_x', type=str, required=True)
+        parser.add_argument('--test_y', type=str, required=True)
         args = parser.parse_args()
-
-        def makedirs_for(path):
-            if not path:
-                return
-            d = os.path.dirname(path)
-            if d and not os.path.exists(d):
-                os.makedirs(d, exist_ok=True)
-
-        def sample_file_bytes(path, n=8192):
-            try:
-                with open(path, "rb") as fh:
-                    return fh.read(n)
-            except Exception:
-                return b""
-
-        def check_if_json_content(sample_bytes):
-            if not sample_bytes:
-                return False
-            try:
-                txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
-            except Exception:
-                return False
-            
-            if len(txt) == 0:
-                return False
-            
-            first_char = txt[0]
-            if first_char in ('{', '['):
-                return True
-            
-            if chr(10) + '{' in txt or chr(10) + '[' in txt:
-                return True
-            
-            return False
-
-        def load_dataframe_from_file(path):
-            if os.path.isdir(path):
-                entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
-                if not entries:
-                    raise ValueError("Input directory is empty: " + path)
-                
-                files = [p for p in entries if os.path.isfile(p)]
-                if not files:
-                    raise ValueError("No regular files inside directory: " + path)
-                
-                if len(files) == 1:
-                    path = files[0]
-                else:
-                    path = max(files, key=lambda p: os.path.getsize(p))
-                print("Info: in_file was a directory - selected candidate file: " + path)
-
-            if not os.path.exists(path) or not os.path.isfile(path):
-                raise ValueError("Input path not found or not a file: " + path)
-
-            ext = os.path.splitext(path)[1].lower()
-
-            if ext in (".gz",) or path.endswith(".csv.gz") or path.endswith(".json.gz"):
-                try:
-                    with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
-                        sample = fh.read(8192)
-                        fh.seek(0)
-                        if check_if_json_content(sample.encode() if isinstance(sample, str) else sample):
-                            fh.seek(0)
-                            try:
-                                return pd.read_json(fh, lines=True)
-                            except Exception:
-                                fh.seek(0)
-                                return pd.read_csv(fh)
-                        else:
-                            fh.seek(0)
-                            return pd.read_csv(fh)
-                except Exception as e:
-                    pass
-
-            if ext == ".zip":
-                with zipfile.ZipFile(path, "r") as z:
-                    names = [n for n in z.namelist() if not n.endswith("/")]
-                    if not names:
-                        raise ValueError("No files inside zip archive: " + path)
-                    member = max(names, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
-                    with z.open(member) as fh:
-                        sample = fh.read(8192)
-                        if check_if_json_content(sample):
-                            with z.open(member) as fh2:
-                                return pd.read_json(io.TextIOWrapper(fh2, encoding="utf-8"), lines=True)
-                        else:
-                            with z.open(member) as fh2:
-                                return pd.read_csv(io.TextIOWrapper(fh2, encoding="utf-8"))
-
-            try:
-                if ext == ".csv":
-                    return pd.read_csv(path)
-                if ext in (".tsv", ".tab"):
-                    return pd.read_csv(path, sep="\t")
-                if ext in (".json", ".ndjson", ".jsonl"):
-                    try:
-                        return pd.read_json(path, lines=True)
-                    except ValueError:
-                        return pd.read_json(path)
-                if ext in (".xls", ".xlsx"):
-                    return pd.read_excel(path)
-                if ext in (".parquet", ".pq"):
-                    return pd.read_parquet(path, engine="auto")
-                if ext == ".feather":
-                    return pd.read_feather(path)
-                if ext == ".orc":
-                    return pd.read_orc(path)
-            except Exception:
-                pass
-
-            sample = sample_file_bytes(path, n=8192)
-            if check_if_json_content(sample):
-                try:
-                    return pd.read_json(path, lines=True)
-                except Exception:
-                    pass
-            
-            try:
-                return pd.read_csv(path)
-            except Exception:
-                pass
-
-            raise ValueError("Unsupported or unreadable file format for automatic loading: " + path)
-
-        try:
-            in_path = args.in_file
-            preview_rows = int(str(args.preview_rows))
-            processed_out = args.processed_file
-            preview_out = args.preview_file
-            schema_out = args.schema_file
-            row_count_out = args.row_count
-
-            if os.path.isdir(in_path):
-                entries = [os.path.join(in_path, f) for f in os.listdir(in_path) if not f.startswith(".")]
-                if not entries:
-                    print("ERROR: input directory is empty: " + in_path, file=sys.stderr)
-                    sys.exit(1)
-                files = [p for p in entries if os.path.isfile(p)]
-                if not files:
-                    print("ERROR: no regular files inside directory: " + in_path, file=sys.stderr)
-                    sys.exit(1)
-                if len(files) == 1:
-                    selected = files[0]
-                else:
-                    selected = max(files, key=lambda p: os.path.getsize(p))
-                print("Detected directory input; selected file: " + selected)
-                in_path = selected
-
-            if not os.path.exists(in_path):
-                print("ERROR: input file does not exist: " + in_path, file=sys.stderr)
-                sys.exit(1)
-
-            print("Loading file: " + in_path)
-            df = load_dataframe_from_file(in_path)
-            print("Loaded DataFrame: rows=" + str(len(df)) + ", cols=" + str(len(df.columns)))
-
-            makedirs_for(processed_out)
-            makedirs_for(preview_out)
-            makedirs_for(schema_out)
-            makedirs_for(row_count_out)
-
-            df.to_parquet(processed_out, index=False)
-            print("Wrote processed parquet: " + processed_out)
-
-            preview_df = df.head(max(1, preview_rows))
-            preview_df.to_json(preview_out, orient="records", indent=2, force_ascii=False)
-            print("Wrote preview json: " + preview_out)
-
-            schema = { str(c): str(t) for c, t in zip(df.columns, df.dtypes) }
-            with open(schema_out, "w", encoding="utf-8") as fh:
-                json.dump({"columns": schema}, fh, indent=2, ensure_ascii=False)
-            print("Wrote schema json: " + schema_out)
-
-            with open(row_count_out, "w", encoding="utf-8") as fh:
-                fh.write(str(len(df)))
-            print("Wrote row count: " + row_count_out)
-
-            print("SUCCESS: All artifacts produced.")
-        except Exception as exc:
-            print("ERROR during Load Data into Pandas: " + str(exc), file=sys.stderr)
-            traceback.print_exc()
-            sys.exit(1)
+        print("===== DOWNLOADING DATA FROM CDN =====")
+        resp = requests.get(args.cdn_url, timeout=30)
+        resp.raise_for_status()
+        tmp_path = "temp_downloaded_file"
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
+        if args.cdn_url.endswith(".parquet"):
+            df = pd.read_parquet(tmp_path)
+        elif args.cdn_url.endswith(".csv"):
+            df = pd.read_csv(tmp_path)
+        elif args.cdn_url.endswith(".json"):
+            df = pd.read_json(tmp_path)
+        else:
+            raise ValueError("Unsupported file format. Must be .csv, .json, or .parquet")
+        print("===== FULL DATAFRAME SUMMARY =====")
+        print("Shape:", df.shape)
+        print("DF_HEAD:")
+        print(df.head().to_string())
+        print("DF_INFO:")
+        df.info()
+        print("DF_DTYPES:")
+        print(df.dtypes.to_string())
+        print("DF_NULL_COUNTS:")
+        print(df.isnull().sum().to_string())
+        if args.target_column in df.columns:
+            target_values = df[args.target_column].copy()
+        else:
+            print(f"WARNING: Target column '{args.target_column}' not found. Creating dummy column.")
+            target_values = pd.Series(np.zeros(len(df)), index=df.index, name=args.target_column)
+        if args.model_type.lower() == "classification":
+            print("===== TARGET VARIABLE DISTRIBUTION =====")
+            print(target_values.value_counts(dropna=False).to_string())
+            print("Unique classes:", target_values.nunique())
+        else:
+            print("Model type is regression — skipping target distribution summary.")
+        split_size_input = float(args.split_size)
+        test_size = split_size_input / 100.0 if split_size_input >= 1.0 else split_size_input
+        if not (0.0 < test_size < 1.0):
+            raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
+        stratify_param = target_values if args.model_type.lower() == "classification" and target_values.nunique() > 1 else None
+        train_df, test_df, train_y, test_y = train_test_split(df, target_values, test_size=test_size, random_state=42, stratify=stratify_param)
+        test_x_df = test_df.drop(columns=[args.target_column], errors="ignore")
+        train_set_df = train_df.copy()
+        test_y_df = pd.DataFrame({args.target_column: test_y})
+        print("===== TRAIN SET =====")
+        print("Shape:", train_set_df.shape)
+        print(train_set_df.head(3).to_string())
+        print("===== TEST X =====")
+        print("Shape:", test_x_df.shape)
+        print(test_x_df.head(3).to_string())
+        print("===== TEST Y =====")
+        print("Shape:", test_y_df.shape)
+        print(test_y_df.head(10).to_string(index=False))
+        os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
+        train_set_df.to_parquet(args.train_set, index=False)
+        os.makedirs(os.path.dirname(args.test_x) or ".", exist_ok=True)
+        test_x_df.to_parquet(args.test_x, index=False)
+        os.makedirs(os.path.dirname(args.test_y) or ".", exist_ok=True)
+        test_y_df.to_parquet(args.test_y, index=False)
     args:
-      - --in_file
-      - {inputPath: in_file}
-      - --preview_rows
-      - {inputValue: preview_rows}
-      - --processed_file
-      - {outputPath: processed_file}
-      - --preview_file
-      - {outputPath: preview_file}
-      - --schema_file
-      - {outputPath: schema_file}
-      - --row_count
-      - {outputPath: row_count}
+      - --cdn_url
+      - {inputValue: cdn_url}
+      - --split_size
+      - {inputValue: split_size}
+      - --target_column
+      - {inputValue: target_column}
+      - --model_type
+      - {inputValue: model_type}
+      - --train_set
+      - {outputPath: train_set}
+      - --test_x
+      - {outputPath: test_x}
+      - --test_y
+      - {outputPath: test_y}
