@@ -1,4 +1,4 @@
-name: Train Logistic or Linear v3
+name: Train Logistic or Linear v4
 description: |
   Reads X and y from parquet, trains LogisticRegression for classification or LinearRegression for regression.
   Supports class imbalance when enbalance=true for classification.
@@ -206,7 +206,7 @@ implementation:
 
                 lr = LogisticRegression(
                     max_iter=int(args.max_iter),
-                    multi_class='multinomial',
+                    multi_class='auto',
                     C=float(args.C),
                     penalty=penalty_arg,
                     solver=solver,
