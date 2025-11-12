@@ -1,6 +1,6 @@
 name: Advanced Preprocess v8.2.3
 description: |
-  End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target.
+  End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target....
   Rules:
   - Do not preprocess the target column.
   - If model_type is classification and target is categorical or string-like, apply label encoding.
@@ -312,13 +312,13 @@ implementation:
             s = ser.astype(str).fillna("")
             
             # Check for word count, string length, numeric fraction, unique ratio, and alphabetic ratio
-            word_cnt_med = s.str.count(r"\b\w+\b").median()
+            word_cnt_med = s.str.count(r"\\b\\w+\\b").median()
             len_med = s.str.len().median()
             numeric_frac = pd.to_numeric(s, errors="coerce").notna().mean()  # Fraction of non-numeric values
             uniq_ratio = ser.nunique(dropna=True) / max(len(ser), 1)  # Unique value ratio
             alpha_len = s.str.replace(r"[^A-Za-z]", "", regex=True).str.len()  # Length of alphabetic characters only
             alpha_ratio_med = (alpha_len / s.str.len().replace(0, 1)).median()  # Ratio of alphabetic length to total length
-            tokens = s.str.findall(r"\b\w+\b")  # Tokenizing the string
+            tokens = s.str.findall(r"\\b\\w+\\b")  # Tokenizing the string
             long_token_cnt_med = tokens.map(lambda ts: sum(len(t) >= 10 for t in ts)).median()  # Count of long tokens
         
             # Check conditions for being considered as text
