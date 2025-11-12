@@ -1,6 +1,6 @@
 name: Advanced Preprocess v8.2.3
 description: |
-  End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target....
+  End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target
   Rules:
   - Do not preprocess the target column.
   - If model_type is classification and target is categorical or string-like, apply label encoding.
@@ -343,7 +343,7 @@ implementation:
         
             def fit(self, X):
                 if self.text_cols is None or len(self.text_cols) == 0:
-                    self.text_cols = [c for c in X.columns if (X[c].dtype == 'object' or pd.api.types.is_string_dtype(X[c])) and self._should_textify(X[c])]
+                    self.text_cols = [c for c in X.columns if (X[c].dtype == 'object' or pd.api.types.is_string_dtype(X[c])) and _should_textify(X[c])]
                 
                 for col in self.text_cols:
                     s = X[col].astype(str).fillna("")  # Ensure that missing data is filled
