@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.2
+name: Advanced Preprocess v8.3.3
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target
   Rules:
@@ -276,35 +276,25 @@ implementation:
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True, model_type='classification'):
             n=len(series); nunique=series.nunique(dropna=True); high_card=(nunique>max(50,0.05*n))
             
-            # Use advanced encoders for both high and low cardinality
+            # SAFE ENCODING: Never use target encoding to prevent data leakage
             if high_card:
-                if target_series is not None and train_mode and model_type == 'classification':
-                    enc=ce.TargetEncoder(cols=[col], smoothing=0.3); return 'target', enc, {}
-                else:
-                    return 'count', None, {}
+                # High cardinality: use count encoding or hash encoding
+                return 'count', None, {}
             else:
-                if nunique<=10:
-                    enc=OneHotEncoder(sparse_output=False, handle_unknown='ignore'); return 'onehot', enc, {}
-                elif target_series is not None and train_mode and model_type == 'classification':
-                    # Use target encoding for medium cardinality in classification
-                    enc=ce.TargetEncoder(cols=[col], smoothing=0.3); return 'target', enc, {}
-                else:
-                    # Use count encoding as fallback
+                # Low/Medium cardinality
+                if nunique <= 2:
+                    # Binary: use label encoding (safe)
+                    return 'ordinal', None, {}
+                elif nunique <= 10:
+                    # Low cardinality: use one-hot encoding
+                    enc=OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                    return 'onehot', enc, {}
+                elif nunique <= 50:
+                    # Medium cardinality: use count encoding (safer than target)
                     return 'count', None, {}
-
-        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
-            X_col=df[col].astype(object).fillna('__NA__'); global_mean=y.mean()
-            oof=pd.Series(index=df.index, dtype=float)
-            from sklearn.model_selection import KFold
-            kf=KFold(n_splits=min(n_splits,max(2,len(df)//10)), shuffle=True, random_state=random_state)
-            for tr_idx, val_idx in kf.split(df):
-                means=y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
-                oof.iloc[val_idx]=X_col.iloc[val_idx].map(lambda v: means.get(v, global_mean))
-            counts=X_col.value_counts(); smooth_map={}
-            for cat,cnt in counts.items():
-                cat_mean=y[X_col==cat].mean() if cnt>0 else global_mean
-                alpha=cnt/(cnt+smoothing); smooth_map[cat]=alpha*cat_mean+(1-alpha)*global_mean
-            return oof.fillna(global_mean), smooth_map, float(global_mean)
+                else:
+                    # Fallback to count encoding
+                    return 'count', None, {}
 
         class Preprocessor:
             def __init__(self):
@@ -345,19 +335,19 @@ implementation:
                     cfg['missing_frac']=float(s.isna().mean())
                     cfg['high_card']=cfg['n_unique']>max(50,0.05*nrows)
                     cfg['rare_threshold_frac']=self.global_metadata['config'].get('rare_threshold',0.01)
-                    enc_name,enc_obj,_=choose_categorical_encoder(c,s,(y if y is not None else None),train_mode=(y is not None), model_type=model_type)
-                    cfg['encoder_type']=enc_name; cfg['encoder_obj']=enc_obj
+                    enc_name,enc_obj,_=choose_categorical_encoder(c, s, target_series=None, train_mode=True, model_type=model_type)
+                    cfg['encoder_type']=enc_name
+                    cfg['encoder_obj']=enc_obj
                     self.col_config[c]=cfg
                     
                 # Fit target encoders if classification
                 if y is not None and model_type == 'classification':
                     for c in self.cat_cols:
                         cfg=self.col_config[c]
-                        if cfg['encoder_type']=='target':
-                            _, mapping, global_mean = fit_target_encoder_kfold(df, c, y, n_splits=5)
-                            cfg['target_mapping']=mapping; cfg['target_global_mean']=float(global_mean)
-                        elif cfg['encoder_type']=='count':
-                            counts=df[c].astype(object).value_counts().to_dict(); cfg['count_map']=counts
+                        if cfg['encoder_type']=='count':
+                            # Count encoding: compute frequency map
+                            counts=df[c].astype(object).value_counts().to_dict()
+                            cfg['count_map']=counts
                             
                 self.global_metadata['num_cols']=self.num_cols; self.global_metadata['cat_cols']=self.cat_cols
                 return self
@@ -474,13 +464,14 @@ implementation:
                         except Exception: df[c]=df[c].astype('category').cat.codes.astype(float)
                     elif enc_type=='count':
                         cnt_map=cfg.get('count_map', df[c].value_counts().to_dict())
-                        df[c]=df[c].map(lambda x: cnt_map.get(x,0))
-                    elif enc_type=='target':
-                        mapping=cfg.get('target_mapping',{}); global_mean=cfg.get('target_global_mean',0.0)
-                        df[c]=df[c].map(lambda x: mapping.get(x, global_mean))
-                    else:
+                        # Map to frequency counts, use 0 for unseen categories
+                        df[c]=df[c].map(lambda x: cnt_map.get(x, 0)).astype(float)
+                    elif enc_type=='ordinal':
+                        # Simple ordinal encoding for binary/low cardinality
                         df[c]=df[c].astype('category').cat.codes.replace({-1:np.nan}).astype(float)
-
+                    else:
+                        # Fallback: convert to category codes
+                        df[c]=df[c].astype('category').cat.codes.replace({-1:np.nan}).astype(float)
                 for c in list(df.columns):
                     if df[c].dtype=='object':
                         try: df[c]=pd.to_numeric(df[c], errors='coerce')
