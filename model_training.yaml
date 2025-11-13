@@ -1,6 +1,6 @@
-name: Train KNN v1.1
+name: Train RandomForest v1.1
 description: |
-  Reads X and y from parquet, trains KNeighborsClassifier for classification or KNeighborsRegressor for regression.
+  Reads X and y from parquet, trains RandomForestClassifier for classification or RandomForestRegressor for regression.
   Assumes y is already encoded from preprocessing (no re-encoding needed).
   Supports class imbalance when enbalance=true for classification.
   Saves trained model and training metrics.
@@ -12,10 +12,9 @@ inputs:
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
-  - {name: n_neighbors, type: Integer, description: "Number of neighbors for KNN", optional: true, default: "5"}
-  - {name: weights, type: String, description: "Weight function: uniform or distance", optional: true, default: "uniform"}
-  - {name: metric, type: String, description: "Distance metric: euclidean, manhattan, minkowski", optional: true, default: "euclidean"}
-  - {name: algorithm, type: String, description: "Algorithm: auto, ball_tree, kd_tree, brute", optional: true, default: "auto"}
+  - {name: n_estimators, type: Integer, description: "Number of trees in the RandomForest", optional: true, default: "150"}
+  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: ""}
+  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
   - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
@@ -33,7 +32,7 @@ implementation:
         import pandas as pd, numpy as np
         import joblib
 
-        from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
         from sklearn.preprocessing import LabelEncoder
         from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
         from sklearn.utils.class_weight import compute_sample_weight
@@ -69,27 +68,22 @@ implementation:
         ap.add_argument('--enbalance', type=str, default="true")
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
-        ap.add_argument('--n_neighbors', type=int, default=5)
-        ap.add_argument('--weights', type=str, default="uniform")
-        ap.add_argument('--metric', type=str, default="euclidean")
-        ap.add_argument('--algorithm', type=str, default="auto")
+        ap.add_argument('--n_estimators', type=int, default=100)
+        ap.add_argument('--max_depth', type=str, default="")
+        ap.add_argument('--random_state', type=int, default=42)
         ap.add_argument('--model_pickle', type=str, required=True)
         ap.add_argument('--metrics_json', type=str, required=True)
         args = ap.parse_args()
 
         try:
             print("="*80)
-            print("TRAINING STARTED")
+            print("TRAINING STARTED (RandomForest)")
             print("="*80)
             
-            print(f"[INFO] Loading X from: {args.X_data}")
             X = load_parquet_df(args.X_data)
             print(f"[INFO] X shape: {X.shape}")
 
-            print(f"[INFO] Loading y from: {args.y_data}")
             y_df = load_parquet_df(args.y_data)
-
-            # Extract target column
             if isinstance(y_df, pd.DataFrame):
                 if y_df.shape[1] == 1 and not args.target_column:
                     y = y_df.iloc[:, 0].copy()
@@ -98,131 +92,83 @@ implementation:
                     col = args.target_column.strip()
                     if not col:
                         raise ValueError(f"y parquet has {y_df.shape[1]} columns. Provide --target_column. Available: {list(y_df.columns)}")
-                    if col not in y_df.columns:
-                        raise ValueError(f"target_column '{col}' not found in y parquet. Available: {list(y_df.columns)}")
                     y = y_df[col].copy()
             else:
                 y = pd.Series(y_df).copy()
 
-            print(f"[INFO] y length: {len(y)}")
-            print(f"[INFO] y dtype: {y.dtype}")
-            print(f"[INFO] y unique values: {sorted(y.unique())}")
-            print(f"[INFO] y sample: {y.head(10).tolist()}")
-
-            # Align X and y
             if len(X) != len(y):
                 print(f"[WARN] Length mismatch: X={len(X)}, y={len(y)}")
                 common_idx = X.index.intersection(y.index)
                 if len(common_idx) > 0:
-                    print(f"[INFO] Aligning by index to {len(common_idx)} rows")
                     X = X.loc[common_idx].sort_index()
                     y = y.loc[common_idx].sort_index()
                 else:
                     m = min(len(X), len(y))
-                    print(f"[WARN] No common index; aligning by position to {m} rows")
                     X = X.reset_index(drop=True).iloc[:m, :]
                     y = y.reset_index(drop=True).iloc[:m]
 
             task = args.model_type.strip().lower()
             metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1])}
 
+            max_depth = None if args.max_depth.strip() in ("", "none", "null") else int(args.max_depth)
+
             if task == "classification":
                 print("[INFO] Classification task detected")
-                
-                # Load metadata for reference only (not for re-encoding)
+
                 meta = try_load_metadata(args.preprocess_metadata)
-                label_mapping = None
-                
-                if meta is not None:
-                    label_mapping = meta.get("label_mapping", None)
-                    if label_mapping:
-                        print(f"[INFO] Label mapping found in metadata: {label_mapping}")
-                        print("[INFO] y is already encoded from preprocessing, no re-encoding needed")
-                
-                # y should already be encoded as integers from preprocessing
-                # Just ensure it's the right type
+                label_mapping = meta.get("label_mapping") if meta else None
+
                 try:
                     y_prepared = pd.Series(y).astype(int)
                     map_info = {"mode": "already_encoded", "label_mapping_reference": label_mapping}
-                    print(f"[INFO] y successfully loaded as integers (already encoded)")
-                except (ValueError, TypeError) as e:
-                    print(f"[WARN] Could not convert y to int: {e}")
-                    print("[WARN] Attempting LabelEncoder as fallback")
+                except Exception:
                     le = LabelEncoder()
                     y_prepared = pd.Series(le.fit_transform(y.astype(str)), index=y.index)
                     map_info = {"mode": "label_encoder_fallback", "classes": le.classes_.tolist()}
 
-                # Remove any NaN values
                 valid_mask = y_prepared.notna()
                 if not valid_mask.all():
                     dropped = int((~valid_mask).sum())
-                    print(f"[WARN] Dropping {dropped} rows with invalid target values")
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_prepared = y_prepared[valid_mask].reset_index(drop=True)
+                    print(f"[WARN] Dropped {dropped} invalid rows")
 
-                print(f"[INFO] Final y unique values: {sorted(y_prepared.unique())}")
-                print(f"[INFO] Final y value counts:{y_prepared.value_counts().sort_index().to_dict()}")
-
-                # Handle class imbalance
                 sample_weight = None
                 if bool_from_str(args.enbalance):
-                    print("[INFO] Computing sample weights for class imbalance")
+                    print("[INFO] Computing sample weights for imbalance")
                     try:
                         sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
-                        print(f"[INFO] Sample weight range: {sample_weight.min():.4f} - {sample_weight.max():.4f}")
                     except Exception as e:
                         print(f"[WARN] Could not compute sample weights: {e}")
 
-                # Train KNN Classifier
-                n_neighbors = min(int(args.n_neighbors), len(X) - 1)
-                n_neighbors = max(1, n_neighbors)  # At least 1 neighbor
-                print(f"[INFO] Training KNeighborsClassifier with n_neighbors={n_neighbors}")
-                
-                knn = KNeighborsClassifier(
-                    n_neighbors=n_neighbors,
-                    weights=args.weights.strip().lower(),
-                    algorithm=args.algorithm.strip().lower(),
-                    metric=args.metric.strip().lower(),
-                    n_jobs=-1
+                print(f"[INFO] Training RandomForestClassifier with {args.n_estimators} trees")
+                clf = RandomForestClassifier(
+                    n_estimators=int(args.n_estimators),
+                    max_depth=max_depth,
+                    random_state=int(args.random_state),
+                    n_jobs=-1,
+                    class_weight='balanced' if bool_from_str(args.enbalance) else None
                 )
+                clf.fit(X, y_prepared, sample_weight=sample_weight)
 
-                knn.fit(X, y_prepared)
-                print("[INFO] Model training complete")
-
-                # Evaluate on training data
-                y_pred = knn.predict(X)
-                acc = float(accuracy_score(y_prepared, y_pred))
-                prec = float(precision_score(y_prepared, y_pred, average='weighted', zero_division=0))
-                rec = float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0))
-                f1 = float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0))
-
+                y_pred = clf.predict(X)
                 metrics.update({
-                    "accuracy_train": acc,
-                    "precision_train": prec,
-                    "recall_train": rec,
-                    "f1_train": f1,
-                    "n_neighbors": n_neighbors,
-                    "weights": args.weights,
-                    "metric": args.metric,
+                    "accuracy_train": float(accuracy_score(y_prepared, y_pred)),
+                    "precision_train": float(precision_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                    "recall_train": float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                    "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                    "n_estimators": int(args.n_estimators),
+                    "max_depth": max_depth,
                     "balanced": bool_from_str(args.enbalance),
                     "label_info": map_info
                 })
 
-                print("[INFO] Training Metrics:")
-                print(f"  Accuracy: {acc:.6f}")
-                print(f"  Precision: {prec:.6f}")
-                print(f"  Recall: {rec:.6f}")
-                print(f"  F1 Score: {f1:.6f}")
-
-                model_obj = knn
+                model_obj = clf
 
             elif task == "regression":
                 print("[INFO] Regression task detected")
-                
-                # Convert to numeric
+
                 y_num = pd.to_numeric(y, errors="coerce")
-                
-                # Drop non-numeric values
                 valid_mask = y_num.notna()
                 if not valid_mask.all():
                     dropped = int((~valid_mask).sum())
@@ -230,70 +176,44 @@ implementation:
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_num = y_num[valid_mask].reset_index(drop=True)
 
-                print(f"[INFO] y statistics: min={y_num.min():.4f}, max={y_num.max():.4f}, mean={y_num.mean():.4f}")
-
-                # Train KNN Regressor
-                n_neighbors = min(int(args.n_neighbors), len(X) - 1)
-                n_neighbors = max(1, n_neighbors)
-                print(f"[INFO] Training KNeighborsRegressor with n_neighbors={n_neighbors}")
-                
-                knn = KNeighborsRegressor(
-                    n_neighbors=n_neighbors,
-                    weights=args.weights.strip().lower(),
-                    algorithm=args.algorithm.strip().lower(),
-                    metric=args.metric.strip().lower(),
+                print(f"[INFO] Training RandomForestRegressor with {args.n_estimators} trees")
+                reg = RandomForestRegressor(
+                    n_estimators=int(args.n_estimators),
+                    max_depth=max_depth,
+                    random_state=int(args.random_state),
                     n_jobs=-1
                 )
+                reg.fit(X, y_num)
 
-                knn.fit(X, y_num)
-                print("[INFO] Model training complete")
-
-                # Evaluate on training data
-                y_pred = knn.predict(X)
-                r2 = float(r2_score(y_num, y_pred))
-                rmse = float(np.sqrt(mean_squared_error(y_num, y_pred)))
-                mae = float(mean_absolute_error(y_num, y_pred))
-
+                y_pred = reg.predict(X)
                 metrics.update({
-                    "r2_train": r2,
-                    "rmse_train": rmse,
-                    "mae_train": mae,
-                    "n_neighbors": n_neighbors,
-                    "weights": args.weights,
-                    "metric": args.metric
+                    "r2_train": float(r2_score(y_num, y_pred)),
+                    "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
+                    "mae_train": float(mean_absolute_error(y_num, y_pred)),
+                    "n_estimators": int(args.n_estimators),
+                    "max_depth": max_depth
                 })
 
-                print("[INFO] Training Metrics:")
-                print(f"  R² Score: {r2:.6f}")
-                print(f"  RMSE: {rmse:.6f}")
-                print(f"  MAE: {mae:.6f}")
+                model_obj = reg
 
-                model_obj = knn
             else:
-                raise ValueError(f"Unsupported model_type '{args.model_type}'. Use 'classification' or 'regression'.")
+                raise ValueError(f"Unsupported model_type '{args.model_type}'")
 
-            # Save model
-            print(f"[INFO] Saving model to: {args.model_pickle}")
             ensure_dir_for(args.model_pickle)
             joblib.dump(model_obj, args.model_pickle)
 
-            # Save metrics
-            print(f"[INFO] Saving metrics to: {args.metrics_json}")
             ensure_dir_for(args.metrics_json)
             with open(args.metrics_json, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
             print("="*80)
-            print(f"SUCCESS: Trained {task} model")
-            print(f"Metrics: {json.dumps(metrics, indent=2)}")
+            print("SUCCESS: RandomForest training completed")
+            print(json.dumps(metrics, indent=2))
             print("="*80)
-            
+
         except Exception as e:
             print("="*80, file=sys.stderr)
             print("ERROR DURING TRAINING", file=sys.stderr)
-            print("="*80, file=sys.stderr)
-            print(f"Error: {e}", file=sys.stderr)
-            print("Full traceback:", file=sys.stderr)
             traceback.print_exc()
             print("="*80, file=sys.stderr)
             sys.exit(1)
@@ -311,14 +231,12 @@ implementation:
       - {inputValue: target_column}
       - --preprocess_metadata
       - {inputPath: preprocess_metadata}
-      - --n_neighbors
-      - {inputValue: n_neighbors}
-      - --weights
-      - {inputValue: weights}
-      - --metric
-      - {inputValue: metric}
-      - --algorithm
-      - {inputValue: algorithm}
+      - --n_estimators
+      - {inputValue: n_estimators}
+      - --max_depth
+      - {inputValue: max_depth}
+      - --random_state
+      - {inputValue: random_state}
       - --model_pickle
       - {outputPath: model_pickle}
       - --metrics_json
