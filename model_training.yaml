@@ -1,6 +1,6 @@
-name: Train RandomForest v1.3
+name: Train GradientBoosting v1.0
 description: |
-  Reads X and y from parquet, trains RandomForestClassifier for classification or RandomForestRegressor for regression.
+  Reads X and y from parquet, trains a gradient boosting classifier or regressor.
   Assumes y is already encoded from preprocessing (no re-encoding needed).
   Supports class imbalance when enbalance=true for classification.
   Prints target variable distribution before training.
@@ -13,8 +13,9 @@ inputs:
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
-  - {name: n_estimators, type: Integer, description: "Number of trees in the RandomForest", optional: true, default: "100"}
-  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: "20"}
+  - {name: n_estimators, type: Integer, description: "Number of boosting iterations (trees)", optional: true, default: "100"}
+  - {name: learning_rate, type: Number, description: "Learning rate for boosting", optional: true, default: "0.1"}
+  - {name: max_depth, type: Integer, description: "Maximum depth of individual trees (None for automatic)", optional: true, default: "6"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
@@ -32,13 +33,11 @@ implementation:
         import argparse, os, sys, json, traceback
         import pandas as pd, numpy as np
         import joblib
-        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+        from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
         from sklearn.preprocessing import LabelEncoder
         from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
         from sklearn.utils.class_weight import compute_sample_weight
         from sklearn.model_selection import cross_val_score
-        from sklearn.ensemble import GradientBoostingClassifier as GBClassifier
-        from sklearn.ensemble import GradientBoostingRegressor as GBRegressor
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
@@ -72,6 +71,7 @@ implementation:
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
         ap.add_argument('--n_estimators', type=int, default=100)
+        ap.add_argument('--learning_rate', type=float, default=0.1)
         ap.add_argument('--max_depth', type=str, default="")
         ap.add_argument('--random_state', type=int, default=42)
         ap.add_argument('--model_pickle', type=str, required=True)
@@ -80,7 +80,7 @@ implementation:
 
         try:
             print("="*80)
-            print("TRAINING STARTED (RandomForest)")
+            print("TRAINING STARTED (Gradient Boosting - HistGradientBoosting)")
             print("="*80)
             
             X = load_parquet_df(args.X_data)
@@ -121,6 +121,8 @@ implementation:
             metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1])}
 
             max_depth = None if args.max_depth.strip() in ("", "none", "null") else int(args.max_depth)
+            # HistGradientBoosting uses max_iter for number of boosting iterations - map n_estimators -> max_iter
+            max_iter = int(args.n_estimators)
 
             if task == "classification":
                 print("[INFO] Classification task detected")
@@ -150,12 +152,12 @@ implementation:
                     except Exception as e:
                         print(f"[WARN] Could not compute sample weights: {e}")
 
-                print(f"[INFO] Training RandomForestClassifier with {args.n_estimators} trees")
-                clf = GBClassifier(
-                    max_iter=100,
-                    max_depth=6,
-                    learning_rate=0.1,
-                    random_state=50
+                print(f"[INFO] Training HistGradientBoostingClassifier with max_iter={max_iter}, learning_rate={args.learning_rate}")
+                clf = HistGradientBoostingClassifier(
+                    max_iter=max_iter,
+                    learning_rate=args.learning_rate,
+                    max_depth=max_depth,
+                    random_state=args.random_state
                 )
 
                 print("[INFO] Running 5-fold cross-validation to check for overfitting...")
@@ -172,6 +174,7 @@ implementation:
                     "recall_train": float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "n_estimators": int(args.n_estimators),
+                    "learning_rate": float(args.learning_rate),
                     "max_depth": max_depth,
                     "balanced": bool_from_str(args.enbalance),
                     "label_info": map_info
@@ -190,12 +193,12 @@ implementation:
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_num = y_num[valid_mask].reset_index(drop=True)
 
-                print(f"[INFO] Training RandomForestRegressor with {args.n_estimators} trees")
-                reg = GBRegressor(
-                    max_iter=100,
-                    max_depth=6,
-                    learning_rate=0.1,
-                    random_state=50
+                print(f"[INFO] Training HistGradientBoostingRegressor with max_iter={max_iter}, learning_rate={args.learning_rate}")
+                reg = HistGradientBoostingRegressor(
+                    max_iter=max_iter,
+                    learning_rate=args.learning_rate,
+                    max_depth=max_depth,
+                    random_state=args.random_state
                 )
                 reg.fit(X, y_num)
 
@@ -205,6 +208,7 @@ implementation:
                     "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
                     "mae_train": float(mean_absolute_error(y_num, y_pred)),
                     "n_estimators": int(args.n_estimators),
+                    "learning_rate": float(args.learning_rate),
                     "max_depth": max_depth
                 })
 
@@ -221,7 +225,7 @@ implementation:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
             print("="*80)
-            print("SUCCESS: RandomForest training completed")
+            print("SUCCESS: Gradient Boosting training completed")
             print(json.dumps(metrics, indent=2))
             print("="*80)
 
@@ -247,6 +251,8 @@ implementation:
       - {inputPath: preprocess_metadata}
       - --n_estimators
       - {inputValue: n_estimators}
+      - --learning_rate
+      - {inputValue: learning_rate}
       - --max_depth
       - {inputValue: max_depth}
       - --random_state
