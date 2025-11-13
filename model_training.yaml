@@ -14,7 +14,7 @@ inputs:
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
   - {name: n_estimators, type: Integer, description: "Number of boosting iterations (trees)", optional: true, default: "100"}
-  - {name: learning_rate, type: Number, description: "Learning rate for boosting", optional: true, default: "0.1"}
+  - {name: learning_rate, type: Float, description: "Learning rate for boosting", optional: true, default: "0.1"}
   - {name: max_depth, type: Integer, description: "Maximum depth of individual trees (None for automatic)", optional: true, default: "6"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
