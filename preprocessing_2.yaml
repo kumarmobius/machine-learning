@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.3
+name: Advanced Preprocess v8.3.4
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target
   Rules:
@@ -55,6 +55,7 @@ implementation:
         from rapidfuzz import process as rf_process, fuzz as rf_fuzz
         import gzip, cloudpickle
         from sklearn.inspection import permutation_importance
+        from sklearn.model_selection import StratifiedKFold
         
         # helpers
         def ensure_dir_for(p):
@@ -274,27 +275,73 @@ implementation:
             return StandardScaler()
 
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True, model_type='classification'):
-            n=len(series); nunique=series.nunique(dropna=True); high_card=(nunique>max(50,0.05*n))
+            n = len(series)
+            nunique = series.nunique(dropna=True)
+            high_card = (nunique > max(50, 0.05 * n))
             
-            # SAFE ENCODING: Never use target encoding to prevent data leakage
-            if high_card:
-                # High cardinality: use count encoding or hash encoding
-                return 'count', None, {}
-            else:
-                # Low/Medium cardinality
-                if nunique <= 2:
-                    # Binary: use label encoding (safe)
-                    return 'ordinal', None, {}
-                elif nunique <= 10:
-                    # Low cardinality: use one-hot encoding
-                    enc=OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                    return 'onehot', enc, {}
-                elif nunique <= 50:
-                    # Medium cardinality: use count encoding (safer than target)
-                    return 'count', None, {}
+            # For very low cardinality: use one-hot encoding (safest, most interpretable)
+            if nunique <= 2:
+                enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                return 'onehot', enc, {}
+            
+            # For low cardinality (3-10 unique): use one-hot
+            elif nunique <= 10:
+                enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                return 'onehot', enc, {}
+            
+            # For medium cardinality (11-50): use target encoding IF target available and training mode
+            elif nunique <= 50:
+                if target_series is not None and train_mode and model_type == 'classification':
+                    # Use K-Fold target encoding (safe from leakage)
+                    return 'target_kfold', None, {}
                 else:
-                    # Fallback to count encoding
+                    # Fallback to count encoding for inference/regression
                     return 'count', None, {}
+            
+            # For high cardinality (>50): use target encoding in training, count in inference
+            else:  # high_card == True
+                if target_series is not None and train_mode and model_type == 'classification':
+                    # High cardinality benefits most from target encoding
+                    return 'target_kfold', None, {}
+                else:
+                    # Count encoding for test/inference
+                    return 'count', None, {}
+            
+        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42):        
+            X_col = df[col].astype(object).fillna('__NA__')
+            global_mean = float(y.mean())
+            oof = pd.Series(index=df.index, dtype=float)
+            
+            # Use StratifiedKFold for better class distribution
+            try:
+                kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                splits = list(kf.split(df, y))
+            except:
+                # Fallback to regular KFold if StratifiedKFold fails
+                from sklearn.model_selection import KFold
+                kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                splits = list(kf.split(df))
+            
+            # Compute out-of-fold encodings (CRITICAL: prevents leakage)
+            for train_idx, val_idx in splits:
+                # Compute means only on training fold
+                train_means = y.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
+                # Apply to validation fold
+                oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
+            
+            # Compute global smoothed mapping for test data (uses all training data)
+            counts = X_col.value_counts()
+            smooth_map = {}
+            for cat, cnt in counts.items():
+                if cnt > 0:
+                    cat_mean = float(y[X_col == cat].mean())
+                    # Smoothing: blend category mean with global mean
+                    alpha = cnt / (cnt + smoothing)
+                    smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
+                else:
+                    smooth_map[cat] = global_mean
+            
+            return oof.fillna(global_mean), smooth_map, global_mean
 
         class Preprocessor:
             def __init__(self):
@@ -335,19 +382,38 @@ implementation:
                     cfg['missing_frac']=float(s.isna().mean())
                     cfg['high_card']=cfg['n_unique']>max(50,0.05*nrows)
                     cfg['rare_threshold_frac']=self.global_metadata['config'].get('rare_threshold',0.01)
-                    enc_name,enc_obj,_=choose_categorical_encoder(c, s, target_series=None, train_mode=True, model_type=model_type)
+                    # CRITICAL: Pass the actual target (y) so target encoding CAN be selected!
+                    enc_name,enc_obj,_=choose_categorical_encoder(c, s, target_series=y, train_mode=True, model_type=model_type)
                     cfg['encoder_type']=enc_name
                     cfg['encoder_obj']=enc_obj
                     self.col_config[c]=cfg
                     
                 # Fit target encoders if classification
+                # Fit encoders based on encoder type
                 if y is not None and model_type == 'classification':
                     for c in self.cat_cols:
-                        cfg=self.col_config[c]
-                        if cfg['encoder_type']=='count':
-                            # Count encoding: compute frequency map
-                            counts=df[c].astype(object).value_counts().to_dict()
-                            cfg['count_map']=counts
+                        cfg = self.col_config[c]
+                        enc_type = cfg['encoder_type']
+                        
+                        if enc_type == 'target_kfold':
+                            # Fit K-Fold target encoder (prevents leakage)
+                            print(f"[INFO] Fitting K-Fold target encoder for column: {c}")
+                            oof_encoding, test_mapping, global_mean = fit_target_encoder_kfold(
+                                df, c, y, n_splits=5, smoothing=1.0, random_state=42
+                            )
+                            # Store OOF encodings for training transformation
+                            cfg['oof_encoding'] = oof_encoding  # OUT-OF-FOLD values (no leakage!)
+                            cfg['target_mapping'] = test_mapping  # For test data
+                            cfg['target_global_mean'] = float(global_mean)
+                            print(f"[INFO] Target encoder fitted for '{c}': {len(test_mapping)} unique categories")
+                            
+                        elif enc_type == 'count':
+                            # Count encoding: simple frequency mapping
+                            counts = df[c].astype(object).value_counts().to_dict()
+                            cfg['count_map'] = counts
+                            print(f"[INFO] Count encoder fitted for '{c}': {len(counts)} unique categories")
+                            
+                        # OneHot encoders are fitted during transform
                             
                 self.global_metadata['num_cols']=self.num_cols; self.global_metadata['cat_cols']=self.cat_cols
                 return self
@@ -441,37 +507,81 @@ implementation:
                     self.col_config[c]['scaler_obj']=sc
 
                 # categorical encodings; never touch target
+                # Categorical encodings; never touch target
                 for c in [cc for cc in self.cat_cols if cc in df.columns and cc != target_col]:
-                    cfg=self.col_config[c]; s=df[c].astype(object)
-                    rare_thresh=cfg.get('rare_threshold_frac',0.01)
-                    if rare_thresh<1.0: collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
-                    else: collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
-                    df[c]=collapsed; cfg['rare_values']=list(rare_set)
-                    if cfg_global.get('enable_string_similarity', False) and cfg['n_unique']>20:
-                        grouped, mapping = string_similarity_group(df[c], score_threshold=90); df[c]=grouped; cfg['string_similarity_map']=mapping
-                    enc_type=cfg.get('encoder_type')
-                    if enc_type=='onehot':
-                        ohe=OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                        resh=df[[c]].astype(str); ohe.fit(resh); arr=ohe.transform(resh)
-                        cols=[f"{c}__{cat}" for cat in ohe.categories_[0]]
-                        df_ohe=pd.DataFrame(arr, columns=cols, index=df.index)
-                        df=pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
-                        cfg['encoder_obj']=ohe; cfg['ohe_columns']=cols
-                    elif enc_type=='ordinal':
-                        ord_enc=OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-                        resh=df[[c]].astype(object)
-                        try: ord_enc.fit(resh); df[c]=ord_enc.transform(resh).astype(float); cfg['encoder_obj']=ord_enc
-                        except Exception: df[c]=df[c].astype('category').cat.codes.astype(float)
-                    elif enc_type=='count':
-                        cnt_map=cfg.get('count_map', df[c].value_counts().to_dict())
-                        # Map to frequency counts, use 0 for unseen categories
-                        df[c]=df[c].map(lambda x: cnt_map.get(x, 0)).astype(float)
-                    elif enc_type=='ordinal':
-                        # Simple ordinal encoding for binary/low cardinality
-                        df[c]=df[c].astype('category').cat.codes.replace({-1:np.nan}).astype(float)
+                    cfg = self.col_config[c]
+                    s = df[c].astype(object)
+                    
+                    # Apply rare label collapsing
+                    rare_thresh = cfg.get('rare_threshold_frac', 0.01)
+                    if rare_thresh < 1.0:
+                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
                     else:
-                        # Fallback: convert to category codes
-                        df[c]=df[c].astype('category').cat.codes.replace({-1:np.nan}).astype(float)
+                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
+                    df[c] = collapsed
+                    cfg['rare_values'] = list(rare_set)
+                    
+                    # String similarity grouping
+                    if cfg_global.get('enable_string_similarity', False) and cfg['n_unique'] > 20:
+                        grouped, mapping = string_similarity_group(df[c], score_threshold=90)
+                        df[c] = grouped
+                        cfg['string_similarity_map'] = mapping
+                    
+                    enc_type = cfg.get('encoder_type')
+                    
+                    # ONE-HOT ENCODING
+                    if enc_type == 'onehot':
+                        ohe = cfg.get('encoder_obj')
+                        if ohe is None:
+                            ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                            resh = df[[c]].astype(str)
+                            ohe.fit(resh)
+                            cfg['encoder_obj'] = ohe
+                            cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        
+                        arr = ohe.transform(df[[c]].astype(str))
+                        cols = cfg['ohe_columns']
+                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
+                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                        
+                    # TARGET ENCODING WITH K-FOLD (CRITICAL FOR ACCURACY!)
+                    elif enc_type == 'target_kfold':
+                        # CRITICAL: Use OOF encodings in training, test mapping in inference
+                        if training_mode and 'oof_encoding' in cfg:
+                            # Training: use out-of-fold encodings (NO LEAKAGE!)
+                            oof = cfg['oof_encoding']
+                            df[c] = oof.reindex(df.index, fill_value=cfg.get('target_global_mean', 0.0)).astype(float)
+                            print(f"[INFO] Applied OOF target encoding for '{c}' in TRAINING mode")
+                        else:
+                            # Inference/Test: use the global mapping
+                            mapping = cfg.get('target_mapping', {})
+                            global_mean = cfg.get('target_global_mean', 0.0)
+                            df[c] = df[c].map(lambda x: mapping.get(x, global_mean)).astype(float)
+                            print(f"[INFO] Applied test target encoding for '{c}' in INFERENCE mode")
+                    
+                    # COUNT ENCODING
+                    elif enc_type == 'count':
+                        cnt_map = cfg.get('count_map', df[c].value_counts().to_dict())
+                        # Map to frequency counts, use 0 for unseen categories
+                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0)).astype(float)
+                    
+                    # ORDINAL ENCODING
+                    elif enc_type == 'ordinal':
+                        ord_enc = cfg.get('encoder_obj')
+                        if ord_enc is None:
+                            ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                            resh = df[[c]].astype(object)
+                            ord_enc.fit(resh)
+                            cfg['encoder_obj'] = ord_enc
+                        try:
+                            df[c] = ord_enc.transform(df[[c]].astype(object)).astype(float)
+                        except Exception:
+                            # Fallback: use category codes
+                            df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                    
+                    # FALLBACK: Category codes
+                    else:
+                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
                 for c in list(df.columns):
                     if df[c].dtype=='object':
                         try: df[c]=pd.to_numeric(df[c], errors='coerce')
@@ -830,7 +940,31 @@ implementation:
                     label_mapping = {str(original): int(encoded) for original, encoded in zip(le.classes_, range(len(le.classes_)))}
                     print(f"[INFO] Created label mapping: {label_mapping}")
 
+            
             # Drop rows with null y
+            if model_type == "classification":
+                class_counts = y_series.value_counts().sort_index()
+                print("="*80)
+                print("CLASS DISTRIBUTION ANALYSIS")
+                print("="*80)
+                for cls, count in class_counts.items():
+                    pct = (count / len(y_series)) * 100
+                    print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
+                
+                # Check for severe imbalance
+                min_class = class_counts.min()
+                max_class = class_counts.max()
+                imbalance_ratio = max_class / min_class if min_class > 0 else float('inf')
+                print(f"  Imbalance ratio (max/min): {imbalance_ratio:.2f}:1")
+                
+                if imbalance_ratio > 5:
+                    print("[WARN] Severe class imbalance detected!")
+                    print("[WARN] Consider using class_weight='balanced' in training")
+                elif imbalance_ratio > 2:
+                    print("[INFO] Moderate class imbalance detected")
+                else:
+                    print("[INFO] Classes are relatively balanced")
+                print("="*80)
             keep_mask_y = y_series.notna()
             dropped_y = int((~keep_mask_y).sum())
             if dropped_y>0:
