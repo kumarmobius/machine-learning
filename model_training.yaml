@@ -1,8 +1,8 @@
-name: Train Logistic or Linear v4
+name: Train KNN v1.0
 description: |
-  Reads X and y from parquet, trains LogisticRegression for classification or LinearRegression for regression.
-  Supports class imbalance when enbalance=true for classification.
-  Uses optional preprocess_metadata to map target labels consistently.
+  Reads X and y from parquet, trains KNeighborsClassifier for classification or KNeighborsRegressor for regression.
+  Supports class imbalance when enbalance=true for classification (uses sample weights).
+  Properly handles label mapping from preprocess_metadata.
   Saves trained model and training metrics.
 
 inputs:
@@ -12,10 +12,10 @@ inputs:
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing to map target labels", optional: true}
-  - {name: max_iter, type: Integer, description: "LogisticRegression max_iter", optional: true, default: "1000"}
-  - {name: C, type: Float, description: "Inverse of regularization strength for LogisticRegression", optional: true, default: "1.0"}
-  - {name: penalty, type: String, description: "LogisticRegression regularization: l2 or none", optional: true, default: "l2"}
-  - {name: solver, type: String, description: "LogisticRegression solver: lbfgs or saga or newton-cg or liblinear", optional: true, default: "lbfgs"}
+  - {name: n_neighbors, type: Integer, description: "Number of neighbors for KNN", optional: true, default: "5"}
+  - {name: weights, type: String, description: "Weight function: uniform or distance", optional: true, default: "uniform"}
+  - {name: metric, type: String, description: "Distance metric: euclidean, manhattan, minkowski", optional: true, default: "euclidean"}
+  - {name: algorithm, type: String, description: "Algorithm: auto, ball_tree, kd_tree, brute", optional: true, default: "auto"}
 
 outputs:
   - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
@@ -33,9 +33,10 @@ implementation:
         import pandas as pd, numpy as np
         import joblib
 
-        from sklearn.linear_model import LogisticRegression, LinearRegression
+        from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         from sklearn.preprocessing import LabelEncoder
-        from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error
+        from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
+        from sklearn.utils.class_weight import compute_sample_weight
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
@@ -51,63 +52,15 @@ implementation:
         def try_load_metadata(path):
             if not path or not os.path.exists(path):
                 return None
-            # Try JSON first
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
                 pass
-            # Try joblib
             try:
                 return joblib.load(path)
             except Exception:
                 return None
-
-        def extract_target_mapping(meta):
-            if not isinstance(meta, dict):
-                return None
-            # explicit dict mapping
-            for key in ("target_mapping","label_map","target_value_map"):
-                if isinstance(meta.get(key), dict):
-                    return meta[key]
-            # list of classes
-            classes_lists = None
-            for key in ("target_label_encoder_classes","label_encoder_classes","classes","target_classes"):
-                if isinstance(meta.get(key), list):
-                    classes_lists = meta[key]
-                    break
-            if classes_lists is not None:
-                return {str(v): i for i, v in enumerate(classes_lists)}
-            te = meta.get("target_label_encoder")
-            if isinstance(te, dict) and isinstance(te.get("classes_"), list):
-                return {str(v): i for i, v in enumerate(te["classes_"])}
-            return None
-
-        def normalize_key(x):
-            if pd.isna(x):
-                return None
-            return str(x).strip()
-
-        def coerce_class_labels(y_series):
-            s = y_series.copy()
-            if pd.api.types.is_integer_dtype(s):
-                return s, {"mode": "already_integer"}
-            s_str = s.astype(str).str.strip().str.lower()
-            pos = {"1","true","yes","y","male","m","positive","pos"}
-            neg = {"0","false","no","n","female","f","negative","neg"}
-            mask_pos = s_str.isin(pos)
-            mask_neg = s_str.isin(neg)
-            if (mask_pos | mask_neg).mean() >= 0.9:
-                mapped = np.where(mask_pos, 1, np.where(mask_neg, 0, np.nan))
-                mapped = pd.Series(mapped, index=s.index)
-                return mapped.astype("Int64"), {"mode": "binary_map", "pos_set": sorted(list(pos)), "neg_set": sorted(list(neg))}
-            le = LabelEncoder()
-            enc = le.fit_transform(s.astype(str))
-            return pd.Series(enc, index=s.index, dtype="int64"), {"mode": "label_encoder", "classes_": le.classes_.tolist()}
-
-        def coerce_regression_target(y_series):
-            y_num = pd.to_numeric(y_series, errors="coerce")
-            return y_num
 
         ap = argparse.ArgumentParser()
         ap.add_argument('--X_data', type=str, required=True)
@@ -116,48 +69,61 @@ implementation:
         ap.add_argument('--enbalance', type=str, default="true")
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
-        ap.add_argument('--max_iter', type=int, default=1000)
-        ap.add_argument('--C', type=float, default=1.0)
-        ap.add_argument('--penalty', type=str, default="l2")
-        ap.add_argument('--solver', type=str, default="lbfgs")
+        ap.add_argument('--n_neighbors', type=int, default=5)
+        ap.add_argument('--weights', type=str, default="uniform")
+        ap.add_argument('--metric', type=str, default="euclidean")
+        ap.add_argument('--algorithm', type=str, default="auto")
         ap.add_argument('--model_pickle', type=str, required=True)
         ap.add_argument('--metrics_json', type=str, required=True)
         args = ap.parse_args()
 
         try:
-            print("Loading X from:", args.X_data)
+            print("="*80)
+            print("TRAINING STARTED")
+            print("="*80)
+            
+            print(f"[INFO] Loading X from: {args.X_data}")
             X = load_parquet_df(args.X_data)
-            print("X shape:", X.shape)
+            print(f"[INFO] X shape: {X.shape}")
+            print(f"[INFO] X columns: {list(X.columns)}")
 
-            print("Loading y from:", args.y_data)
+            print(f"[INFO] Loading y from: {args.y_data}")
             y_df = load_parquet_df(args.y_data)
 
+            # Extract target column
             if isinstance(y_df, pd.DataFrame):
                 if y_df.shape[1] == 1 and not args.target_column:
-                    y = y_df.iloc[:, 0]
+                    y = y_df.iloc[:, 0].copy()
+                    print(f"[INFO] Auto-detected single column: {y_df.columns[0]}")
                 else:
                     col = args.target_column.strip()
                     if not col:
-                        raise ValueError("y parquet has multiple columns. Provide --target_column.")
+                        raise ValueError(f"y parquet has {y_df.shape[1]} columns. Provide --target_column. Available: {list(y_df.columns)}")
                     if col not in y_df.columns:
-                        raise ValueError("target_column '" + col + "' not found in y parquet. Available: " + str(list(y_df.columns)))
-                    y = y_df[col]
+                        raise ValueError(f"target_column '{col}' not found in y parquet. Available: {list(y_df.columns)}")
+                    y = y_df[col].copy()
             else:
-                y = y_df
+                y = pd.Series(y_df).copy()
 
-            print("y length:", len(y))
+            print(f"[INFO] y length: {len(y)}")
+            print(f"[INFO] y unique values: {y.nunique()}")
+            print(f"[INFO] y sample: {y.head(10).tolist()}")
 
+            # Align X and y
             if len(X) != len(y):
+                print(f"[WARN] Length mismatch: X={len(X)}, y={len(y)}")
                 common_idx = X.index.intersection(y.index)
                 if len(common_idx) > 0:
+                    print(f"[INFO] Aligning by index to {len(common_idx)} rows")
                     X = X.loc[common_idx].sort_index()
                     y = y.loc[common_idx].sort_index()
                 else:
                     m = min(len(X), len(y))
-                    print("Warning: X and y length mismatch; aligning by position to", m, "rows.")
+                    print(f"[WARN] No common index; aligning by position to {m} rows")
                     X = X.reset_index(drop=True).iloc[:m, :]
                     y = y.reset_index(drop=True).iloc[:m]
 
+            # Optimize integer columns
             for c in X.columns:
                 if pd.api.types.is_float_dtype(X[c]) and np.allclose(X[c].dropna(), np.round(X[c].dropna())):
                     try:
@@ -166,104 +132,184 @@ implementation:
                         pass
 
             task = args.model_type.strip().lower()
-
             metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1])}
 
             if task == "classification":
+                print("[INFO] Classification task detected")
+                
+                # Load metadata and label_mapping
                 meta = try_load_metadata(args.preprocess_metadata)
-                mapping = extract_target_mapping(meta) if meta is not None else None
-                if isinstance(mapping, dict):
-                    print("Using target mapping from preprocess_metadata")
-                    y_map = y.map(lambda v: mapping.get(normalize_key(v), mapping.get(v, None)))
-                    if y_map.isna().mean() > 0.1:
-                        y_map = y.astype(str).map(lambda v: mapping.get(v, None))
-                    y_prepared = y_map.astype("Int64")
-                    map_info = {"mode": "metadata_mapping", "keys": list(mapping.keys())[:20]}
+                label_mapping = None
+                
+                if meta is not None:
+                    label_mapping = meta.get("label_mapping", None)
+                    if label_mapping:
+                        print(f"[INFO] Loaded label_mapping from metadata: {label_mapping}")
+                    else:
+                        print("[WARN] No label_mapping found in metadata")
                 else:
-                    y_prepared, map_info = coerce_class_labels(y)
-
-                keep = y_prepared.notna()
-                if keep.mean() < 1.0:
-                    print("Dropping", int((~keep).sum()), "rows with unmapped target")
-                    X = X.loc[keep].reset_index(drop=True)
-                    y_prepared = y_prepared.loc[keep].reset_index(drop=True)
-
-                imbalance = bool_from_str(args.enbalance)
-                class_weight = "balanced" if imbalance else None
-
-                penalty = args.penalty.strip().lower()
-                solver = args.solver.strip().lower()
-                if penalty == "none":
-                    penalty_arg = "none"
-                    if solver not in ("lbfgs","saga","newton-cg"):
-                        solver = "lbfgs"
+                    print("[WARN] No metadata provided")
+                
+                # Apply label mapping if available
+                if label_mapping:
+                    print("[INFO] Applying label_mapping to y...")
+                    y_str = y.astype(str)
+                    y_prepared = y_str.map(lambda val: label_mapping.get(val, None))
+                    
+                    # Check for unmapped values
+                    unmapped_mask = y_prepared.isna()
+                    if unmapped_mask.any():
+                        unmapped_count = int(unmapped_mask.sum())
+                        unmapped_values = y_str[unmapped_mask].unique().tolist()
+                        print(f"[WARN] Found {unmapped_count} unmapped labels: {unmapped_values}")
+                        print("[WARN] These rows will be dropped")
+                        
+                        keep_mask = ~unmapped_mask
+                        X = X.loc[keep_mask].reset_index(drop=True)
+                        y_prepared = y_prepared[keep_mask].astype(int).reset_index(drop=True)
+                    else:
+                        y_prepared = y_prepared.astype(int).reset_index(drop=True)
+                    
+                    map_info = {"mode": "metadata_mapping", "mapping": label_mapping}
                 else:
-                    if penalty not in ("l2",):
-                        penalty = "l2"
-                    penalty_arg = penalty
-                    if solver not in ("lbfgs","saga","newton-cg","liblinear"):
-                        solver = "lbfgs"
+                    # Fallback: use LabelEncoder
+                    print("[INFO] No label_mapping found, using LabelEncoder")
+                    le = LabelEncoder()
+                    y_prepared = pd.Series(le.fit_transform(y.astype(str)), index=y.index)
+                    map_info = {"mode": "label_encoder", "classes": le.classes_.tolist()}
+                    print(f"[INFO] Encoded classes: {le.classes_.tolist()}")
 
-                lr = LogisticRegression(
-                    max_iter=int(args.max_iter),
-                    multi_class='auto',
-                    C=float(args.C),
-                    penalty=penalty_arg,
-                    solver=solver,
-                    class_weight=class_weight,
-                    n_jobs=-1 if solver in ("saga","liblinear") else None,
-                    random_state=42
+                print(f"[INFO] y after encoding - unique values: {y_prepared.unique()}")
+                print(f"[INFO] y after encoding - value counts:{y_prepared.value_counts().to_dict()}")
+
+                # Handle class imbalance
+                sample_weight = None
+                if bool_from_str(args.enbalance):
+                    print("[INFO] Computing sample weights for class imbalance")
+                    sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
+                    print(f"[INFO] Sample weight range: {sample_weight.min():.4f} - {sample_weight.max():.4f}")
+
+                # Train KNN Classifier
+                n_neighbors = min(int(args.n_neighbors), len(X) - 1)
+                print(f"[INFO] Training KNeighborsClassifier with n_neighbors={n_neighbors}")
+                
+                knn = KNeighborsClassifier(
+                    n_neighbors=n_neighbors,
+                    weights=args.weights.strip().lower(),
+                    algorithm=args.algorithm.strip().lower(),
+                    metric=args.metric.strip().lower(),
+                    n_jobs=-1
                 )
 
-                lr.fit(X, y_prepared)
-                y_hat = lr.predict(X)
-                acc = float(accuracy_score(y_prepared, y_hat))
+                knn.fit(X, y_prepared)
+                print("[INFO] Model training complete")
+
+                # Evaluate on training data
+                y_pred = knn.predict(X)
+                acc = float(accuracy_score(y_prepared, y_pred))
+                prec = float(precision_score(y_prepared, y_pred, average='weighted', zero_division=0))
+                rec = float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0))
+                f1 = float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0))
 
                 metrics.update({
                     "accuracy_train": acc,
-                    "class_weight": ("balanced" if class_weight == "balanced" else None),
+                    "precision_train": prec,
+                    "recall_train": rec,
+                    "f1_train": f1,
+                    "n_neighbors": n_neighbors,
+                    "weights": args.weights,
+                    "metric": args.metric,
+                    "balanced": bool_from_str(args.enbalance),
                     "label_info": map_info
                 })
 
-                model_obj = lr
+                print("[INFO] Training Metrics:")
+                print(f"  Accuracy: {acc:.6f}")
+                print(f"  Precision: {prec:.6f}")
+                print(f"  Recall: {rec:.6f}")
+                print(f"  F1 Score: {f1:.6f}")
+
+                model_obj = knn
 
             elif task == "regression":
+                print("[INFO] Regression task detected")
+                
+                # Convert to numeric
                 y_num = pd.to_numeric(y, errors="coerce")
-                keep = y_num.notna()
-                if keep.mean() < 1.0:
-                    print("Dropping", int((~keep).sum()), "rows with non-numeric target")
-                    X = X.loc[keep].reset_index(drop=True)
-                    y_num = y_num.loc[keep].reset_index(drop=True)
+                
+                # Drop non-numeric values
+                valid_mask = y_num.notna()
+                if not valid_mask.all():
+                    dropped = int((~valid_mask).sum())
+                    print(f"[WARN] Dropping {dropped} rows with non-numeric target")
+                    X = X.loc[valid_mask].reset_index(drop=True)
+                    y_num = y_num[valid_mask].reset_index(drop=True)
 
-                reg = LinearRegression()
-                reg.fit(X, y_num)
+                print(f"[INFO] y statistics: min={y_num.min():.4f}, max={y_num.max():.4f}, mean={y_num.mean():.4f}")
 
-                y_hat = reg.predict(X)
-                r2 = float(r2_score(y_num, y_hat))
-                rmse = float(np.sqrt(mean_squared_error(y_num, y_hat)))
-                mae = float(mean_absolute_error(y_num, y_hat))
+                # Train KNN Regressor
+                n_neighbors = min(int(args.n_neighbors), len(X) - 1)
+                print(f"[INFO] Training KNeighborsRegressor with n_neighbors={n_neighbors}")
+                
+                knn = KNeighborsRegressor(
+                    n_neighbors=n_neighbors,
+                    weights=args.weights.strip().lower(),
+                    algorithm=args.algorithm.strip().lower(),
+                    metric=args.metric.strip().lower(),
+                    n_jobs=-1
+                )
+
+                knn.fit(X, y_num)
+                print("[INFO] Model training complete")
+
+                # Evaluate on training data
+                y_pred = knn.predict(X)
+                r2 = float(r2_score(y_num, y_pred))
+                rmse = float(np.sqrt(mean_squared_error(y_num, y_pred)))
+                mae = float(mean_absolute_error(y_num, y_pred))
 
                 metrics.update({
                     "r2_train": r2,
                     "rmse_train": rmse,
-                    "mae_train": mae
+                    "mae_train": mae,
+                    "n_neighbors": n_neighbors,
+                    "weights": args.weights,
+                    "metric": args.metric
                 })
 
-                model_obj = reg
-            else:
-                raise ValueError("Unsupported model_type '" + args.model_type + "'. Use 'classification' or 'regression'.")
+                print("[INFO] Training Metrics:")
+                print(f"  R² Score: {r2:.6f}")
+                print(f"  RMSE: {rmse:.6f}")
+                print(f"  MAE: {mae:.6f}")
 
+                model_obj = knn
+            else:
+                raise ValueError(f"Unsupported model_type '{args.model_type}'. Use 'classification' or 'regression'.")
+
+            # Save model
+            print(f"[INFO] Saving model to: {args.model_pickle}")
             ensure_dir_for(args.model_pickle)
-            ensure_dir_for(args.metrics_json)
             joblib.dump(model_obj, args.model_pickle)
 
+            # Save metrics
+            print(f"[INFO] Saving metrics to: {args.metrics_json}")
+            ensure_dir_for(args.metrics_json)
             with open(args.metrics_json, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-            print("SUCCESS: Trained", task, "model. Metrics:", metrics)
+            print("="*80)
+            print(f"SUCCESS: Trained {task} model")
+            print(f"Final metrics: {json.dumps(metrics, indent=2)}")
+            print("="*80)
+            
         except Exception as e:
-            print("ERROR during training:", e, file=sys.stderr)
+            print("="*80, file=sys.stderr)
+            print("ERROR DURING TRAINING", file=sys.stderr)
+            print("="*80, file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
+            print("Full traceback:", file=sys.stderr)
             traceback.print_exc()
+            print("="*80, file=sys.stderr)
             sys.exit(1)
 
     args:
@@ -279,14 +325,14 @@ implementation:
       - {inputValue: target_column}
       - --preprocess_metadata
       - {inputPath: preprocess_metadata}
-      - --max_iter
-      - {inputValue: max_iter}
-      - --C
-      - {inputValue: C}
-      - --penalty
-      - {inputValue: penalty}
-      - --solver
-      - {inputValue: solver}
+      - --n_neighbors
+      - {inputValue: n_neighbors}
+      - --weights
+      - {inputValue: weights}
+      - --metric
+      - {inputValue: metric}
+      - --algorithm
+      - {inputValue: algorithm}
       - --model_pickle
       - {outputPath: model_pickle}
       - --metrics_json
