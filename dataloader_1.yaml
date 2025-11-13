@@ -1,4 +1,4 @@
-name: Data loader v3
+name: Data loader v4
 description: |
   Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. 
   Prints dataframe diagnostics and ensures train/test splits follow requested column rules. 
@@ -88,22 +88,31 @@ implementation:
         # === Prepare target ===
         if args.target_column in df.columns:
             target_values = df[args.target_column].copy()
-            anomaly_labels = (df[args.target_column] == 0.0).astype(np.int32)
         else:
-            logger.warning(f" Target column '{args.target_column}' not found. Creating zero anomaly labels.")
+            logger.warning(f" Target column '{args.target_column}' not found. Creating zero target values.")
             target_values = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index, name=args.target_column)
-            anomaly_labels = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index)
-
+        
         # === Print target variable distribution if classification ===
         if args.model_type.lower() == "classification":
-            print("===== TARGET VARIABLE DISTRIBUTION =====")
+            print("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
             print(target_values.value_counts(dropna=False).to_string())
             print("Unique classes:", target_values.nunique())
+            print("Class distribution percentages:")
+            print((target_values.value_counts(dropna=False, normalize=True) * 100).to_string())
         else:
             print("Model type is regression — skipping target distribution summary.")
-
-        # Use anomaly_labels for stratify if >1 unique
-        stratify_param = anomaly_labels if anomaly_labels.nunique() > 1 else None
+        
+        # CRITICAL FIX: Stratify by actual target values (not binary mask!)
+        # This ensures train/test have the same class distribution
+        if args.model_type.lower() == "classification":
+            if target_values.nunique() > 1:
+                stratify_param = target_values  # ← FIXED: Use actual target (3 classes)
+                print(f"[INFO] Using stratified split by target (stratify={target_values.nunique()} classes)")
+            else:
+                stratify_param = None
+                print("[WARN] Only one class in target, stratification disabled")
+        else:
+            stratify_param = None  # No stratification for regression
 
         # === Convert split size ===
         split_size_input = float(args.split_size)
@@ -115,6 +124,36 @@ implementation:
         train_df, test_df, train_y, test_y = train_test_split(
             df, target_values, test_size=test_size, random_state=42, stratify=stratify_param
         )
+        if args.model_type.lower() == "classification":
+            print("="*80)
+            print("CLASS DISTRIBUTION VERIFICATION")
+            print("="*80)
+            
+            print("TRAIN SET CLASS DISTRIBUTION:")
+            train_dist = train_y.value_counts(dropna=False).sort_index()
+            for cls, count in train_dist.items():
+                pct = (count / len(train_y)) * 100
+                print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
+            
+            print("TEST SET CLASS DISTRIBUTION:")
+            test_dist = test_y.value_counts(dropna=False).sort_index()
+            for cls, count in test_dist.items():
+                pct = (count / len(test_y)) * 100
+                print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
+            
+            # Calculate distribution difference
+            print("DISTRIBUTION MATCH CHECK:")
+            train_pct = train_y.value_counts(normalize=True, dropna=False).sort_index()
+            test_pct = test_y.value_counts(normalize=True, dropna=False).sort_index()
+            max_diff = (train_pct - test_pct).abs().max() * 100
+            print(f"  Maximum class distribution difference: {max_diff:.2f}%")
+            
+            if max_diff > 5.0:
+                print("  [WARN] Large distribution mismatch detected! This may cause poor test performance.")
+            else:
+                print("  [OK] Train/test distributions are well matched.")
+            
+            print("="*80)
 
         # === Create outputs ===
         test_x_df = test_df.drop(columns=[args.target_column], errors="ignore")
