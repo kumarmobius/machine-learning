@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.1
+name: Advanced Preprocess v8.3.2
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -835,6 +835,8 @@ implementation:
                     y_series = pd.Series(le.fit_transform(y_raw.astype(str)), index=y_raw.index)
                     y_info['strategy']="label_encode"
                     y_info['classes_']=list(map(str, le.classes_))
+                    label_mapping = {str(original): int(encoded) for original, encoded in zip(le.classes_, range(len(le.classes_)))}
+                    print(f"[INFO] Created label mapping: {label_mapping}")
 
             # Drop rows with null y
             keep_mask_y = y_series.notna()
@@ -920,6 +922,7 @@ implementation:
                 'dropped_unique_cols': cols_to_drop_unique,
                 'missing_report': missing_report,
                 'unique_report': unique_report,
+                'label_mapping': label_mapping,
                 'conversion_report': conv_report,
                 'date_report': date_report,
                 'num_cols': pre.global_metadata.get('num_cols', []),
