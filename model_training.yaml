@@ -1,9 +1,11 @@
-name: Train GradientBoosting v1.0
+name: Train RandomForest v1.3
 description: |
-  Reads X and y from parquet, trains HistGradientBoostingClassifier for classification
-  or HistGradientBoostingRegressor for regression. Assumes y is already encoded.
-  Supports class imbalance via sample_weight when enbalance=true (classification).
-  Prints target distribution and per-class feature statistics. Saves trained model and metrics.
+  Reads X and y from parquet, trains RandomForestClassifier for classification or RandomForestRegressor for regression.
+  Assumes y is already encoded from preprocessing (no re-encoding needed).
+  Supports class imbalance when enbalance=true for classification.
+  Prints target variable distribution before training.
+  Saves trained model and training metrics.
+
 inputs:
   - {name: X_data, type: Data, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Data, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
@@ -11,13 +13,14 @@ inputs:
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
-  - {name: n_estimators, type: Integer, description: "Number of boosting iterations (trees)", optional: true, default: "100"}
-  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: "6"}
-  - {name: learning_rate, type: Number, description: "Learning rate for boosting", optional: true, default: "0.1"}
+  - {name: n_estimators, type: Integer, description: "Number of trees in the RandomForest", optional: true, default: "100"}
+  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: "20"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
+
 outputs:
   - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
   - {name: metrics_json, type: Data, description: "Training metrics JSON"}
+
 implementation:
   container:
     image: kumar2004/ml-base:v1
@@ -27,20 +30,15 @@ implementation:
       - -c
       - |
         import argparse, os, sys, json, traceback
-        import pandas as pd, numpy as np, joblib
+        import pandas as pd, numpy as np
+        import joblib
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
         from sklearn.preprocessing import LabelEncoder
         from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
         from sklearn.utils.class_weight import compute_sample_weight
         from sklearn.model_selection import cross_val_score
-
-        # Use HistGradientBoosting for speed/modern defaults
-        try:
-            from sklearn.ensemble import HistGradientBoostingClassifier as GBClassifier
-            from sklearn.ensemble import HistGradientBoostingRegressor as GBRegressor
-        except Exception:
-            # Fallback to classic GradientBoosting when Hist is unavailable
-            from sklearn.ensemble import GradientBoostingClassifier as GBClassifier
-            from sklearn.ensemble import GradientBoostingRegressor as GBRegressor
+        from sklearn.ensemble import GradientBoostingClassifier as GBClassifier
+        from sklearn.ensemble import GradientBoostingRegressor as GBRegressor
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
@@ -74,8 +72,7 @@ implementation:
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
         ap.add_argument('--n_estimators', type=int, default=100)
-        ap.add_argument('--max_depth', type=str, default="6")
-        ap.add_argument('--learning_rate', type=float, default=0.1)
+        ap.add_argument('--max_depth', type=str, default="")
         ap.add_argument('--random_state', type=int, default=42)
         ap.add_argument('--model_pickle', type=str, required=True)
         ap.add_argument('--metrics_json', type=str, required=True)
@@ -83,17 +80,17 @@ implementation:
 
         try:
             print("="*80)
-            print("TRAINING STARTED (Gradient Boosting)")
+            print("TRAINING STARTED (RandomForest)")
             print("="*80)
-
+            
             X = load_parquet_df(args.X_data)
-            print("[INFO] X shape:", X.shape)
+            print(f"[INFO] X shape: {X.shape}")
 
             y_df = load_parquet_df(args.y_data)
             if isinstance(y_df, pd.DataFrame):
                 if y_df.shape[1] == 1 and not args.target_column:
                     y = y_df.iloc[:, 0].copy()
-                    print("[INFO] Auto-detected single column:", y_df.columns[0])
+                    print(f"[INFO] Auto-detected single column: {y_df.columns[0]}")
                 else:
                     col = args.target_column.strip()
                     if not col:
@@ -103,7 +100,7 @@ implementation:
                 y = pd.Series(y_df).copy()
 
             if len(X) != len(y):
-                print("[WARN] Length mismatch: X=", len(X), "y=", len(y))
+                print(f"[WARN] Length mismatch: X={len(X)}, y={len(y)}")
                 common_idx = X.index.intersection(y.index)
                 if len(common_idx) > 0:
                     X = X.loc[common_idx].sort_index()
@@ -143,63 +140,30 @@ implementation:
                     dropped = int((~valid_mask).sum())
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_prepared = y_prepared[valid_mask].reset_index(drop=True)
-                    print("[WARN] Dropped", dropped, "invalid rows")
-                else:
-                    # ensure indices aligned and reset for clean processing
-                    X = X.reset_index(drop=True)
-                    y_prepared = y_prepared.reset_index(drop=True)
+                    print(f"[WARN] Dropped {dropped} invalid rows")
 
-                # === Sample weights for imbalance ===
                 sample_weight = None
                 if bool_from_str(args.enbalance):
                     print("[INFO] Computing sample weights for imbalance")
                     try:
                         sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
                     except Exception as e:
-                        print("[WARN] Could not compute sample weights:", e)
-                        sample_weight = None
+                        print(f"[WARN] Could not compute sample weights: {e}")
 
-                # === Feature statistics by class (DEBUG) ===
-                print("[DEBUG] Feature statistics by class:")
-                classes_sorted = sorted(pd.Series(y_prepared).unique().tolist())
-                for cls in classes_sorted:
-                    mask = (y_prepared == cls)
-                    print("")  # blank line
-                    print("Class", cls, ":")
-                    try:
-                        desc = X.loc[mask, :].describe().loc[['mean', 'std']].T.head(10)
-                        print(desc.to_string())
-                    except Exception as e:
-                        print("[WARN] Could not compute stats for class", cls, ":", e)
-
-                # === Initialize Gradient Boosting classifier ===
-                print("[INFO] Training HistGradientBoostingClassifier with iterations:", args.n_estimators)
+                print(f"[INFO] Training RandomForestClassifier with {args.n_estimators} trees")
                 clf = GBClassifier(
-                    max_iter=int(args.n_estimators),
-                    max_depth=max_depth,
-                    learning_rate=float(args.learning_rate),
-                    random_state=int(args.random_state)
+                    max_iter=100,
+                    max_depth=6,
+                    learning_rate=0.1,
+                    random_state=50
                 )
 
-                print("[INFO] Running 5-fold cross-validation (without sample weights)...")
-                try:
-                    cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=-1)
-                    print("[INFO] CV Accuracy:", cv_scores.mean(), "(+/-", cv_scores.std(), ")")
-                    metrics["cv_accuracy_mean"] = float(cv_scores.mean())
-                    metrics["cv_accuracy_std"] = float(cv_scores.std())
-                except Exception as e:
-                    print("[WARN] cross_val_score failed:", e)
-
-                # Fit with sample_weight if available
-                try:
-                    if sample_weight is not None:
-                        clf.fit(X, y_prepared, sample_weight=sample_weight)
-                    else:
-                        clf.fit(X, y_prepared)
-                except TypeError:
-                    # some GB implementations expect sample_weight named differently; fallback to no sample weight
-                    print("[WARN] Fit with sample_weight failed; retrying without sample weights")
-                    clf.fit(X, y_prepared)
+                print("[INFO] Running 5-fold cross-validation to check for overfitting...")
+                cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=-1)
+                print(f"[INFO] CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                metrics["cv_accuracy_mean"] = float(cv_scores.mean())
+                metrics["cv_accuracy_std"] = float(cv_scores.std())
+                clf.fit(X, y_prepared, sample_weight=sample_weight)
 
                 y_pred = clf.predict(X)
                 metrics.update({
@@ -209,7 +173,6 @@ implementation:
                     "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "n_estimators": int(args.n_estimators),
                     "max_depth": max_depth,
-                    "learning_rate": float(args.learning_rate),
                     "balanced": bool_from_str(args.enbalance),
                     "label_info": map_info
                 })
@@ -218,23 +181,21 @@ implementation:
 
             elif task == "regression":
                 print("[INFO] Regression task detected")
+
                 y_num = pd.to_numeric(y, errors="coerce")
                 valid_mask = y_num.notna()
                 if not valid_mask.all():
                     dropped = int((~valid_mask).sum())
-                    print("[WARN] Dropping", dropped, "rows with non-numeric target")
+                    print(f"[WARN] Dropping {dropped} rows with non-numeric target")
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_num = y_num[valid_mask].reset_index(drop=True)
-                else:
-                    X = X.reset_index(drop=True)
-                    y_num = y_num.reset_index(drop=True)
 
-                print("[INFO] Training HistGradientBoostingRegressor with iterations:", args.n_estimators)
+                print(f"[INFO] Training RandomForestRegressor with {args.n_estimators} trees")
                 reg = GBRegressor(
-                    max_iter=int(args.n_estimators),
-                    max_depth=max_depth,
-                    learning_rate=float(args.learning_rate),
-                    random_state=int(args.random_state)
+                    max_iter=100,
+                    max_depth=6,
+                    learning_rate=0.1,
+                    random_state=50
                 )
                 reg.fit(X, y_num)
 
@@ -244,14 +205,13 @@ implementation:
                     "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
                     "mae_train": float(mean_absolute_error(y_num, y_pred)),
                     "n_estimators": int(args.n_estimators),
-                    "max_depth": max_depth,
-                    "learning_rate": float(args.learning_rate)
+                    "max_depth": max_depth
                 })
 
                 model_obj = reg
 
             else:
-                raise ValueError("Unsupported model_type '{}'".format(args.model_type))
+                raise ValueError(f"Unsupported model_type '{args.model_type}'")
 
             ensure_dir_for(args.model_pickle)
             joblib.dump(model_obj, args.model_pickle)
@@ -261,7 +221,7 @@ implementation:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
             print("="*80)
-            print("SUCCESS: Gradient Boosting training completed")
+            print("SUCCESS: RandomForest training completed")
             print(json.dumps(metrics, indent=2))
             print("="*80)
 
@@ -271,6 +231,7 @@ implementation:
             traceback.print_exc()
             print("="*80, file=sys.stderr)
             sys.exit(1)
+
     args:
       - --X_data
       - {inputPath: X_data}
@@ -288,8 +249,6 @@ implementation:
       - {inputValue: n_estimators}
       - --max_depth
       - {inputValue: max_depth}
-      - --learning_rate
-      - {inputValue: learning_rate}
       - --random_state
       - {inputValue: random_state}
       - --model_pickle
