@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.4
+name: Advanced Preprocess v8.3.5
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target
   Rules:
@@ -374,28 +374,46 @@ implementation:
                             cfg['imputer']=('iterative',{'max_iter':10,'random_state':0})
                     cfg['scaler_choice']='auto'
                     self.col_config[c]=cfg
-                    
                 # Configure categorical columns
                 for c in self.cat_cols:
-                    s=df[c].astype(object); cfg={}
-                    cfg['n_unique']=int(s.nunique(dropna=True))
-                    cfg['missing_frac']=float(s.isna().mean())
-                    cfg['high_card']=cfg['n_unique']>max(50,0.05*nrows)
-                    cfg['rare_threshold_frac']=self.global_metadata['config'].get('rare_threshold',0.01)
-                    # CRITICAL: Pass the actual target (y) so target encoding CAN be selected!
-                    enc_name,enc_obj,_=choose_categorical_encoder(c, s, target_series=y, train_mode=True, model_type=model_type)
-                    cfg['encoder_type']=enc_name
-                    cfg['encoder_obj']=enc_obj
-                    self.col_config[c]=cfg
+                    s = df[c].astype(object)
+                    cfg = {}
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['missing_frac'] = float(s.isna().mean())
+                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05*nrows)
+                    cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
                     
-                # Fit target encoders if classification
+                    # CRITICAL FIX: Pass the actual target (y) so target encoding can be selected!
+                    enc_name, enc_obj, _ = choose_categorical_encoder(
+                        c, s, 
+                        target_series=y,  # ← CHANGED FROM None to y
+                        train_mode=True, 
+                        model_type=model_type
+                    )
+                    
+                    cfg['encoder_type'] = enc_name
+                    cfg['encoder_obj'] = enc_obj
+                    self.col_config[c] = cfg
+                
                 # Fit encoders based on encoder type
                 if y is not None and model_type == 'classification':
                     for c in self.cat_cols:
                         cfg = self.col_config[c]
                         enc_type = cfg['encoder_type']
                         
-                        if enc_type == 'target_kfold':
+                        if enc_type == 'onehot':
+                            # FIT THE ONEHOT ENCODER NOW!
+                            ohe = cfg.get('encoder_obj')
+                            if ohe is not None:
+                                print(f"[INFO] Fitting OneHot encoder for column: {c}")
+                                # Fit on the current data
+                                resh = df[[c]].astype(str)
+                                ohe.fit(resh)
+                                cfg['encoder_obj'] = ohe
+                                cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                                print(f"[INFO] OneHot encoder fitted for '{c}': {len(ohe.categories_[0])} categories")
+                        
+                        elif enc_type == 'target_kfold':
                             # Fit K-Fold target encoder (prevents leakage)
                             print(f"[INFO] Fitting K-Fold target encoder for column: {c}")
                             oof_encoding, test_mapping, global_mean = fit_target_encoder_kfold(
@@ -412,6 +430,14 @@ implementation:
                             counts = df[c].astype(object).value_counts().to_dict()
                             cfg['count_map'] = counts
                             print(f"[INFO] Count encoder fitted for '{c}': {len(counts)} unique categories")
+                        
+                        elif enc_type == 'ordinal':
+                            # FIT THE ORDINAL ENCODER NOW!
+                            ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                            resh = df[[c]].astype(object)
+                            ord_enc.fit(resh)
+                            cfg['encoder_obj'] = ord_enc
+                            print(f"[INFO] Ordinal encoder fitted for '{c}': {len(ord_enc.categories_[0])} categories")
                             
                         # OneHot encoders are fitted during transform
                             
@@ -532,16 +558,21 @@ implementation:
                     # ONE-HOT ENCODING
                     if enc_type == 'onehot':
                         ohe = cfg.get('encoder_obj')
-                        if ohe is None:
+                        ohe_columns = cfg.get('ohe_columns')
+                        
+                        if ohe is None or ohe_columns is None:
+                            # Fallback: fit now if not fitted during training (shouldn't happen)
+                            print(f"[WARN] OneHot encoder for '{c}' not pre-fitted, fitting now...")
                             ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                             resh = df[[c]].astype(str)
                             ohe.fit(resh)
                             cfg['encoder_obj'] = ohe
-                            cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                            ohe_columns = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                            cfg['ohe_columns'] = ohe_columns
                         
+                        # Transform using pre-fitted encoder
                         arr = ohe.transform(df[[c]].astype(str))
-                        cols = cfg['ohe_columns']
-                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
+                        df_ohe = pd.DataFrame(arr, columns=ohe_columns, index=df.index)
                         df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
                         
                     # TARGET ENCODING WITH K-FOLD (CRITICAL FOR ACCURACY!)
@@ -569,15 +600,20 @@ implementation:
                     elif enc_type == 'ordinal':
                         ord_enc = cfg.get('encoder_obj')
                         if ord_enc is None:
+                            # Fallback: fit now if not fitted during training (shouldn't happen)
+                            print(f"[WARN] Ordinal encoder for '{c}' not pre-fitted, fitting now...")
                             ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
                             resh = df[[c]].astype(object)
                             ord_enc.fit(resh)
                             cfg['encoder_obj'] = ord_enc
+                        
                         try:
                             df[c] = ord_enc.transform(df[[c]].astype(object)).astype(float)
-                        except Exception:
+                        except Exception as e:
+                            print(f"[WARN] Ordinal encoding failed for '{c}': {e}, using category codes")
                             # Fallback: use category codes
                             df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+
                     
                     # FALLBACK: Category codes
                     else:
