@@ -12,8 +12,8 @@ inputs:
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
-  - {name: n_estimators, type: Integer, description: "Number of trees in the RandomForest", optional: true, default: "150"}
-  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: "100"}
+  - {name: n_estimators, type: Integer, description: "Number of trees in the RandomForest", optional: true, default: "100"}
+  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: "20"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
@@ -36,6 +36,8 @@ implementation:
         from sklearn.preprocessing import LabelEncoder
         from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
         from sklearn.utils.class_weight import compute_sample_weight
+        from sklearn.model_selection import cross_val_score
+
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
@@ -141,14 +143,27 @@ implementation:
                     except Exception as e:
                         print(f"[WARN] Could not compute sample weights: {e}")
 
+                
+
                 print(f"[INFO] Training RandomForestClassifier with {args.n_estimators} trees")
                 clf = RandomForestClassifier(
                     n_estimators=int(args.n_estimators),
                     max_depth=max_depth,
                     random_state=int(args.random_state),
                     n_jobs=-1,
-                    class_weight='balanced' if bool_from_str(args.enbalance) else None
+                    class_weight='balanced' if bool_from_str(args.enbalance) else None,
+                    oob_score=True,
+                    bootstrap=True,
+                    max_features='sqrt',
+                    min_samples_split=20,
+                    min_samples_leaf=10    
                 )
+
+                print("[INFO] Running 5-fold cross-validation to check for overfitting...")
+                cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=-1)
+                print(f"[INFO] CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                metrics["cv_accuracy_mean"] = float(cv_scores.mean())
+                metrics["cv_accuracy_std"] = float(cv_scores.std())
                 clf.fit(X, y_prepared, sample_weight=sample_weight)
 
                 y_pred = clf.predict(X)
