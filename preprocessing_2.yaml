@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.0
+name: Advanced Preprocess v8.3.1
 description: |
   End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target...
   Rules:
@@ -6,7 +6,6 @@ description: |
   - Drop unique identifier columns (>95% unique values)
   - Do not preprocess the target column
   - If model_type is classification and target is categorical or string-like, apply label encoding
-  - If model_type is classification and target is numeric floats, round half-up to whole numbers
   - Outputs are train_X and train_y as separate parquet files. train_X does not contain the target column
   - Prints comprehensive data understanding statistics
   - Feature selection is optional via enable_feature_selection parameter
@@ -57,7 +56,7 @@ implementation:
         import gzip, cloudpickle
         from sklearn.inspection import permutation_importance
         
-        # ---------- helpers ----------
+        # helpers
         def ensure_dir_for(p):
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
@@ -830,7 +829,6 @@ implementation:
                 y_num=pd.to_numeric(y_raw, errors='coerce')
                 if y_num.notna().mean() > 0.8:
                     y_series = np.floor(y_num + 0.5).astype("Int64")
-                    y_info['strategy']="round_half_up"
                 else:
                     # string labels -> label encode
                     le=LabelEncoder()
