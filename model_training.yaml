@@ -1,8 +1,9 @@
-name: Train RandomForest v1.2
+name: Train RandomForest v1.3
 description: |
   Reads X and y from parquet, trains RandomForestClassifier for classification or RandomForestRegressor for regression.
   Assumes y is already encoded from preprocessing (no re-encoding needed).
   Supports class imbalance when enbalance=true for classification.
+  Prints target variable distribution before training.
   Saves trained model and training metrics.
 
 inputs:
@@ -31,13 +32,11 @@ implementation:
         import argparse, os, sys, json, traceback
         import pandas as pd, numpy as np
         import joblib
-
         from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
         from sklearn.preprocessing import LabelEncoder
         from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
         from sklearn.utils.class_weight import compute_sample_weight
         from sklearn.model_selection import cross_val_score
-
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
@@ -109,6 +108,13 @@ implementation:
                     X = X.reset_index(drop=True).iloc[:m, :]
                     y = y.reset_index(drop=True).iloc[:m]
 
+            # === Print target variable distribution ===
+            print("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
+            print(y.value_counts(dropna=False).to_string())
+            print("Unique classes:", y.nunique())
+            print("Class distribution percentages:")
+            print((y.value_counts(dropna=False, normalize=True) * 100).to_string())
+
             task = args.model_type.strip().lower()
             metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1])}
 
@@ -116,7 +122,6 @@ implementation:
 
             if task == "classification":
                 print("[INFO] Classification task detected")
-
                 meta = try_load_metadata(args.preprocess_metadata)
                 label_mapping = meta.get("label_mapping") if meta else None
 
@@ -142,8 +147,6 @@ implementation:
                         sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
                     except Exception as e:
                         print(f"[WARN] Could not compute sample weights: {e}")
-
-                
 
                 print(f"[INFO] Training RandomForestClassifier with {args.n_estimators} trees")
                 clf = RandomForestClassifier(
