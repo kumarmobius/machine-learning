@@ -13,7 +13,7 @@ inputs:
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
   - {name: n_estimators, type: Integer, description: "Number of trees in the RandomForest", optional: true, default: "150"}
-  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: ""}
+  - {name: max_depth, type: Integer, description: "Maximum depth of trees (None for unlimited)", optional: true, default: "100"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
