@@ -1,4 +1,4 @@
-name: Train RandomForest v1.1
+name: Train RandomForest v1.2
 description: |
   Reads X and y from parquet, trains RandomForestClassifier for classification or RandomForestRegressor for regression.
   Assumes y is already encoded from preprocessing (no re-encoding needed).
