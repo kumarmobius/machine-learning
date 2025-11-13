@@ -1,12 +1,12 @@
-name: Evaluate Model v1.6
+name: Evaluate Model v1.7
 description: |
   Evaluate a trained model on test data.
   - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
   - Applies saved Preprocessor (transform only) and FeatureSelector (transform only).
   - Loads pickled model and computes metrics.
   - Classification: accuracy, precision_weighted, recall_weighted, f1_weighted.
-  - Regression: r2_score.
-  - Optional preprocess_metadata with label_mapping to align y_test labels to train-time encoding.
+  - Regression: r2_score, rmse, mae.
+  - Uses preprocess_metadata with label_mapping to align y_test labels to train-time encoding.
 inputs:
   - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Data, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -28,12 +28,8 @@ implementation:
       - -c
       - |
         import argparse, os, sys, json, io, gzip, zipfile, traceback, subprocess
-        def pip_install(pkgs):
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
-
-
         import pandas as pd, numpy as np, joblib
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
         import cloudpickle, gzip
 
         def is_likely_json(sample_bytes):
@@ -52,7 +48,7 @@ implementation:
                 files=[p for p in entries if os.path.isfile(p)]
                 if not files: raise ValueError("No files in dir: "+path)
                 path = max(files, key=lambda p: os.path.getsize(p))
-                print("[info] directory input. picked file: " + path)
+                print("[INFO] Directory input. Picked file: " + path)
             ext=os.path.splitext(path)[1].lower()
             if ext==".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
                 try:
@@ -99,17 +95,28 @@ implementation:
                 os.makedirs(d, exist_ok=True)
 
         def load_pickle_any(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"File not found: {path}")
+            
+            # Try gzipped cloudpickle first
             try:
                 with gzip.open(path, "rb") as f:
                     return cloudpickle.load(f)
             except Exception:
                 pass
+            
+            # Try regular cloudpickle
             try:
                 with open(path, "rb") as f:
                     return cloudpickle.load(f)
             except Exception:
                 pass
-            return joblib.load(path)
+            
+            # Try joblib as fallback
+            try:
+                return joblib.load(path)
+            except Exception as e:
+                raise ValueError(f"Could not load pickle from {path}: {e}")
 
         parser = argparse.ArgumentParser()
         parser.add_argument("--X_test", type=str, required=True)
@@ -125,6 +132,10 @@ implementation:
         args = parser.parse_args()
 
         try:
+            print("="*80)
+            print("EVALUATION STARTED")
+            print("="*80)
+            
             X_path = args.X_test
             y_path = args.y_test
             preprocessor_path = args.preprocessor
@@ -136,144 +147,258 @@ implementation:
             target_col = str(args.target_column or "").strip()
             meta_path = (args.preprocess_metadata or "").strip()
 
+            print(f"[INFO] Task: {task}")
+            print(f"[INFO] X_test path: {X_path}")
+            print(f"[INFO] y_test path: {y_path}")
+            print(f"[INFO] Target column: {target_col if target_col else '(auto-detect)'}")
+            
+            # Load artifacts
+            print("[INFO] Loading preprocessor...")
             pre = load_pickle_any(preprocessor_path)
-            fs = load_pickle_any(feature_selector_path) if feature_selector_path and os.path.exists(feature_selector_path) else None
+            print("[INFO] Preprocessor loaded successfully")
+            
+            print("[INFO] Loading feature selector...")
+            if feature_selector_path and os.path.exists(feature_selector_path):
+                fs = load_pickle_any(feature_selector_path)
+                print("[INFO] Feature selector loaded successfully")
+            else:
+                fs = None
+                print("[INFO] No feature selector provided")
+            
+            print("[INFO] Loading model...")
             try:
                 model = joblib.load(model_path)
             except Exception:
                 model = load_pickle_any(model_path)
+            print("[INFO] Model loaded successfully")
 
+            # Load test data
+            print("[INFO] Loading test data...")
             X_raw = read_with_pandas(X_path)
+            print(f"[INFO] X_test shape: {X_raw.shape}")
+            
             y_df = read_with_pandas(y_path)
-
+            
+            # Extract target column
             if isinstance(y_df, pd.DataFrame):
                 if target_col:
                     if target_col not in y_df.columns:
-                        raise ValueError("--target_column '" + target_col + "' not in y_test. Columns: " + str(list(y_df.columns)))
-                    y = y_df[target_col]
+                        raise ValueError(f"--target_column '{target_col}' not in y_test. Available columns: {list(y_df.columns)}")
+                    y = y_df[target_col].copy()
                 elif y_df.shape[1] == 1:
-                    y = y_df.iloc[:, 0]
+                    y = y_df.iloc[:, 0].copy()
                 else:
-                    raise ValueError("y_test has multiple columns. Provide --target_column.")
+                    raise ValueError(f"y_test has {y_df.shape[1]} columns. Please provide --target_column. Available: {list(y_df.columns)}")
             else:
-                y = pd.Series(y_df)
+                y = pd.Series(y_df).copy()
 
             if len(y) == 0:
-                raise ValueError("Loaded y_test has 0 rows. Check the artifact and target_column.")
+                raise ValueError("y_test has 0 rows. Check the input file.")
+            
+            print(f"[INFO] y_test shape: {y.shape}")
+            print(f"[INFO] y_test unique values: {y.nunique()}")
+            print(f"[INFO] y_test sample values: {y.head(10).tolist()}")
 
-            # Transform X using saved preprocessor (no fitting)
-            Xp = pre.transform(X_raw, training_mode=False)
-
-            # Optional feature selector
-            if fs is not None and hasattr(fs, "selected_features"):
-                want_cols = list(fs.selected_features)
-                Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
-            elif fs is not None:
-                Xs = fs.transform(Xp)
-            else:
-                Xs = Xp
-
-            # --- Align y labels to train-time encoding if available ---
-            def _round_half_up_to_str(v):
-                if pd.isna(v):
-                    return None
-                s = str(v).strip()
-                try:
-                    from math import floor
-                    x = float(s)
-                    return str(int(floor(x + 0.5)))
-                except Exception:
-                    return s
-
-            label_map = None
+            # Load metadata and label mapping
+            print("[INFO] Loading preprocessing metadata...")
+            label_mapping = None
             if meta_path and os.path.exists(meta_path):
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
-                    label_map = meta.get("label_mapping", None)
-                    if label_map:
-                        print("info loaded label_mapping from preprocess_metadata")
+                    label_mapping = meta.get("label_mapping", None)
+                    if label_mapping:
+                        print(f"[INFO] Label mapping loaded from metadata: {label_mapping}")
+                    else:
+                        print("[WARN] No label_mapping found in metadata")
                 except Exception as e:
-                    print("warn could not read preprocess_metadata reason=", e)
-            if label_map is None:
+                    print(f"[WARN] Could not read metadata: {e}")
+            else:
+                print("[WARN] No metadata file provided")
+            
+            # Fallback: try to get label_mapping from preprocessor
+            if label_mapping is None:
                 try:
                     gm = getattr(pre, "global_metadata", {}) or {}
                     if "label_mapping" in gm:
-                        label_map = gm["label_mapping"]
-                        print("info loaded label_mapping from preprocessor.global_metadata")
+                        label_mapping = gm["label_mapping"]
+                        print(f"[INFO] Label mapping loaded from preprocessor: {label_mapping}")
                 except Exception:
                     pass
 
-            if task != "regression" and label_map is not None:
-                inv_src_to_id = { _round_half_up_to_str(k): int(v) for k, v in label_map.items() }
-                y_canon = pd.Series(y).map(_round_half_up_to_str)
-                y_enc = y_canon.map(lambda k: inv_src_to_id.get(k, None))
-                if y_enc.isna().any():
-                    missing = int(y_enc.isna().sum())
-                    print("warn unmapped targets in y_test count=", missing)
-                    keep_mask = ~y_enc.isna()
-                    Xs = Xs.iloc[keep_mask.values].reset_index(drop=True)
-                    y = y_enc[keep_mask].astype(int).reset_index(drop=True)
+            # Transform X using preprocessor
+            print("[INFO] Applying preprocessor to X_test...")
+            Xp = pre.transform(X_raw, training_mode=False)
+            print(f"[INFO] X after preprocessing: {Xp.shape}")
+
+            # Apply feature selector if available
+            if fs is not None:
+                print("[INFO] Applying feature selector...")
+                if hasattr(fs, "selected_features"):
+                    want_cols = list(fs.selected_features)
+                    print(f"[INFO] Selecting {len(want_cols)} features")
+                    Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
                 else:
-                    y = y_enc.astype(int).reset_index(drop=True)
+                    Xs = fs.transform(Xp)
+                print(f"[INFO] X after feature selection: {Xs.shape}")
+            else:
+                Xs = Xp
+                print("[INFO] No feature selection applied")
 
+            # Align y_test labels to training encoding for classification
+            y_original = y.copy()  # Keep original for reference
+            
+            if task != "regression" and label_mapping is not None:
+                print("[INFO] Applying label mapping to y_test...")
+                print(f"[INFO] Label mapping: {label_mapping}")
+                
+                # Convert y_test to match the format used in training
+                y_str = y.astype(str)
+                
+                # Map to encoded integers
+                y_encoded = y_str.map(lambda val: label_mapping.get(val, None))
+                
+                # Check for unmapped labels
+                unmapped_mask = y_encoded.isna()
+                if unmapped_mask.any():
+                    unmapped_count = int(unmapped_mask.sum())
+                    unmapped_values = y_str[unmapped_mask].unique().tolist()
+                    print(f"[WARN] Found {unmapped_count} unmapped labels in y_test: {unmapped_values}")
+                    print(f"[WARN] These rows will be excluded from evaluation")
+                    
+                    # Filter out unmapped rows
+                    keep_mask = ~unmapped_mask
+                    Xs = Xs.iloc[keep_mask.values].reset_index(drop=True)
+                    y = y_encoded[keep_mask].astype(int).reset_index(drop=True)
+                    y_original = y_original[keep_mask].reset_index(drop=True)
+                else:
+                    y = y_encoded.astype(int).reset_index(drop=True)
+                
+                print(f"[INFO] y_test after encoding - unique values: {y.unique()}")
+                print(f"[INFO] y_test after encoding - sample: {y.head(10).tolist()}")
+            elif task == "regression":
+                print("[INFO] Regression task - converting y_test to numeric...")
+                y = pd.to_numeric(y, errors='coerce')
+                # Drop NaN values
+                valid_mask = y.notna()
+                if not valid_mask.all():
+                    print(f"[WARN] Dropping {(~valid_mask).sum()} rows with non-numeric targets")
+                    Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
+                    y = y[valid_mask].reset_index(drop=True)
+                    y_original = y_original[valid_mask].reset_index(drop=True)
+            else:
+                print("[WARN] Classification task but no label_mapping found!")
+                print("[WARN] This may cause evaluation errors if y_test labels don't match training encoding")
+
+            # Final length check
             if len(y) != len(Xs):
-                raise ValueError("Length mismatch: X=" + str(len(Xs)) + " vs y=" + str(len(y)) + ". Pass matching test artifacts.")
+                raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y)}")
+            
+            print(f"[INFO] Final evaluation set size: {len(y)} samples")
 
-            # Predict
-            has_proba = hasattr(model, "predict_proba")
+            # Make predictions
+            print("[INFO] Making predictions...")
             y_pred = model.predict(Xs)
+            print(f"[INFO] Predictions shape: {y_pred.shape}")
+            print(f"[INFO] Predictions unique values: {np.unique(y_pred)}")
+            print(f"[INFO] Predictions sample: {y_pred[:10]}")
+            
+            # Get probability predictions if available
             y_proba = None
-            if has_proba:
+            if hasattr(model, "predict_proba"):
                 try:
                     y_proba = model.predict_proba(Xs)
-                except Exception:
-                    y_proba = None
+                    print(f"[INFO] Probability predictions available: {y_proba.shape}")
+                except Exception as e:
+                    print(f"[WARN] Could not get probability predictions: {e}")
 
-            # Metrics
+            # Compute metrics
+            print("="*80)
             metrics = {}
+            
             if task == "regression":
+                print("REGRESSION METRICS")
+                print("="*80)
+                
                 y_true_num = pd.to_numeric(y, errors="coerce")
                 metrics["r2"] = float(r2_score(y_true_num, y_pred))
-                print("===== REGRESSION METRICS =====")
-                print("R2 Score:", metrics["r2"])
-            else:
+                metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true_num, y_pred)))
+                metrics["mae"] = float(mean_absolute_error(y_true_num, y_pred))
+                
+                print(f"R² Score: {metrics['r2']:.6f}")
+                print(f"RMSE: {metrics['rmse']:.6f}")
+                print(f"MAE: {metrics['mae']:.6f}")
+                
+            else:  # Classification
+                print("CLASSIFICATION METRICS")
+                print("="*80)
+                
                 y_true = y
+                
+                # Ensure both are same type for comparison
                 try:
-                    if (np.issubdtype(pd.Series(y_true).dtype, np.number) and not np.issubdtype(pd.Series(y_pred).dtype, np.number)) or                        (not np.issubdtype(pd.Series(y_true).dtype, np.number) and np.issubdtype(pd.Series(y_pred).dtype, np.number)):
+                    if pd.api.types.is_numeric_dtype(y_true) and not pd.api.types.is_numeric_dtype(y_pred):
+                        y_pred = pd.Series(y_pred).astype(y_true.dtype)
+                    elif not pd.api.types.is_numeric_dtype(y_true) and pd.api.types.is_numeric_dtype(y_pred):
                         y_true = y_true.astype(str)
                         y_pred = pd.Series(y_pred).astype(str)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[WARN] Type alignment issue: {e}")
+                
                 metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
                 metrics["precision_weighted"] = float(precision_score(y_true, y_pred, average="weighted", zero_division=0))
                 metrics["recall_weighted"] = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
                 metrics["f1_weighted"] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
-                print("===== CLASSIFICATION METRICS =====")
-                print("Accuracy:", metrics["accuracy"])
-                print("Precision (weighted):", metrics["precision_weighted"])
-                print("Recall (weighted):", metrics["recall_weighted"])
-                print("F1 Score (weighted):", metrics["f1_weighted"])
+                
+                print(f"Accuracy: {metrics['accuracy']:.6f}")
+                print(f"Precision (weighted): {metrics['precision_weighted']:.6f}")
+                print(f"Recall (weighted): {metrics['recall_weighted']:.6f}")
+                print(f"F1 Score (weighted): {metrics['f1_weighted']:.6f}")
+                
+                # Show confusion info
+                print(f"Unique true labels: {np.unique(y_true)}")
+                print(f"Unique predicted labels: {np.unique(y_pred)}")
+
+            print("="*80)
 
             # Save metrics
+            print(f"[INFO] Saving metrics to: {metrics_path}")
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
             # Save predictions
+            print(f"[INFO] Saving predictions to: {preds_path}")
             ensure_dir_for(preds_path)
-            out = pd.DataFrame({"y_true": y, "y_pred": y_pred})
+            out = pd.DataFrame({
+                "y_true": y,
+                "y_pred": y_pred,
+                "y_true_original": y_original  # Keep original labels for reference
+            })
+            
             if isinstance(y_proba, np.ndarray):
                 try:
                     out["y_proba_max"] = y_proba.max(axis=1)
-                except Exception:
-                    pass
+                    # Add individual class probabilities
+                    for i in range(y_proba.shape[1]):
+                        out[f"y_proba_class_{i}"] = y_proba[:, i]
+                except Exception as e:
+                    print(f"[WARN] Could not save probabilities: {e}")
+            
             out.to_parquet(preds_path, index=False)
 
-            print("SUCCESS evaluation complete")
+            print("="*80)
+            print("SUCCESS: Evaluation complete")
+            print("="*80)
+            
         except Exception as e:
-            print("ERROR during evaluation:", e, file=sys.stderr)
+            print("="*80, file=sys.stderr)
+            print("ERROR DURING EVALUATION", file=sys.stderr)
+            print("="*80, file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
+            print("Full traceback:", file=sys.stderr)
             traceback.print_exc()
+            print("="*80, file=sys.stderr)
             sys.exit(1)
     args:
       - --X_test
