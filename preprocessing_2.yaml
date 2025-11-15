@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.6
+name: Advanced Preprocess v8.3.7
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -682,25 +682,17 @@ implementation:
                 self._pi_importance_ = pd.Series(dtype=float)
 
             def _auto_k(self, p: int, n_samples: int = None) -> int:
-                
-                
                 if n_samples is None:
-                    # Conservative default
-                    base_k = max(5, min(int(math.ceil(math.sqrt(p) * 2.0)), p))
+                    base_k = max(10, min(int(math.sqrt(p) * 3.0), p))
                 else:
-                    # Adaptive based on sample size
                     if n_samples < 500:
-                        # Small dataset: be very conservative
-                        base_k = max(5, min(int(math.sqrt(p)), int(p * 0.5)))
+                        base_k = max(10, min(int(math.sqrt(p) * 1.5), int(p * 0.6)))
                     elif n_samples < 5000:
-                        # Medium dataset: moderate
-                        base_k = max(5, min(int(math.sqrt(p) * 2), int(p * 0.6)))
+                        base_k = max(10, min(int(math.sqrt(p) * 3), int(p * 0.7)))
                     else:
-                        # Large dataset: can afford more features
-                        base_k = max(5, min(int(math.sqrt(p) * 3), int(p * 0.7)))
+                        base_k = max(10, min(int(math.sqrt(p) * 4), int(p * 0.8)))
                     
-                    # Critical: Never have more features than samples/10
-                    max_allowed = max(5, n_samples // 10)
+                    max_allowed = max(10, n_samples // 5)
                     base_k = min(base_k, max_allowed)
                 
                 return base_k
