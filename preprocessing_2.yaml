@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4
+name: Advanced Preprocess v8.4.1
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -425,13 +425,11 @@ implementation:
                 nrows=len(df)
                 date_derived_cols = [c for c in df.columns if any(
                     suffix in c for suffix in ['_year', '_month', '_day', '_dayofweek', '_quarter', 
-                                                 '_is_weekend', '_days_since_epoch', '_month_sin', 
-                                                 '_month_cos', '_day_sin', '_day_cos']
+                                                '_is_weekend', '_days_since_epoch', '_month_sin', 
+                                                '_month_cos', '_day_sin', '_day_cos']
                 )]
-            
-                # Extract original date column names
+                
                 if date_derived_cols:
-                    # Find the base column names (e.g., "Date" from "Date_year")
                     date_bases = set()
                     for col in date_derived_cols:
                         for suffix in ['_year', '_month', '_day', '_dayofweek', '_quarter', 
@@ -440,11 +438,16 @@ implementation:
                                       '_is_month_start', '_is_month_end', '_is_quarter_start', '_is_quarter_end']:
                             if col.endswith(suffix):
                                 base = col[:-len(suffix)]
+                                # Remove "_orig" suffix to get ORIGINAL column name
+                                if base.endswith('_orig'):
+                                    base = base[:-5]  # Remove "_orig"
                                 date_bases.add(base)
                                 break
                     
                     self.date_columns = list(date_bases)
-                    print(f"[INFO] Preprocessor detected {len(self.date_columns)} date columns: {self.date_columns}")
+                    print(f"[INFO] Preprocessor will extract dates from: {self.date_columns}")
+                else:
+                    self.date_columns = []
                 
                 self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
                 self.cat_cols=[c for c in df.columns if c not in self.num_cols]
@@ -528,12 +531,26 @@ implementation:
                 protected_cols=set([target_col]) if target_col in df.columns else set()
                 cfg_global = self.global_metadata.get('config') or {}
                 if hasattr(self, 'date_columns') and self.date_columns:
-                    print(f"[INFO] Applying date extraction to {len(self.date_columns)} columns...")
-                if self.date_columns:
-                    print(f"[INFO] Applying date extraction to {len(self.date_columns)} columns...")
-                    exclude_cols = [target_col] if target_col else []
-                    df, _ = detect_and_extract_dates(df, enabled=True, exclude_cols=exclude_cols)
-                    print(f"[INFO] Date extraction complete. Shape: {df.shape}")
+                    print(f"[INFO] Checking for date columns to extract...")
+                    
+                    # Only extract dates that are still in object/string format
+                    cols_to_extract = []
+                    for date_col in self.date_columns:
+                        if date_col in df.columns:
+                            # Check if it's still an object/string (not already extracted)
+                            if df[date_col].dtype == 'object' or str(df[date_col].dtype).startswith('string'):
+                                cols_to_extract.append(date_col)
+                            else:
+                                print(f"[INFO] Skipping '{date_col}' - already processed (dtype: {df[date_col].dtype})")
+            
+                    if cols_to_extract:
+                        print(f"[INFO] Extracting dates from {len(cols_to_extract)} columns: {cols_to_extract}")
+                        exclude_cols = [target_col] if target_col else []
+                        df, _ = detect_and_extract_dates(df, enabled=True, exclude_cols=exclude_cols)
+                        print(f"[INFO] Date extraction complete. Shape: {df.shape}")
+                    else:
+                        print(f"[INFO] No date extraction needed - all date columns already processed")
+                
     
                 df.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
                 for c in list(self.num_cols):
