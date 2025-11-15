@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.3.8
+name: Advanced Preprocess v8.4
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -429,23 +429,23 @@ implementation:
                                                  '_month_cos', '_day_sin', '_day_cos']
                 )]
             
-            # Extract original date column names
-            if date_derived_cols:
-                # Find the base column names (e.g., "Date" from "Date_year")
-                date_bases = set()
-                for col in date_derived_cols:
-                    for suffix in ['_year', '_month', '_day', '_dayofweek', '_quarter', 
-                                  '_is_weekend', '_days_since_epoch', '_month_sin', 
-                                  '_month_cos', '_day_sin', '_day_cos', '_hour', '_is_business_hours',
-                                  '_is_month_start', '_is_month_end', '_is_quarter_start', '_is_quarter_end']:
-                        if col.endswith(suffix):
-                            base = col[:-len(suffix)]
-                            date_bases.add(base)
-                            break
+                # Extract original date column names
+                if date_derived_cols:
+                    # Find the base column names (e.g., "Date" from "Date_year")
+                    date_bases = set()
+                    for col in date_derived_cols:
+                        for suffix in ['_year', '_month', '_day', '_dayofweek', '_quarter', 
+                                      '_is_weekend', '_days_since_epoch', '_month_sin', 
+                                      '_month_cos', '_day_sin', '_day_cos', '_hour', '_is_business_hours',
+                                      '_is_month_start', '_is_month_end', '_is_quarter_start', '_is_quarter_end']:
+                            if col.endswith(suffix):
+                                base = col[:-len(suffix)]
+                                date_bases.add(base)
+                                break
+                    
+                    self.date_columns = list(date_bases)
+                    print(f"[INFO] Preprocessor detected {len(self.date_columns)} date columns: {self.date_columns}")
                 
-                self.date_columns = list(date_bases)
-                print(f"[INFO] Preprocessor detected {len(self.date_columns)} date columns: {self.date_columns}")
-            
                 self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
                 self.cat_cols=[c for c in df.columns if c not in self.num_cols]
                 for c in self.num_cols:
