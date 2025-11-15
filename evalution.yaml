@@ -1,13 +1,4 @@
 name: Evaluate Model v1.8
-description: |
-  Evaluate a trained model on test data.
-  - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
-  - Reconstructs full dataframe for preprocessing (includes target temporarily).
-  - Applies saved Preprocessor (transform only) and FeatureSelector (transform only).
-  - Loads pickled model and computes metrics.
-  - Classification: accuracy, precision_weighted, recall_weighted, f1_weighted.
-  - Regression: r2_score, rmse, mae.
-  - Uses preprocess_metadata with label_mapping to align y_test labels to train-time encoding.
 inputs:
   - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Data, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -451,7 +442,7 @@ implementation:
                         columns=[f"Pred_{i}" for i in range(cm.shape[1])]
                     )
                     print(cm_df)
-                    print(f"\nUnique true labels: {np.unique(y_true)}")
+                    print(f"Unique true labels: {np.unique(y_true)}")
                     print(f"Unique predicted labels: {np.unique(y_pred)}")
                     
                     # Add confusion matrix to metrics
@@ -507,7 +498,7 @@ implementation:
             print("ERROR DURING EVALUATION", file=sys.stderr)
             print("="*80, file=sys.stderr)
             print(f"Error: {e}", file=sys.stderr)
-            print("\nFull traceback:", file=sys.stderr)
+            print("Full traceback:", file=sys.stderr)
             traceback.print_exc()
             print("="*80, file=sys.stderr)
             sys.exit(1)
