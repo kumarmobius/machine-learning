@@ -1,15 +1,4 @@
-name: Advanced Preprocess v8.3.5
-description: |
-  End-to-end robust preprocessing and feature selection that reads a single dataset containing features and target
-  Rules:
-  - Drop columns with >40% missing values immediately after load
-  - Drop unique identifier columns (>95% unique values)
-  - Do not preprocess the target column
-  - If model_type is classification and target is categorical or string-like, apply label encoding
-  - Outputs are train_X and train_y as separate parquet files. train_X does not contain the target column
-  - Prints comprehensive data understanding statistics
-  - Feature selection is optional via enable_feature_selection parameter
-  - Preserves robust preprocessing logic with advanced categorical encoders
+name: Advanced Preprocess v8.3.6
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -51,11 +40,14 @@ implementation:
         from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
         import joblib
         import re
+        import math
         import category_encoders as ce
         from rapidfuzz import process as rf_process, fuzz as rf_fuzz
         import gzip, cloudpickle
         from sklearn.inspection import permutation_importance
         from sklearn.model_selection import StratifiedKFold
+        from sklearn.preprocessing import PolynomialFeatures
+        from itertools import combinations
         
         # helpers
         def ensure_dir_for(p):
@@ -187,30 +179,128 @@ implementation:
             return df, report
 
         def detect_and_extract_dates(df, enabled=True, exclude_cols=None):
-            df=df.copy(); report={'date_columns':[],'skipped':[]}
-            if not enabled: return df, report
-            exclude_cols=set(exclude_cols or [])
-            cand=[c for c in df.columns if c not in exclude_cols and (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
+            df = df.copy()
+            report = {'date_columns': [], 'skipped': [], 'patterns_found': {}}
+            if not enabled:
+                return df, report
+            
+            exclude_cols = set(exclude_cols or [])
+            cand = [c for c in df.columns if c not in exclude_cols and 
+                    (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
+            
+            datetime_patterns = [
+                (r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}', 'ISO_DATE'),
+                (r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}[T\s]\d{1,2}:\d{2}', 'ISO_DATETIME'),
+                (r'^\d{1,2}[-/]\d{1,2}[-/]\d{4}', 'US_DATE'),
+                (r'^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}', 'EU_DATE'),
+                (r'^\w{3,9}\s+\d{1,2},?\s+\d{4}', 'MONTH_NAME'),
+                (r'^\d{10}$', 'UNIX_TIMESTAMP'),
+                (r'^\d{13}$', 'UNIX_TIMESTAMP_MS'),
+            ]
+            
             for col in cand:
-                ser=df[col].astype(object); sample=ser.dropna().astype(str).head(500)
-                if sample.empty: report['skipped'].append({'col':col,'parsable_fraction':0.0}); continue
-                parsed=pd.to_datetime(sample, errors='coerce', utc=False)
-                frac=parsed.notna().mean()
-                if frac>=0.6:
-                    full=pd.to_datetime(ser, errors='coerce', utc=False)
-                    df[col+"_orig"]=df[col]; df[col]=full
-                    df[col+"_year"]=df[col].dt.year
-                    df[col+"_month"]=df[col].dt.month
-                    df[col+"_day"]=df[col].dt.day
-                    df[col+"_dayofweek"]=df[col].dt.dayofweek
-                    df[col+"_is_weekend"]=df[col].dt.dayofweek.isin([5,6]).astype('Int64')
-                    df[col+"_is_month_start"]=df[col].dt.is_month_start.astype('Int64')
-                    df[col+"_is_month_end"]=df[col].dt.is_month_end.astype('Int64')
-                    df[col+"_days_since_epoch"]=(df[col]-pd.Timestamp("1970-01-01"))//pd.Timedelta('1D')
-                    report['date_columns'].append({'col':col,'parsable_fraction':frac})
+                ser = df[col].astype(object)
+                sample = ser.dropna().astype(str).head(500)
+                
+                if sample.empty:
+                    report['skipped'].append({'col': col, 'parsable_fraction': 0.0})
+                    continue
+                detected_pattern = None
+                for pattern, pattern_name in datetime_patterns:
+                    matches = sample.str.match(pattern, na=False).sum()
+                    if matches / len(sample) >= 0.5:
+                        detected_pattern = pattern_name
+                        break
+                if detected_pattern in ['UNIX_TIMESTAMP', 'UNIX_TIMESTAMP_MS']:
+                    try:
+                        numeric_ser = pd.to_numeric(ser, errors='coerce')
+                        if detected_pattern == 'UNIX_TIMESTAMP_MS':
+                            parsed = pd.to_datetime(numeric_ser, unit='ms', errors='coerce', utc=False)
+                        else:
+                            parsed = pd.to_datetime(numeric_ser, unit='s', errors='coerce', utc=False)
+                        frac = parsed.notna().mean()
+                    except:
+                        frac = 0.0
+                        parsed = None
                 else:
-                    report['skipped'].append({'col':col,'parsable_fraction':frac})
+                    parsed = pd.to_datetime(sample, errors='coerce', utc=False, infer_datetime_format=True)
+                    frac = parsed.notna().mean()
+                
+                if frac >= 0.6:
+                    if detected_pattern in ['UNIX_TIMESTAMP', 'UNIX_TIMESTAMP_MS']:
+                        numeric_full = pd.to_numeric(ser, errors='coerce')
+                        if detected_pattern == 'UNIX_TIMESTAMP_MS':
+                            full = pd.to_datetime(numeric_full, unit='ms', errors='coerce', utc=False)
+                        else:
+                            full = pd.to_datetime(numeric_full, unit='s', errors='coerce', utc=False)
+                    else:
+                        full = pd.to_datetime(ser, errors='coerce', utc=False, infer_datetime_format=True)
+                    
+                    df[col + "_orig"] = df[col]
+                    df[col] = full
+                    df[col + "_year"] = df[col].dt.year.astype('Int64')
+                    df[col + "_month"] = df[col].dt.month.astype('Int64')
+                    df[col + "_day"] = df[col].dt.day.astype('Int64')
+                    df[col + "_dayofweek"] = df[col].dt.dayofweek.astype('Int64')
+                    df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
+                    df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
+                    df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
+                    df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
+                    df[col + "_is_month_start"] = df[col].dt.is_month_start.astype('Int64')
+                    df[col + "_is_month_end"] = df[col].dt.is_month_end.astype('Int64')
+                    df[col + "_is_quarter_start"] = df[col].dt.is_quarter_start.astype('Int64')
+                    df[col + "_is_quarter_end"] = df[col].dt.is_quarter_end.astype('Int64')
+                    if (df[col].dt.hour != 0).any():
+                        df[col + "_hour"] = df[col].dt.hour.astype('Int64')
+                        df[col + "_is_business_hours"] = ((df[col].dt.hour >= 9) & 
+                                                           (df[col].dt.hour <= 17)).astype('Int64')
+                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                    
+                    report['date_columns'].append({
+                        'col': col,
+                        'parsable_fraction': frac,
+                        'pattern': detected_pattern or 'AUTO_DETECTED'
+                    })
+                    report['patterns_found'][col] = detected_pattern or 'AUTO_DETECTED'
+                    
+                    print(f"[INFO] Detected datetime in '{col}' (pattern: {detected_pattern or 'AUTO'}, {frac*100:.1f}% valid)")
+                else:
+                    report['skipped'].append({'col': col, 'parsable_fraction': frac})
+
             return df, report
+            
+        def add_polynomial_features(df, numeric_cols, degree=2, interaction_only=True, max_features=20):
+            
+            if len(numeric_cols) < 2:
+                return df
+            
+            print(f"[INFO] Creating polynomial features (degree={degree}, interaction_only={interaction_only})")
+            variances = df[numeric_cols].var().sort_values(ascending=False)
+            top_cols = variances.head(min(5, len(numeric_cols))).index.tolist()
+            new_features = {}
+            interaction_count = 0
+            
+            for col1, col2 in combinations(top_cols, 2):
+                if interaction_count >= max_features:
+                    break
+                interaction_name = f"{col1}_x_{col2}"
+                new_features[interaction_name] = df[col1] * df[col2]
+                interaction_count += 1
+                if (df[col2] != 0).all():
+                    div_name = f"{col1}_div_{col2}"
+                    new_features[div_name] = df[col1] / df[col2]
+                    interaction_count += 1
+            
+            if degree == 2:
+                for col in top_cols[:3]:  # Only top 3
+                    new_features[f"{col}_squared"] = df[col] ** 2
+            for name, values in new_features.items():
+                df[name] = values
+            
+            print(f"[INFO] Created {len(new_features)} polynomial/interaction features")
+            return df
 
         def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
             counts=series.value_counts(dropna=False); n=len(series)
@@ -278,64 +368,43 @@ implementation:
             n = len(series)
             nunique = series.nunique(dropna=True)
             high_card = (nunique > max(50, 0.05 * n))
-            
-            # For very low cardinality: use one-hot encoding (safest, most interpretable)
             if nunique <= 2:
                 enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                 return 'onehot', enc, {}
-            
-            # For low cardinality (3-10 unique): use one-hot
             elif nunique <= 10:
                 enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                 return 'onehot', enc, {}
-            
-            # For medium cardinality (11-50): use target encoding IF target available and training mode
             elif nunique <= 50:
                 if target_series is not None and train_mode and model_type == 'classification':
-                    # Use K-Fold target encoding (safe from leakage)
                     return 'target_kfold', None, {}
                 else:
-                    # Fallback to count encoding for inference/regression
                     return 'count', None, {}
-            
-            # For high cardinality (>50): use target encoding in training, count in inference
             else:  # high_card == True
                 if target_series is not None and train_mode and model_type == 'classification':
-                    # High cardinality benefits most from target encoding
                     return 'target_kfold', None, {}
                 else:
-                    # Count encoding for test/inference
                     return 'count', None, {}
             
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42):        
             X_col = df[col].astype(object).fillna('__NA__')
             global_mean = float(y.mean())
             oof = pd.Series(index=df.index, dtype=float)
-            
-            # Use StratifiedKFold for better class distribution
             try:
                 kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
                 splits = list(kf.split(df, y))
             except:
-                # Fallback to regular KFold if StratifiedKFold fails
                 from sklearn.model_selection import KFold
                 kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
                 splits = list(kf.split(df))
-            
-            # Compute out-of-fold encodings (CRITICAL: prevents leakage)
             for train_idx, val_idx in splits:
-                # Compute means only on training fold
                 train_means = y.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
-                # Apply to validation fold
                 oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
-            
-            # Compute global smoothed mapping for test data (uses all training data)
+          
             counts = X_col.value_counts()
             smooth_map = {}
             for cat, cnt in counts.items():
                 if cnt > 0:
                     cat_mean = float(y[X_col == cat].mean())
-                    # Smoothing: blend category mean with global mean
                     alpha = cnt / (cnt + smoothing)
                     smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
                 else:
@@ -352,12 +421,8 @@ implementation:
                 self.global_metadata['target_col']=target_col
                 self.global_metadata['model_type']=model_type
                 nrows=len(df)
-                
-                # Identify numeric and categorical columns
                 self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
                 self.cat_cols=[c for c in df.columns if c not in self.num_cols]
-
-                # Configure numeric columns
                 for c in self.num_cols:
                     s=df[c]; cfg={}
                     missing_frac=s.isna().mean(); cfg['missing_frac']=float(missing_frac)
@@ -374,7 +439,6 @@ implementation:
                             cfg['imputer']=('iterative',{'max_iter':10,'random_state':0})
                     cfg['scaler_choice']='auto'
                     self.col_config[c]=cfg
-                # Configure categorical columns
                 for c in self.cat_cols:
                     s = df[c].astype(object)
                     cfg = {}
@@ -383,10 +447,9 @@ implementation:
                     cfg['high_card'] = cfg['n_unique'] > max(50, 0.05*nrows)
                     cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
                     
-                    # CRITICAL FIX: Pass the actual target (y) so target encoding can be selected!
                     enc_name, enc_obj, _ = choose_categorical_encoder(
                         c, s, 
-                        target_series=y,  # ← CHANGED FROM None to y
+                        target_series=y, 
                         train_mode=True, 
                         model_type=model_type
                     )
@@ -394,19 +457,15 @@ implementation:
                     cfg['encoder_type'] = enc_name
                     cfg['encoder_obj'] = enc_obj
                     self.col_config[c] = cfg
-                
-                # Fit encoders based on encoder type
                 if y is not None and model_type == 'classification':
                     for c in self.cat_cols:
                         cfg = self.col_config[c]
                         enc_type = cfg['encoder_type']
                         
                         if enc_type == 'onehot':
-                            # FIT THE ONEHOT ENCODER NOW!
                             ohe = cfg.get('encoder_obj')
                             if ohe is not None:
                                 print(f"[INFO] Fitting OneHot encoder for column: {c}")
-                                # Fit on the current data
                                 resh = df[[c]].astype(str)
                                 ohe.fit(resh)
                                 cfg['encoder_obj'] = ohe
@@ -414,54 +473,40 @@ implementation:
                                 print(f"[INFO] OneHot encoder fitted for '{c}': {len(ohe.categories_[0])} categories")
                         
                         elif enc_type == 'target_kfold':
-                            # Fit K-Fold target encoder (prevents leakage)
                             print(f"[INFO] Fitting K-Fold target encoder for column: {c}")
                             oof_encoding, test_mapping, global_mean = fit_target_encoder_kfold(
                                 df, c, y, n_splits=5, smoothing=1.0, random_state=42
                             )
-                            # Store OOF encodings for training transformation
-                            cfg['oof_encoding'] = oof_encoding  # OUT-OF-FOLD values (no leakage!)
-                            cfg['target_mapping'] = test_mapping  # For test data
+                            cfg['oof_encoding'] = oof_encoding 
+                            cfg['target_mapping'] = test_mapping 
                             cfg['target_global_mean'] = float(global_mean)
                             print(f"[INFO] Target encoder fitted for '{c}': {len(test_mapping)} unique categories")
                             
                         elif enc_type == 'count':
-                            # Count encoding: simple frequency mapping
                             counts = df[c].astype(object).value_counts().to_dict()
                             cfg['count_map'] = counts
                             print(f"[INFO] Count encoder fitted for '{c}': {len(counts)} unique categories")
                         
                         elif enc_type == 'ordinal':
-                            # FIT THE ORDINAL ENCODER NOW!
                             ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
                             resh = df[[c]].astype(object)
                             ord_enc.fit(resh)
                             cfg['encoder_obj'] = ord_enc
-                            print(f"[INFO] Ordinal encoder fitted for '{c}': {len(ord_enc.categories_[0])} categories")
-                            
-                        # OneHot encoders are fitted during transform
-                            
+                            print(f"[INFO] Ordinal encoder fitted for '{c}': {len(ord_enc.categories_[0])} categories")      
                 self.global_metadata['num_cols']=self.num_cols; self.global_metadata['cat_cols']=self.cat_cols
                 return self
 
             def transform(self, df, training_mode=False):
                 import numpy as np, pandas as pd
                 df=df.copy()
-
-                # Never touch the target column
                 target_col = self.global_metadata.get('target_col')
                 protected_cols=set([target_col]) if target_col in df.columns else set()
-
-                # normalize string tokens to NaN
+                cfg_global = self.global_metadata.get('config') or {}
                 df.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
-
-                # force numeric on learned numeric cols
                 for c in list(self.num_cols):
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
-
                 temp_df=df.copy()
-
                 for c in self.num_cols:
                     imputer_info=self.col_config.get(c,{}).get('imputer',('none',None))
                     if imputer_info[0] in ('knn','iterative'):
@@ -511,8 +556,6 @@ implementation:
                     cfg=self.col_config[c]
                     if cfg['imputer'][0]=='simple_median':
                         imp=cfg['imputer'][1]; df[c]=imp.transform(df[[c]])
-
-                cfg_global=self.global_metadata.get('config') or {}
                 if training_mode:
                     if cfg_global.get('outlier_strategy','drop_iqr')=='drop_iqr':
                         df2, n_removed, kept_mask = drop_outliers_iqr(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
@@ -531,14 +574,21 @@ implementation:
                         try: df[c]=sc.fit_transform(df[[c]].values).reshape(-1)
                         except Exception: df[c]=StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
                     self.col_config[c]['scaler_obj']=sc
-
-                # categorical encodings; never touch target
-                # Categorical encodings; never touch target
+                if training_mode and cfg_global.get('create_interactions', False):
+                    print("[INFO] Creating polynomial/interaction features...")
+                    current_num_cols = [c for c in df.columns if c in self.num_cols]
+                    if len(current_num_cols) >= 2:
+                        df = add_polynomial_features(
+                            df, 
+                            current_num_cols, 
+                            degree=2, 
+                            interaction_only=True, 
+                            max_features=15
+                        )
+                        print(f"[INFO] DataFrame shape after interactions: {df.shape}")
                 for c in [cc for cc in self.cat_cols if cc in df.columns and cc != target_col]:
                     cfg = self.col_config[c]
                     s = df[c].astype(object)
-                    
-                    # Apply rare label collapsing
                     rare_thresh = cfg.get('rare_threshold_frac', 0.01)
                     if rare_thresh < 1.0:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
@@ -546,22 +596,17 @@ implementation:
                         collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
                     df[c] = collapsed
                     cfg['rare_values'] = list(rare_set)
-                    
-                    # String similarity grouping
                     if cfg_global.get('enable_string_similarity', False) and cfg['n_unique'] > 20:
                         grouped, mapping = string_similarity_group(df[c], score_threshold=90)
                         df[c] = grouped
                         cfg['string_similarity_map'] = mapping
                     
                     enc_type = cfg.get('encoder_type')
-                    
-                    # ONE-HOT ENCODING
                     if enc_type == 'onehot':
                         ohe = cfg.get('encoder_obj')
                         ohe_columns = cfg.get('ohe_columns')
                         
                         if ohe is None or ohe_columns is None:
-                            # Fallback: fit now if not fitted during training (shouldn't happen)
                             print(f"[WARN] OneHot encoder for '{c}' not pre-fitted, fitting now...")
                             ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                             resh = df[[c]].astype(str)
@@ -569,38 +614,25 @@ implementation:
                             cfg['encoder_obj'] = ohe
                             ohe_columns = [f"{c}__{cat}" for cat in ohe.categories_[0]]
                             cfg['ohe_columns'] = ohe_columns
-                        
-                        # Transform using pre-fitted encoder
                         arr = ohe.transform(df[[c]].astype(str))
                         df_ohe = pd.DataFrame(arr, columns=ohe_columns, index=df.index)
                         df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
-                        
-                    # TARGET ENCODING WITH K-FOLD (CRITICAL FOR ACCURACY!)
                     elif enc_type == 'target_kfold':
-                        # CRITICAL: Use OOF encodings in training, test mapping in inference
                         if training_mode and 'oof_encoding' in cfg:
-                            # Training: use out-of-fold encodings (NO LEAKAGE!)
                             oof = cfg['oof_encoding']
                             df[c] = oof.reindex(df.index, fill_value=cfg.get('target_global_mean', 0.0)).astype(float)
                             print(f"[INFO] Applied OOF target encoding for '{c}' in TRAINING mode")
                         else:
-                            # Inference/Test: use the global mapping
                             mapping = cfg.get('target_mapping', {})
                             global_mean = cfg.get('target_global_mean', 0.0)
                             df[c] = df[c].map(lambda x: mapping.get(x, global_mean)).astype(float)
                             print(f"[INFO] Applied test target encoding for '{c}' in INFERENCE mode")
-                    
-                    # COUNT ENCODING
                     elif enc_type == 'count':
                         cnt_map = cfg.get('count_map', df[c].value_counts().to_dict())
-                        # Map to frequency counts, use 0 for unseen categories
                         df[c] = df[c].map(lambda x: cnt_map.get(x, 0)).astype(float)
-                    
-                    # ORDINAL ENCODING
                     elif enc_type == 'ordinal':
                         ord_enc = cfg.get('encoder_obj')
                         if ord_enc is None:
-                            # Fallback: fit now if not fitted during training (shouldn't happen)
                             print(f"[WARN] Ordinal encoder for '{c}' not pre-fitted, fitting now...")
                             ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
                             resh = df[[c]].astype(object)
@@ -648,9 +680,30 @@ implementation:
                 self._relevance_keep_ = []
                 self._mi_scores_ = pd.Series(dtype=float)
                 self._pi_importance_ = pd.Series(dtype=float)
-        
-            def _auto_k(self, p: int) -> int:
-                return max(5, min(int(math.ceil(math.sqrt(p) * 2.0)), p))
+
+            def _auto_k(self, p: int, n_samples: int = None) -> int:
+                
+                
+                if n_samples is None:
+                    # Conservative default
+                    base_k = max(5, min(int(math.ceil(math.sqrt(p) * 2.0)), p))
+                else:
+                    # Adaptive based on sample size
+                    if n_samples < 500:
+                        # Small dataset: be very conservative
+                        base_k = max(5, min(int(math.sqrt(p)), int(p * 0.5)))
+                    elif n_samples < 5000:
+                        # Medium dataset: moderate
+                        base_k = max(5, min(int(math.sqrt(p) * 2), int(p * 0.6)))
+                    else:
+                        # Large dataset: can afford more features
+                        base_k = max(5, min(int(math.sqrt(p) * 3), int(p * 0.7)))
+                    
+                    # Critical: Never have more features than samples/10
+                    max_allowed = max(5, n_samples // 10)
+                    base_k = min(base_k, max_allowed)
+                
+                return base_k
         
             @staticmethod
             def _nzv_keep(X: pd.DataFrame, threshold: float) -> list:
@@ -750,10 +803,10 @@ implementation:
                 keep2 = self._corr_prune_keep(X1, self._CORR_THRESH)
                 Xf = X1[keep2]
                 self._filter_keep_ = list(Xf.columns)
-        
                 mi = self._mi_scores(Xf, y_arr)
                 self._mi_scores_ = mi.copy()
-                k = self._auto_k(Xf.shape[1])
+                k = self._auto_k(Xf.shape[1], n_samples=len(Xf))
+                print(f"[INFO] Adaptive k selection: {k} features (from {Xf.shape[1]} candidates, {len(Xf)} samples)")
                 if self._RELEVANCE == "mrmr":
                     keep_rel = self._mrmr_greedy(Xf, mi, k)
                 else:
@@ -879,30 +932,20 @@ implementation:
             unique_threshold=float(args.unique_threshold)
             preview_rows=int(args.preview_rows)
             out_X=args.train_X; out_y=args.train_y; preproc_path=args.preprocessor; fs_path=args.feature_selector; meta_path=args.preprocess_metadata
-
             if not os.path.exists(in_path):
                 print("ERROR input file does not exist: " + str(in_path), file=sys.stderr); sys.exit(1)
             print("Loading: " + in_path)
             df = read_with_pandas(in_path)
             print(f"Loaded shape: {df.shape}")
             print(f"All columns: {list(df.columns)}")
-
             if target_col not in df.columns:
                 print("ERROR target column " + str(target_col) + " not found", file=sys.stderr); sys.exit(1)
-
-            # Print comprehensive data understanding
             print_data_understanding(df, target_col, preview_rows)
-
-            # Drop duplicates
             before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
             dropped_dupes = before - len(df)
             print(f"Removed duplicates: {dropped_dupes} rows dropped")
-
-            # Pull target aside first
             y_raw = df[target_col].copy()
             X_raw = df.drop(columns=[target_col]).copy()
-
-            # Drop columns with high missing percentage (excluding target)
             missing_report = {}
             cols_to_drop_missing = []
             for col in X_raw.columns:
@@ -916,8 +959,6 @@ implementation:
                 for col in cols_to_drop_missing:
                     print(f"   - {col}: {missing_report[col]*100:.2f}% missing")
                 X_raw = X_raw.drop(columns=cols_to_drop_missing)
-
-            # Drop unique identifier columns (high cardinality)
             unique_report = {}
             cols_to_drop_unique = []
             for col in X_raw.columns:
@@ -933,18 +974,12 @@ implementation:
                 X_raw = X_raw.drop(columns=cols_to_drop_unique)
 
             print(f"Remaining features after filtering: {X_raw.shape[1]} columns")
-
-            # Convert object columns in X only
             print("Converting object columns in X to numeric where possible")
             X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
             print(f"Conversion report: {len(conv_report.get('converted', []))} columns converted")
-
-            # Detect dates in X only
             print("Detecting date-like columns in X")
             X_dates, date_report = detect_and_extract_dates(X_conv, enabled=True, exclude_cols=None)
             print(f"Date detection report: {len(date_report.get('date_columns', []))} date columns found")
-
-            # Build config
             config={
                 'outlier_strategy': outlier_strategy,
                 'outlier_fold': outlier_fold,
@@ -955,29 +990,22 @@ implementation:
                 'missing_threshold': missing_threshold,
                 'unique_threshold': unique_threshold
             }
-
-            # Prepare y according to task
             y_info={'strategy': None, 'classes_': None}
             label_mapping = None
             if model_type=="regression":
                 y_series=pd.to_numeric(y_raw, errors='coerce')
                 y_info['strategy']="numeric_coerce"
             else:
-                # try numeric rounding half-up
                 y_num=pd.to_numeric(y_raw, errors='coerce')
                 if y_num.notna().mean() > 0.8:
                     y_series = np.floor(y_num + 0.5).astype("Int64")
                 else:
-                    # string labels -> label encode
                     le=LabelEncoder()
                     y_series = pd.Series(le.fit_transform(y_raw.astype(str)), index=y_raw.index)
                     y_info['strategy']="label_encode"
                     y_info['classes_']=list(map(str, le.classes_))
                     label_mapping = {str(original): int(encoded) for original, encoded in zip(le.classes_, range(len(le.classes_)))}
                     print(f"[INFO] Created label mapping: {label_mapping}")
-
-            
-            # Drop rows with null y
             if model_type == "classification":
                 class_counts = y_series.value_counts().sort_index()
                 print("="*80)
@@ -986,8 +1014,6 @@ implementation:
                 for cls, count in class_counts.items():
                     pct = (count / len(y_series)) * 100
                     print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
-                
-                # Check for severe imbalance
                 min_class = class_counts.min()
                 max_class = class_counts.max()
                 imbalance_ratio = max_class / min_class if min_class > 0 else float('inf')
@@ -1011,28 +1037,20 @@ implementation:
             print(f"Final dataset before preprocessing: {X_input.shape}")
             print_head(X_input, "X head before Preprocessor.fit", preview_rows)
             print_dtypes(X_input, "X dtypes before Preprocessor.fit")
-
-            # Fit preprocessor on X only, pass y for encoders
             print("Fitting Preprocessor...")
             pre=Preprocessor()
             pre.fit(X_input, y=y_series if model_type=="classification" else y_series, config=config, target_col=target_col, model_type=model_type)
 
             print(f"Numeric columns identified: {len(pre.num_cols)}")
             print(f"Categorical columns identified: {len(pre.cat_cols)}")
-
-            # Transform X with training_mode True to apply outlier rule
             print("Transforming data...")
             Xp = pre.transform(X_input, training_mode=True)
-
-            # Align y to kept_mask if any rows were dropped by outlier removal
             kmask = pre.global_metadata.get('kept_mask_after_outlier', None)
             if kmask is not None and isinstance(kmask, pd.Series):
                 kmask = kmask.reindex(X_input.index, fill_value=True)
                 Xp = Xp.reset_index(drop=True)
                 y_series = y_series.loc[kmask].reset_index(drop=True)
                 print(f"Rows after outlier handling: {len(Xp)}")
-
-            # Ensure numeric dtypes optimal
             print("Optimizing numeric dtypes...")
             for col in Xp.select_dtypes(include=[np.number]).columns:
                 try:
@@ -1052,8 +1070,6 @@ implementation:
                 print("Feature selection disabled, using all features")
                 Xs = Xp.copy()
                 fs = None
-
-            # Save outputs
             ensure_dir_for(out_X); ensure_dir_for(out_y); ensure_dir_for(preproc_path); ensure_dir_for(fs_path); ensure_dir_for(meta_path)
             
             Xs.to_parquet(out_X, index=False)
@@ -1067,7 +1083,6 @@ implementation:
                 with gzip.open(fs_path, "wb") as f:
                     cloudpickle.dump(fs, f)
             else:
-                # Save a dummy selector if feature selection was disabled
                 dummy_fs = type('DummySelector', (), {'selected_features': list(Xs.columns), 'transform': lambda self, X: X})()
                 with gzip.open(fs_path, "wb") as f:
                     cloudpickle.dump(dummy_fs, f)
@@ -1095,7 +1110,6 @@ implementation:
             with open(meta_path,'w',encoding='utf-8') as fh:
                 json.dump(metadata, fh, indent=2, ensure_ascii=False)
 
-            # Final prints
             print("="*80)
             print("PREPROCESSING SUMMARY")
             print("="*80)
