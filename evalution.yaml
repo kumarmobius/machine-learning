@@ -1,7 +1,8 @@
-name: Evaluate Model v1.7
+name: Evaluate Model v1.8
 description: |
   Evaluate a trained model on test data.
   - Loads X_test and y_test from CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC.
+  - Reconstructs full dataframe for preprocessing (includes target temporarily).
   - Applies saved Preprocessor (transform only) and FeatureSelector (transform only).
   - Loads pickled model and computes metrics.
   - Classification: accuracy, precision_weighted, recall_weighted, f1_weighted.
@@ -29,8 +30,9 @@ implementation:
       - |
         import argparse, os, sys, json, io, gzip, zipfile, traceback, subprocess
         import pandas as pd, numpy as np, joblib
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error,confusion_matrix
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error, confusion_matrix
         import cloudpickle, gzip
+        
         def is_likely_json(sample_bytes):
             if not sample_bytes: return False
             try: txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
@@ -175,6 +177,7 @@ implementation:
             print("[INFO] Loading test data...")
             X_raw = read_with_pandas(X_path)
             print(f"[INFO] X_test shape: {X_raw.shape}")
+            print(f"[INFO] X_test columns: {list(X_raw.columns)}")
             
             y_df = read_with_pandas(y_path)
             
@@ -183,20 +186,20 @@ implementation:
                 if target_col:
                     if target_col not in y_df.columns:
                         raise ValueError(f"--target_column '{target_col}' not in y_test. Available columns: {list(y_df.columns)}")
-                    y = y_df[target_col].copy()
+                    y_raw = y_df[target_col].copy()
                 elif y_df.shape[1] == 1:
-                    y = y_df.iloc[:, 0].copy()
+                    y_raw = y_df.iloc[:, 0].copy()
                 else:
                     raise ValueError(f"y_test has {y_df.shape[1]} columns. Please provide --target_column. Available: {list(y_df.columns)}")
             else:
-                y = pd.Series(y_df).copy()
+                y_raw = pd.Series(y_df).copy()
 
-            if len(y) == 0:
+            if len(y_raw) == 0:
                 raise ValueError("y_test has 0 rows. Check the input file.")
             
-            print(f"[INFO] y_test shape: {y.shape}")
-            print(f"[INFO] y_test unique values: {y.nunique()}")
-            print(f"[INFO] y_test sample values: {y.head(10).tolist()}")
+            print(f"[INFO] y_test shape: {y_raw.shape}")
+            print(f"[INFO] y_test unique values: {y_raw.nunique()}")
+            print(f"[INFO] y_test sample values: {y_raw.head(10).tolist()}")
 
             # Load metadata and label mapping
             print("[INFO] Loading preprocessing metadata...")
@@ -225,10 +228,55 @@ implementation:
                 except Exception:
                     pass
 
-            # Transform X using preprocessor
-            print("[INFO] Applying preprocessor to X_test...")
-            Xp = pre.transform(X_raw, training_mode=False)
-            print(f"[INFO] X after preprocessing: {Xp.shape}")
+            # ============================================================================
+            # CRITICAL FIX: Reconstruct full dataframe for preprocessing
+            # ============================================================================
+            print("="*80)
+            print("RECONSTRUCTING TEST DATA FOR PREPROCESSING")
+            print("="*80)
+            
+            # Get target column name from preprocessor metadata
+            try:
+                target_col_name = pre.global_metadata.get('target_col', target_col)
+                if not target_col_name:
+                    target_col_name = target_col if target_col else 'target'
+                print(f"[INFO] Target column name from preprocessor: {target_col_name}")
+            except Exception as e:
+                target_col_name = target_col if target_col else 'target'
+                print(f"[WARN] Could not get target column from preprocessor: {e}")
+                print(f"[WARN] Using: {target_col_name}")
+
+            # Reconstruct full dataframe (preprocessor expects this structure during training)
+            # The target values don't matter for feature engineering, we just need the column
+            test_full = X_raw.copy()
+            test_full[target_col_name] = y_raw.values
+
+            print(f"[INFO] X_raw shape: {X_raw.shape}")
+            print(f"[INFO] X_raw columns: {list(X_raw.columns)}")
+            print(f"[INFO] Reconstructed test_full shape: {test_full.shape}")
+            print(f"[INFO] Reconstructed columns: {list(test_full.columns)}")
+            print("="*80)
+
+            # Transform using reconstructed dataframe
+            print("[INFO] Applying preprocessor to reconstructed test data...")
+            print("[INFO] Note: Target column added temporarily for structural consistency")
+            
+            Xp_full = pre.transform(test_full, training_mode=False)
+            
+            print(f"[INFO] X after preprocessing: {Xp_full.shape}")
+            print(f"[INFO] Columns after preprocessing: {list(Xp_full.columns)}")
+
+            # Remove target column if it's still present after preprocessing
+            if target_col_name in Xp_full.columns:
+                print(f"[INFO] Removing target column '{target_col_name}' from processed features")
+                Xp = Xp_full.drop(columns=[target_col_name])
+            else:
+                print(f"[INFO] Target column already removed during preprocessing")
+                Xp = Xp_full
+
+            print(f"[INFO] Final Xp shape: {Xp.shape}")
+            print(f"[INFO] Final Xp columns: {list(Xp.columns)}")
+            print("="*80)
 
             # Apply feature selector if available
             if fs is not None:
@@ -236,6 +284,14 @@ implementation:
                 if hasattr(fs, "selected_features"):
                     want_cols = list(fs.selected_features)
                     print(f"[INFO] Selecting {len(want_cols)} features")
+                    print(f"[INFO] Selected features: {want_cols}")
+                    
+                    # Check if all required features are present
+                    missing_cols = set(want_cols) - set(Xp.columns)
+                    if missing_cols:
+                        print(f"[WARN] Missing features after preprocessing: {missing_cols}")
+                        print(f"[WARN] These will be filled with zeros")
+                    
                     Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
                 else:
                     Xs = fs.transform(Xp)
@@ -245,14 +301,16 @@ implementation:
                 print("[INFO] No feature selection applied")
 
             # Align y_test labels to training encoding for classification
-            y_original = y.copy()  # Keep original for reference
+            y_original = y_raw.copy()  # Keep original for reference
             
             if task != "regression" and label_mapping is not None:
-                print("[INFO] Applying label mapping to y_test...")
+                print("="*80)
+                print("APPLYING LABEL MAPPING TO TEST DATA")
+                print("="*80)
                 print(f"[INFO] Label mapping: {label_mapping}")
                 
                 # Convert y_test to match the format used in training
-                y_str = y.astype(str)
+                y_str = y_raw.astype(str)
                 
                 # Map to encoded integers
                 y_encoded = y_str.map(lambda val: label_mapping.get(val, None))
@@ -263,6 +321,7 @@ implementation:
                     unmapped_count = int(unmapped_mask.sum())
                     unmapped_values = y_str[unmapped_mask].unique().tolist()
                     print(f"[WARN] Found {unmapped_count} unmapped labels in y_test: {unmapped_values}")
+                    print(f"[WARN] Available mappings: {list(label_mapping.keys())}")
                     print(f"[WARN] These rows will be excluded from evaluation")
                     
                     # Filter out unmapped rows
@@ -274,40 +333,65 @@ implementation:
                     y = y_encoded.astype(int).reset_index(drop=True)
                 
                 print(f"[INFO] y_test after encoding - unique values: {y.unique()}")
+                print(f"[INFO] y_test after encoding - value counts:")
+                print(y.value_counts().sort_index())
                 print(f"[INFO] y_test after encoding - sample: {y.head(10).tolist()}")
+                print("="*80)
+                
             elif task == "regression":
                 print("[INFO] Regression task - converting y_test to numeric...")
-                y = pd.to_numeric(y, errors='coerce')
+                y = pd.to_numeric(y_raw, errors='coerce')
+                
                 # Drop NaN values
                 valid_mask = y.notna()
                 if not valid_mask.all():
-                    print(f"[WARN] Dropping {(~valid_mask).sum()} rows with non-numeric targets")
+                    invalid_count = (~valid_mask).sum()
+                    print(f"[WARN] Dropping {invalid_count} rows with non-numeric targets")
                     Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
                     y = y[valid_mask].reset_index(drop=True)
                     y_original = y_original[valid_mask].reset_index(drop=True)
+                    
             else:
                 print("[WARN] Classification task but no label_mapping found!")
-                print("[WARN] This may cause evaluation errors if y_test labels don't match training encoding")
+                print("[WARN] Assuming y_test labels already match training encoding")
+                y = y_raw
+                
+                # Try to convert to numeric if possible
+                try:
+                    y = pd.to_numeric(y, errors='coerce')
+                    if y.isna().any():
+                        print(f"[ERROR] Could not convert some labels to numeric!")
+                        print(f"[ERROR] This will cause evaluation to fail")
+                except Exception as e:
+                    print(f"[WARN] Could not convert labels to numeric: {e}")
 
             # Final length check
             if len(y) != len(Xs):
                 raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y)}")
             
             print(f"[INFO] Final evaluation set size: {len(y)} samples")
+            print(f"[INFO] Final X shape: {Xs.shape}")
+            print(f"[INFO] Final y shape: {y.shape}")
 
             # Make predictions
-            print("[INFO] Making predictions...")
+            print("="*80)
+            print("MAKING PREDICTIONS")
+            print("="*80)
+            
             y_pred = model.predict(Xs)
             print(f"[INFO] Predictions shape: {y_pred.shape}")
+            print(f"[INFO] Predictions dtype: {y_pred.dtype}")
             print(f"[INFO] Predictions unique values: {np.unique(y_pred)}")
-            print(f"[INFO] Predictions sample: {y_pred[:10]}")
+            print(f"[INFO] Predictions sample (first 10): {y_pred[:10]}")
             
             # Get probability predictions if available
             y_proba = None
             if hasattr(model, "predict_proba"):
                 try:
                     y_proba = model.predict_proba(Xs)
-                    print(f"[INFO] Probability predictions available: {y_proba.shape}")
+                    print(f"[INFO] Probability predictions shape: {y_proba.shape}")
+                    print(f"[INFO] Probability predictions sample (first 3):")
+                    print(y_proba[:3])
                 except Exception as e:
                     print(f"[WARN] Could not get probability predictions: {e}")
 
@@ -354,15 +438,26 @@ implementation:
                 print(f"Recall (weighted): {metrics['recall_weighted']:.6f}")
                 print(f"F1 Score (weighted): {metrics['f1_weighted']:.6f}")
 
-                cm = confusion_matrix(y_true, y_pred)
-                print("="*80)
-                print("CONFUSION MATRIX (Raw Counts)")
-                print("="*80)
-                print(pd.DataFrame(cm))
-                
-                # Show confusion info
-                print(f"Unique true labels: {np.unique(y_true)}")
-                print(f"Unique predicted labels: {np.unique(y_pred)}")
+                # Confusion matrix
+                try:
+                    cm = confusion_matrix(y_true, y_pred)
+                    print("="*80)
+                    print("CONFUSION MATRIX")
+                    print("="*80)
+                    print("Rows = Actual, Columns = Predicted")
+                    cm_df = pd.DataFrame(
+                        cm, 
+                        index=[f"Actual_{i}" for i in range(cm.shape[0])],
+                        columns=[f"Pred_{i}" for i in range(cm.shape[1])]
+                    )
+                    print(cm_df)
+                    print(f"\nUnique true labels: {np.unique(y_true)}")
+                    print(f"Unique predicted labels: {np.unique(y_pred)}")
+                    
+                    # Add confusion matrix to metrics
+                    metrics["confusion_matrix"] = cm.tolist()
+                except Exception as e:
+                    print(f"[WARN] Could not compute confusion matrix: {e}")
 
             print("="*80)
 
@@ -371,29 +466,40 @@ implementation:
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] Metrics saved successfully")
 
             # Save predictions
             print(f"[INFO] Saving predictions to: {preds_path}")
             ensure_dir_for(preds_path)
+            
             out = pd.DataFrame({
                 "y_true": y,
                 "y_pred": y_pred,
                 "y_true_original": y_original  # Keep original labels for reference
             })
             
+            # Add probabilities if available
             if isinstance(y_proba, np.ndarray):
                 try:
                     out["y_proba_max"] = y_proba.max(axis=1)
                     # Add individual class probabilities
                     for i in range(y_proba.shape[1]):
                         out[f"y_proba_class_{i}"] = y_proba[:, i]
+                    print(f"[INFO] Added probability columns for {y_proba.shape[1]} classes")
                 except Exception as e:
                     print(f"[WARN] Could not save probabilities: {e}")
             
             out.to_parquet(preds_path, index=False)
+            print(f"[INFO] Predictions saved successfully")
+            print(f"[INFO] Predictions dataframe shape: {out.shape}")
+            print(f"[INFO] Predictions dataframe columns: {list(out.columns)}")
 
             print("="*80)
-            print("SUCCESS: Evaluation complete")
+            print("SUCCESS: Evaluation completed successfully")
+            print("="*80)
+            print(f"Total samples evaluated: {len(y)}")
+            print(f"Metrics saved to: {metrics_path}")
+            print(f"Predictions saved to: {preds_path}")
             print("="*80)
             
         except Exception as e:
@@ -401,7 +507,7 @@ implementation:
             print("ERROR DURING EVALUATION", file=sys.stderr)
             print("="*80, file=sys.stderr)
             print(f"Error: {e}", file=sys.stderr)
-            print("Full traceback:", file=sys.stderr)
+            print("\nFull traceback:", file=sys.stderr)
             traceback.print_exc()
             print("="*80, file=sys.stderr)
             sys.exit(1)
