@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2
+name: Advanced Preprocess v8.4.5
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -245,8 +245,8 @@ implementation:
                     df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
                     df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
                     df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
-                    df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
-                    df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.day / 31)
+                    df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.day / 31)
                     df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
                     df[col + "_is_month_start"] = df[col].dt.is_month_start.astype('Int64')
                     df[col + "_is_month_end"] = df[col].dt.is_month_end.astype('Int64')
@@ -424,47 +424,56 @@ implementation:
                 self.global_metadata['model_type']=model_type
                 nrows=len(df)
                      # Skip backup columns
-                potential_date_cols = [c for c in df.columns if 
-                          (df[c].dtype == 'object' or str(df[c].dtype).startswith('string')) and
-                          c != target_col and
-                          not c.endswith('_orig')]
-    
-                # Also check for datetime columns that might have derived features
+                # Detect actual date-like columns on a copy and keep bases from any derived columns
+                self.original_input_columns = list(df.columns)
+
+                # Detect actual date-like columns on a copy and keep bases from any derived columns
+                _, det_report = detect_and_extract_dates(df.copy(), enabled=True, exclude_cols=[target_col] if target_col else None)
+                detected_date_cols = [e['col'] for e in det_report.get('date_columns', [])]
+                
                 date_derived_cols = [c for c in df.columns if any(
-                    suffix in c for suffix in ['_year', '_month', '_day', '_dayofweek', '_quarter', 
-                                                '_is_weekend', '_days_since_epoch', '_month_sin', 
-                                                '_month_cos', '_day_sin', '_day_cos']
-                )]
+                    c.endswith(suf) for suf in [
+                        '_year','_month','_day','_dayofweek','_quarter',
+                        '_is_weekend','_days_since_epoch','_month_sin','_month_cos',
+                        '_day_sin','_day_cos','_hour','_is_business_hours',
+                        '_is_month_start','_is_month_end','_is_quarter_start','_is_quarter_end'
+                ])]
                 
-                # Extract base names from derived columns
                 date_bases_from_derived = set()
-                if date_derived_cols:
-                    for col in date_derived_cols:
-                        for suffix in ['_year', '_month', '_day', '_dayofweek', '_quarter', 
-                                      '_is_weekend', '_days_since_epoch', '_month_sin', 
-                                      '_month_cos', '_day_sin', '_day_cos', '_hour', '_is_business_hours',
-                                      '_is_month_start', '_is_month_end', '_is_quarter_start', '_is_quarter_end']:
-                            if col.endswith(suffix):
-                                base = col[:-len(suffix)]
-                                date_bases_from_derived.add(base)
-                                break
+                for col in date_derived_cols:
+                    for suf in [
+                        '_year','_month','_day','_dayofweek','_quarter',
+                        '_is_weekend','_days_since_epoch','_month_sin','_month_cos',
+                        '_day_sin','_day_cos','_hour','_is_business_hours',
+                        '_is_month_start','_is_month_end','_is_quarter_start','_is_quarter_end'
+                    ]:
+                        if col.endswith(suf):
+                            date_bases_from_derived.add(col[:-len(suf)])
+                            break
                 
-                # Combine: columns that need extraction + columns that were already extracted
-                all_date_columns = list(set(potential_date_cols) | date_bases_from_derived)
+                # Final list (DO NOT strip '_orig')
+                self.date_columns = sorted(set(detected_date_cols) | date_bases_from_derived)
+
+                # Keep only real date bases: either dtype is datetime OR we already have derived features for that base
+                _SUFFIXES = [
+                    "_year","_month","_day","_dayofweek","_quarter",
+                    "_is_weekend","_is_month_start","_is_month_end",
+                    "_is_quarter_start","_is_quarter_end","_days_since_epoch",
+                    "_month_sin","_month_cos","_day_sin","_day_cos"
+                ]
+                def _has_derived(base: str) -> bool:
+                    return any((base + s) in df.columns for s in _SUFFIXES)
                 
-                cleaned_date_columns = []
-                for col in all_date_columns:
-                    clean_name = col
-                    while clean_name.endswith('_orig'):
-                        clean_name = clean_name[:-5]  # Remove "_orig" suffix
-                    if clean_name and clean_name not in cleaned_date_columns:
-                        cleaned_date_columns.append(clean_name)
+                from pandas.api.types import is_datetime64_any_dtype as _is_dt
+                self.date_columns = [b for b in self.date_columns if
+                                     (b in df.columns and _is_dt(df[b])) or _has_derived(b)]
                 
-                self.date_columns = cleaned_date_columns
                 if self.date_columns:
                     print(f"[INFO] Preprocessor will extract dates from: {self.date_columns}")
                 else:
                     self.date_columns = []
+
+
                 
                 self.num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
                 self.cat_cols=[c for c in df.columns if c not in self.num_cols]
@@ -542,12 +551,23 @@ implementation:
                 return self
 
             def transform(self, df, training_mode=False):
-                import numpy as np, pandas as pd
                 df=df.copy()
+                if hasattr(self, 'date_columns') and self.date_columns:
+                    for expected_base in self.date_columns:
+                        if expected_base not in df.columns and expected_base.endswith('_orig'):
+                            source_col = expected_base.replace('_orig', '')
+                            if source_col in df.columns:
+                                print(f"[INFO] Renaming '{source_col}' -> '{expected_base}' for alignment")
+                                df[expected_base] = df[source_col]
+                                df = df.drop(columns=[source_col])  # DROP the original to avoid duplicate processing
+                
                 target_col = self.global_metadata.get('target_col')
                 protected_cols=set([target_col]) if target_col in df.columns else set()
                 cfg_global = self.global_metadata.get('config') or {}
                 if hasattr(self, 'date_columns') and self.date_columns:
+                    expected_bases = set(self.date_columns)
+                    if 'date_orig' in expected_bases and ('date_orig' not in df.columns) and ('date' in df.columns):
+                        df['date_orig'] = df['date']
                     print(f"[INFO] Checking for date columns to extract...")
                     
                     # Only extract dates that are still in object/string format
@@ -564,6 +584,59 @@ implementation:
                         print(f"[INFO] Extracting dates from {len(cols_to_extract)} columns: {cols_to_extract}")
                         exclude_cols = [target_col] if target_col else []
                         df, _ = detect_and_extract_dates(df, enabled=True, exclude_cols=exclude_cols)
+                        expected_bases = set(getattr(self, "date_columns", []))  # e.g., {'date_orig'}
+                        suffix_pat = re.compile(
+                            r'^(.*)_(year|month|day|dayofweek|quarter|month_sin|month_cos|day_sin|day_cos|'
+                            r'is_weekend|is_month_start|is_month_end|is_quarter_start|is_quarter_end|days_since_epoch)$'
+                        )
+                        
+                        for dst_base in list(expected_bases):
+                            # If expected features for this base are missing, but another base exists with the same suffixes, copy them.
+                            have_any_dst = any(col.startswith(dst_base + "_") for col in df.columns)
+                            if have_any_dst:
+                                continue
+                        
+                            # Find one candidate source base that actually has derived columns
+                            src_bases = sorted({suffix_pat.match(c).group(1) for c in df.columns if suffix_pat.match(c)})
+                            # Prefer 'date' as a source if present, else take the single available base
+                            src_base = "date" if "date" in src_bases else (src_bases[0] if len(src_bases) == 1 else None)
+                            if not src_base or src_base == dst_base:
+                                continue
+                        
+                            # Clone all derived features from src_base_* to dst_base_*
+                            for col in list(df.columns):
+                                m = suffix_pat.match(col)
+                                if not m:
+                                    continue
+                                if m.group(1) == src_base:
+                                    df[f"{dst_base}_{m.group(2)}"] = df[col]
+                        
+                            # Also mirror the raw/backup columns when present
+                            if f"{src_base}" in df.columns and f"{dst_base}" not in df.columns:
+                                df[dst_base] = df[src_base]
+                            if f"{src_base}_orig" in df.columns and f"{dst_base}_orig" not in df.columns:
+                                df[f"{dst_base}_orig"] = df[f"{src_base}_orig"]
+
+                        # Align extracted base to the trained base (e.g., 'date_*' -> 'date_orig_*')
+                        expected_bases = set(getattr(self, 'date_columns', []))  # e.g., {'date_orig'}
+                        suffix_pat = re.compile(
+                            r'^(.*)_(year|month|day|dayofweek|quarter|month_sin|month_cos|day_sin|day_cos|'
+                            r'is_weekend|is_month_start|is_month_end|is_quarter_start|is_quarter_end|days_since_epoch)$'
+                        )
+                        
+                        missing = [b for b in expected_bases if not any(col.startswith(b + "_") for col in df.columns)]
+                        if missing:
+                            extracted_bases = sorted({suffix_pat.match(c).group(1) for c in df.columns if suffix_pat.match(c)})
+                            if len(extracted_bases) == 1 and len(expected_bases) == 1:
+                                src_base = extracted_bases[0]      # likely 'date'
+                                dst_base = list(expected_bases)[0] # likely 'date_orig'
+                                for col in list(df.columns):
+                                    m = suffix_pat.match(col)
+                                    if m and m.group(1) == src_base:
+                                        df[dst_base + "_" + m.group(2)] = df[col]
+                                if src_base + "_orig" in df.columns:
+                                    df[dst_base + "_orig"] = df[src_base + "_orig"]
+
                         print(f"[INFO] Date extraction complete. Shape: {df.shape}")
                     else:
                         print(f"[INFO] No date extraction needed - all date columns already processed")
@@ -620,9 +693,14 @@ implementation:
                     for c in need_iter: self.col_config[c]['imputer_obj']=iter_imp
 
                 for c in self.num_cols:
-                    cfg=self.col_config[c]
-                    if cfg['imputer'][0]=='simple_median':
-                        imp=cfg['imputer'][1]; df[c]=imp.transform(df[[c]])
+                    if c not in df.columns:
+                        continue
+                    cfg = self.col_config[c]
+                    if cfg['imputer'][0] == 'simple_median':
+                        imp = cfg['imputer'][1]
+                        df[c] = imp.transform(df[[c]])
+
+
                 if training_mode:
                     if cfg_global.get('outlier_strategy','drop_iqr')=='drop_iqr':
                         df2, n_removed, kept_mask = drop_outliers_iqr(df, self.num_cols, fold=cfg_global.get('outlier_fold',1.5))
