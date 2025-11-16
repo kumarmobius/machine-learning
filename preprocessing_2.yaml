@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.6
+name: Advanced Preprocess v8.6.1
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -1023,21 +1023,12 @@ implementation:
                             global_mean = cfg.get('target_global_mean', 0.0)
                             df[c] = df[c].map(lambda x: mapping.get(x, global_mean)).astype(float)
                             print(f"[INFO] Applied test target mean encoding for '{c}' in INFERENCE mode")
-                    
                     elif enc_type == 'drop':
-                        # Drop uninformative columns
                         print(f"[INFO] Dropping uninformative column: {c}")
                         df = df.drop(columns=[c])
-                    
-                    # FALLBACK: Category codes
                     else:
                         df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
-                
 
-                    
-                    # FALLBACK: Category codes
-                    else:
-                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
                 for c in list(df.columns):
                     if df[c].dtype=='object':
                         try: df[c]=pd.to_numeric(df[c], errors='coerce')
