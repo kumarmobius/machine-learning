@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2.1
+name: Advanced Preprocess v8.4.2.2
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -533,14 +533,11 @@ implementation:
                     for expected_col in self.date_columns:
                         if expected_col not in df.columns:
                             # Check if we have the source column without '_orig' suffix
-                            source_candidates = [expected_col.replace('_orig', ''), expected_col + '_orig']
-                            for candidate in source_candidates:
-                                if candidate in df.columns and candidate != expected_col:
-                                    print(f"[INFO] Aligning test data: renaming '{candidate}' -> '{expected_col}'")
-                                    df[expected_col] = df[candidate]
-                                    df = df.drop(columns=[candidate])
-                                    break
-                
+                            if expected_col.endswith('_orig'):
+                                source_name = expected_col.replace('_orig', '')
+                                if source_name in df.columns:
+                                    print(f"[INFO] Aligning test data: copying '{source_name}' -> '{expected_col}'")
+                                    df[expected_col] = df[source_name]                          
                 target_col = self.global_metadata.get('target_col')
                 protected_cols=set([target_col]) if target_col in df.columns else set()
                 cfg_global = self.global_metadata.get('config') or {}
