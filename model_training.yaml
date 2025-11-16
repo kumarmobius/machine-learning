@@ -1,4 +1,4 @@
-name: Train GradientBoosting v1.1
+name: Train GradientBoosting v1.2
 description: |
   Reads X and y from parquet, trains a gradient boosting classifier or regressor.
   Assumes y is already encoded from preprocessing (no re-encoding needed).
@@ -85,6 +85,8 @@ implementation:
             
             X = load_parquet_df(args.X_data)
             print(f"[INFO] X shape: {X.shape}")
+            print("[INFO] X.head():")
+            print(X.head())
 
             y_df = load_parquet_df(args.y_data)
             if isinstance(y_df, pd.DataFrame):
