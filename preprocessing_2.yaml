@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2.2
+name: Advanced Preprocess v8.4.2.3
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -553,14 +553,27 @@ implementation:
                                 cols_to_extract.append(date_col)
                             else:
                                 print(f"[INFO] Skipping '{date_col}' - already processed (dtype: {df[date_col].dtype})")
-            
+
                     if cols_to_extract:
                         print(f"[INFO] Extracting dates from {len(cols_to_extract)} columns: {cols_to_extract}")
                         exclude_cols = [target_col] if target_col else []
                         df, _ = detect_and_extract_dates(df, enabled=True, exclude_cols=exclude_cols)
                         print(f"[INFO] Date extraction complete. Shape: {df.shape}")
+                        
+                        # Drop the original string format columns (ending with '_orig')
+                        cols_to_drop = [c for c in df.columns if c.endswith('_orig')]
+                        if cols_to_drop:
+                            print(f"[INFO] Dropping original date string columns: {cols_to_drop}")
+                            df = df.drop(columns=cols_to_drop)
+                            print(f"[INFO] Shape after dropping original date columns: {df.shape}")
                     else:
                         print(f"[INFO] No date extraction needed - all date columns already processed")
+                        
+                        # Also drop '_orig' columns in this case (they might already exist)
+                        cols_to_drop = [c for c in df.columns if c.endswith('_orig')]
+                        if cols_to_drop:
+                            print(f"[INFO] Dropping original date string columns: {cols_to_drop}")
+                            df = df.drop(columns=cols_to_drop)
                 
     
                 df.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
