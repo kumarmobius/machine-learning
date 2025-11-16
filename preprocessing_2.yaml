@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2.4
+name: Advanced Preprocess v8.6
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -48,6 +48,7 @@ implementation:
         from sklearn.model_selection import StratifiedKFold
         from sklearn.preprocessing import PolynomialFeatures
         from itertools import combinations
+        from scipy.stats import chi2_contingency
         
         # helpers
         def ensure_dir_for(p):
@@ -127,40 +128,110 @@ implementation:
                 except Exception:
                     df[c] = df[c].astype(str)
             return df
-
-        CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
-        MULTIPLIER_MAP = {'k':1e3,'m':1e6,'b':1e9,'t':1e12}
-        TOKEN_RE = re.compile(r'^\s*(?P<sign>[-+]?)(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?P<mult>[kKmMbBtT])?\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$')
+        
+        CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺₴₦₡₱₵₲₸₾₼₻₢₣₤₧₨₪₫₮₯₰₱₲₳₴₵₶₷₸₹₺₨₪]'
+        MULTIPLIER_MAP = {
+            'k': 1e3, 'K': 1e3,
+            'm': 1e6, 'M': 1e6, 'mn': 1e6, 'mil': 1e6, 'million': 1e6,
+            'b': 1e9, 'B': 1e9, 'bn': 1e9, 'bil': 1e9, 'billion': 1e9,
+            't': 1e12, 'T': 1e12, 'tn': 1e12, 'tril': 1e12, 'trillion': 1e12,
+            'cr': 1e7, 'crore': 1e7,  # Indian numbering
+            'l': 1e5, 'lakh': 1e5, 'lac': 1e5,  # Indian numbering
+            'th': 1e3, 'thousand': 1e3,
+        }
+        
+        # More flexible token regex
+        TOKEN_RE = re.compile(
+            r'^\s*(?P<sign>[-+−]?)\s*'  # Optional sign (including minus variants)
+            r'(?P<currency>[€£¥₹$¢฿₪₩₫₽₺₴₦₡₱₵₲₸₾₼₻₢₣₤₧₨]?)\s*'  # Optional currency symbol
+            r'(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)\s*'  # Number with separators
+            r'(?P<mult>k|K|m|M|mn|mil|million|b|B|bn|bil|billion|t|T|tn|tril|trillion|cr|crore|l|lakh|lac|th|thousand)?\s*'  # Multiplier
+            r'(?P<unit>[A-Za-z%/°µμ²³]*)\s*'  # Unit
+            r'(?P<currency_end>[€£¥₹$¢฿₪₩₫₽₺₴₦₡₱₵₲₸₾₼₻₢₣₤₧₨]?)\s*$'  # Currency at end
+        )
         
         def parse_alphanumeric_to_numeric(s, decimal_comma=False):
-            if pd.isna(s): return np.nan
-            orig=str(s).strip()
-            if orig=='' or orig.lower() in {'nan','none','null','na'}: return np.nan
-            tmp=re.sub(CURRENCY_SYMBOLS_REGEX,'',orig)
-            if tmp.strip().endswith('%'):
-                try: return float(tmp.strip().rstrip('%').replace(',','').replace(' ',''))/100.0
-                except Exception: pass
-            tmp=tmp.replace('\u2212','-').replace('\u2013','-').replace('\u2014','-')
-            tmp=re.sub(r'[\u00A0\u202F]','',tmp).strip()
-            if decimal_comma: tmp=tmp.replace('.','').replace(',','.')
-            else: tmp=tmp.replace(',','').replace(' ','')
-            try: return float(tmp)
-            except Exception: pass
-            m=TOKEN_RE.match(tmp)
+            if pd.isna(s): 
+                return np.nan
+            orig = str(s).strip()
+            if not orig or orig.lower() in {'nan', 'none', 'null', 'na', 'n/a', '-', '--', '—'}:
+                return np.nan
+            if orig.lower() in {'inf', 'infinity', '∞'}:
+                return np.inf
+            if orig.lower() in {'-inf', '-infinity', '-∞'}:
+                return -np.inf
+            try:
+                if 'e' in orig.lower() and re.match(r'^[-+]?\d+\.?\d*[eE][-+]?\d+$', orig):
+                    return float(orig)
+            except:
+                pass
+            fraction_match = re.match(r'^\s*(\d+)?\s*(\d+)\s*/\s*(\d+)\s*$', orig)
+            if fraction_match:
+                whole = int(fraction_match.group(1) or 0)
+                numerator = int(fraction_match.group(2))
+                denominator = int(fraction_match.group(3))
+                if denominator != 0:
+                    return whole + (numerator / denominator)
+            range_match = re.match(r'^\s*([-+]?\d+\.?\d*)\s*(?:[-–—]|to)\s*([-+]?\d+\.?\d*)\s*$', orig, re.IGNORECASE)
+            if range_match:
+                try:
+                    low = float(range_match.group(1))
+                    high = float(range_match.group(2))
+                    return (low + high) / 2.0
+                except:
+                    pass
+            tmp = re.sub(CURRENCY_SYMBOLS_REGEX, '', orig)
+            if '%' in tmp:
+                try:
+                    num_str = tmp.replace('%', '').replace(',', '').replace(' ', '').strip()
+                    return float(num_str) / 100.0
+                except:
+                    pass
+            tmp = tmp.replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-')
+            tmp = tmp.replace('−', '-') 
+            tmp = re.sub(r'[\u00A0\u202F\u2009\u200A]', '', tmp).strip()
+            if decimal_comma:
+                tmp = tmp.replace('.', '').replace(',', '.')
+            else:
+                tmp = tmp.replace(',', '').replace(' ', '')
+            try:
+                return float(tmp)
+            except:
+                pass
+            m = TOKEN_RE.match(orig)
             if m:
-                number=m.group('number'); mult=m.group('mult'); unit=(m.group('unit') or '').lower()
-                number_clean=number.replace(',','').replace(' ','')
-                try: val=float(number_clean)
-                except Exception:
-                    try: val=float(number_clean.replace(',', '.'))
-                    except Exception: return np.nan
-                if mult: val*=MULTIPLIER_MAP.get(mult.lower(),1.0)
-                if unit and '%' in unit: val = val/100.0
+                sign = m.group('sign') or ''
+                currency = m.group('currency') or ''
+                number = m.group('number')
+                mult = m.group('mult')
+                unit = (m.group('unit') or '').lower()
+                currency_end = m.group('currency_end') or ''
+                if decimal_comma:
+                    number_clean = number.replace('.', '').replace(',', '.')
+                else:
+                    number_clean = number.replace(',', '').replace(' ', '')
+                try:
+                    val = float(number_clean)
+                except:
+                    try:
+                        val = float(number_clean.replace(',', '.'))
+                    except:
+                        return np.nan
+                if sign in ('-', '−', '–', '—'):
+                    val = -val
+                if mult:
+                    mult_key = mult.lower()
+                    val *= MULTIPLIER_MAP.get(mult_key, MULTIPLIER_MAP.get(mult, 1.0))
+                if unit and '%' in unit:
+                    val = val / 100.0  
                 return val
-            num_search=re.search(r'[-+]?\d+([.,]\d+)?', tmp)
+            num_search = re.search(r'[-+−]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?', tmp)
             if num_search:
-                try: return float(num_search.group(0).replace(',',''))
-                except Exception: return np.nan
+                try:
+                    num_str = num_search.group(0).replace(',', '')
+                    return float(num_str)
+                except:
+                    pass
             return np.nan
 
         def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True):
@@ -353,37 +424,234 @@ implementation:
                     df2[c]=df2[c].clip(lower=lo, upper=hi)
             return df2,0
 
-        def choose_scaler_for_series(s):
-            v=s.dropna()
-            if v.empty: return StandardScaler()
-            if v.std(ddof=0)==0: return StandardScaler()
-            skew=float(v.skew()); kurt=float(v.kurtosis()) if len(v)>3 else 0.0
-            extreme_frac=float(((v - v.mean()).abs() > 3*v.std(ddof=0)).mean())
-            if (v.min()>=0.0 and v.max()<=1.0): return MinMaxScaler()
-            if abs(skew)>=1.0: return Pipeline([('power',PowerTransformer(method='yeo-johnson')),('std',StandardScaler())])
-            if extreme_frac>0.01 or abs(kurt)>10: return RobustScaler()
+        def choose_scaler_for_series(s, feature_name=None):
+            v = s.dropna()
+            if v.empty or len(v) < 3:
+                return StandardScaler()
+            std = v.std(ddof=0)
+            if std == 0 or std < 1e-10:
+                return StandardScaler()
+            mean_val = float(v.mean())
+            median_val = float(v.median())
+            min_val = float(v.min())
+            max_val = float(v.max())
+            value_range = max_val - min_val
+            skew = float(v.skew()) if len(v) > 3 else 0.0
+            kurt = float(v.kurtosis()) if len(v) > 3 else 0.0
+            z_scores = np.abs((v - mean_val) / std)
+            extreme_frac_zscore = float((z_scores > 3).mean())
+            q1, q3 = v.quantile([0.25, 0.75])
+            iqr = q3 - q1
+            outlier_frac_iqr = float(((v < (q1 - 1.5 * iqr)) | (v > (q3 + 1.5 * iqr))).mean())
+            mad = float(np.median(np.abs(v - median_val)))
+            outlier_frac_mad = float((np.abs(v - median_val) > 3 * mad).mean()) if mad > 0 else 0.0
+            cv = std / abs(mean_val) if abs(mean_val) > 1e-10 else np.inf
+            is_multimodal = kurt < -1.0  # Platykurtic (flat distribution)
+            is_heavy_tailed = kurt > 3.0  # Leptokurtic (heavy tails)
+            is_normalized = (min_val >= -0.1 and max_val <= 1.1)
+            is_probability = (min_val >= 0.0 and max_val <= 1.0)
+            is_percentage = (min_val >= 0.0 and max_val <= 100.0 and value_range > 1.0)
+            if len(v) > 10:
+                int_frac = float((v == v.round()).mean())
+                is_count_like = (int_frac > 0.9) and (min_val >= 0)
+            else:
+                is_count_like = False
+            if is_probability:
+                if feature_name:
+                    print(f"[SCALER] {feature_name}: Probability range [0,1] → No scaling (identity)")
+                return MinMaxScaler(feature_range=(0, 1))
+            if is_normalized:
+                if feature_name:
+                    print(f"[SCALER] {feature_name}: Normalized range → MinMaxScaler")
+                return MinMaxScaler()
+            if is_percentage:
+                if feature_name:
+                    print(f"[SCALER] {feature_name}: Percentage [0-100] → MinMaxScaler")
+                return MinMaxScaler()
+            outlier_consensus = (extreme_frac_zscore > 0.05) or (outlier_frac_iqr > 0.10) or (outlier_frac_mad > 0.05)
+            if outlier_consensus:
+                if feature_name:
+                    print(f"[SCALER] {feature_name}: Heavy outliers detected (Z:{extreme_frac_zscore:.3f}, IQR:{outlier_frac_iqr:.3f}) → RobustScaler")
+                return RobustScaler()
+            if abs(skew) > 2.0:
+                if min_val > 0:
+                    if feature_name:
+                        print(f"[SCALER] {feature_name}: High skew ({skew:.2f}), positive data → PowerTransformer(box-cox)")
+                    return Pipeline([
+                        ('power', PowerTransformer(method='box-cox', standardize=True)),
+                    ])
+                else:
+                    if feature_name:
+                        print(f"[SCALER] {feature_name}: High skew ({skew:.2f}) → PowerTransformer(yeo-johnson)")
+                    return Pipeline([
+                        ('power', PowerTransformer(method='yeo-johnson', standardize=True)),
+                    ])
+            if abs(skew) >= 1.0:
+                if is_count_like and min_val >= 0:
+                    if feature_name:
+                        print(f"[SCALER] {feature_name}: Moderate skew ({skew:.2f}), count-like → QuantileTransformer(uniform)")
+                    from sklearn.preprocessing import QuantileTransformer
+                    return Pipeline([
+                        ('quantile', QuantileTransformer(output_distribution='uniform', n_quantiles=min(1000, len(v)))),
+                        ('std', StandardScaler())
+                    ])
+                else:
+                    if feature_name:
+                        print(f"[SCALER] {feature_name}: Moderate skew ({skew:.2f}) → RobustScaler")
+                    return RobustScaler()
+            if is_heavy_tailed or is_multimodal:
+                if feature_name:
+                    print(f"[SCALER] {feature_name}: Heavy tails (kurt:{kurt:.2f}) → RobustScaler")
+                return RobustScaler()
+            if cv > 1.5:
+                if feature_name:
+                    print(f"[SCALER] {feature_name}: High CV ({cv:.2f}) → RobustScaler")
+                return RobustScaler()
+            if is_count_like:
+                zero_frac = float((v == 0).mean())
+                if zero_frac > 0.3:
+                    if feature_name:
+                        print(f"[SCALER] {feature_name}: Zero-inflated count ({zero_frac:.2%} zeros) → RobustScaler")
+                    return RobustScaler()
+            if feature_name:
+                print(f"[SCALER] {feature_name}: Well-behaved distribution → StandardScaler")
             return StandardScaler()
-
         def choose_categorical_encoder(col, series, target_series=None, train_mode=True, model_type='classification'):
             n = len(series)
             nunique = series.nunique(dropna=True)
+            if nunique == 0:
+                return 'drop', None, {}
+            if nunique == 1:
+                return 'drop', None, {}
+            value_counts = series.value_counts(dropna=True)
+            most_common_frac = float(value_counts.iloc[0] / n) if len(value_counts) > 0 else 0.0
+            least_common_count = int(value_counts.iloc[-1]) if len(value_counts) > 0 else 0
+            sorted_counts = np.sort(value_counts.values)
+            n_cats = len(sorted_counts)
+            cumsum = np.cumsum(sorted_counts)
+            gini = (2 * np.sum((np.arange(1, n_cats + 1)) * sorted_counts)) / (n_cats * cumsum[-1]) - (n_cats + 1) / n_cats if n_cats > 0 else 0
+            probs = value_counts.values / n
+            entropy = -np.sum(probs * np.log2(probs + 1e-10))
+            max_entropy = np.log2(nunique) if nunique > 1 else 1.0
+            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+            rare_threshold = max(5, int(0.01 * n))  # At least 5 samples or 1% of data
+            n_rare = int((value_counts < rare_threshold).sum())
+            rare_fraction = n_rare / nunique if nunique > 0 else 0.0
+            target_correlation = 0.0
+            target_predictive_power = 0.0
+            
+            if target_series is not None and train_mode and len(target_series) == n:
+                try:
+                    if model_type == 'classification':
+                        le = LabelEncoder()
+                        series_encoded = le.fit_transform(series.astype(str).fillna('__MISSING__'))
+                        target_predictive_power = float(mutual_info_classif(
+                            series_encoded.reshape(-1, 1), 
+                            target_series, 
+                            random_state=42
+                        )[0])
+                        
+                        contingency = pd.crosstab(series.fillna('__MISSING__'), target_series)
+                        chi2, _, _, _ = chi2_contingency(contingency)
+                        n_obs = contingency.sum().sum()
+                        min_dim = min(contingency.shape[0] - 1, contingency.shape[1] - 1)
+                        target_correlation = np.sqrt(chi2 / (n_obs * min_dim)) if min_dim > 0 else 0.0
+                        
+                    else:  # regression
+                        # Calculate correlation ratio (eta-squared)
+                        group_means = series.map(target_series.groupby(series).mean())
+                        ss_between = ((group_means - target_series.mean()) ** 2).sum()
+                        ss_total = ((target_series - target_series.mean()) ** 2).sum()
+                        target_correlation = np.sqrt(ss_between / ss_total) if ss_total > 0 else 0.0
+                        
+                except Exception as e:
+                    print(f"[WARN] Could not calculate target correlation for '{col}': {e}")
+                    target_correlation = 0.0
+                    target_predictive_power = 0.0
             high_card = (nunique > max(50, 0.05 * n))
-            if nunique <= 2:
-                enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                return 'onehot', enc, {}
-            elif nunique <= 10:
-                enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                return 'onehot', enc, {}
-            elif nunique <= 50:
-                if target_series is not None and train_mode and model_type == 'classification':
-                    return 'target_kfold', None, {}
+            very_high_card = (nunique > max(100, 0.20 * n))
+            if nunique == 2:
+                unique_vals = set(series.dropna().unique())
+                if unique_vals <= {0, 1} or unique_vals <= {True, False} or unique_vals <= {'0', '1'}:
+                    return 'binary', None, {'info': 'Natural binary feature'}
                 else:
-                    return 'count', None, {}
-            else:  # high_card == True
+                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop='first')
+                    return 'onehot', enc, {'info': 'Binary feature → OneHot with drop'}
+            if 3 <= nunique <= 10:
+                if most_common_frac > 0.95:
+                    print(f"[WARN] Column '{col}': {most_common_frac*100:.1f}% dominated by one category")
+                    return 'drop', None, {'info': 'Extremely imbalanced - low variance'}
+                
+                enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                return 'onehot', enc, {'info': f'{nunique} categories → OneHot (best for low cardinality)'}
+            if 11 <= nunique <= 30:
+                if target_predictive_power > 0.1 and gini < 0.5:
+                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore', max_categories=20)
+                    return 'onehot', enc, {'info': f'Predictive + balanced → OneHot (capped at 20)'}
                 if target_series is not None and train_mode and model_type == 'classification':
-                    return 'target_kfold', None, {}
-                else:
-                    return 'count', None, {}
+                    if target_predictive_power > 0.05:
+                        return 'target_kfold', None, {
+                            'info': f'Medium cardinality + predictive → Target encoding',
+                            'predictive_power': target_predictive_power
+                        }
+                return 'count', None, {'info': f'{nunique} categories → Count encoding'}   
+            if 31 <= nunique <= 50:
+                if target_series is not None and train_mode and target_predictive_power > 0.1:
+                    if model_type == 'classification':
+                        return 'target_kfold', None, {
+                            'info': 'Highly predictive → Target encoding',
+                            'predictive_power': target_predictive_power
+                        }
+                    else:
+                        return 'target_mean', None, {
+                            'info': 'Predictive (regression) → Target mean encoding'
+                        }
+                try:
+                    sorted_cats = sorted(series.dropna().unique(), key=str)
+                    looks_ordinal = all(str(sorted_cats[i]) < str(sorted_cats[i+1]) 
+                                      for i in range(len(sorted_cats)-1))
+                    if looks_ordinal and nunique <= 30:
+                        return 'ordinal', None, {'info': 'Detected ordinal pattern → Ordinal encoding'}
+                except:
+                    pass
+                return 'count', None, {'info': f'{nunique} categories → Count encoding'}
+            if 51 <= nunique <= 100:
+                if target_series is not None and train_mode:
+                    if model_type == 'classification' and target_predictive_power > 0.05:
+                        return 'target_kfold', None, {
+                            'info': f'High cardinality ({nunique}) + predictive → Target encoding',
+                            'predictive_power': target_predictive_power
+                        }
+                    elif model_type == 'regression' and target_correlation > 0.1:
+                        return 'target_mean', None, {
+                            'info': f'High cardinality + correlated → Target mean encoding',
+                            'correlation': target_correlation
+                        }
+                if rare_fraction > 0.5:
+                    return 'count', None, {
+                        'info': f'High cardinality ({nunique}), {rare_fraction*100:.0f}% rare → Count encoding'
+                    }
+                return 'count', None, {'info': f'{nunique} categories → Count encoding'}
+            if nunique > 100:
+                if nunique > 0.8 * n:
+                    print(f"[WARN] Column '{col}': {nunique}/{n} unique values ({nunique/n*100:.1f}%) - likely ID column")
+                    return 'drop', None, {'info': 'Likely ID column - too unique'}
+                if target_series is not None and train_mode:
+                    if model_type == 'classification' and target_predictive_power > 0.1:
+                        return 'target_kfold', None, {
+                            'info': f'Very high cardinality ({nunique}) but highly predictive → Target encoding',
+                            'predictive_power': target_predictive_power
+                        }
+                    elif model_type == 'regression' and target_correlation > 0.15:
+                        return 'target_mean', None, {
+                            'info': f'Very high cardinality but correlated → Target mean encoding',
+                            'correlation': target_correlation
+                        }
+                return 'hash', None, {
+                    'info': f'Very high cardinality ({nunique}), not highly predictive → Hash encoding',
+                    'n_components': min(32, nunique // 10)
+                }
+            return 'count', None, {'info': 'Fallback → Count encoding'}
             
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42):        
             X_col = df[col].astype(object).fillna('__NA__')
@@ -438,14 +706,10 @@ implementation:
                             base = col[:-len(suffix)]  # DON'T strip '_orig' - keep as-is!
                             extracted_bases.add(base)
                             break
-                
-                # Also check for object/string date columns that haven't been extracted yet
                 potential_date_cols = [c for c in df.columns if 
                           (df[c].dtype == 'object' or str(df[c].dtype).startswith('string')) and
                           c != target_col and
                           not any(c.endswith(suf) for suf in date_suffixes)]
-                
-                # Priority: if we found extracted features, use those bases; otherwise use potential columns
                 self.date_columns = list(extracted_bases) if extracted_bases else potential_date_cols
                 
                 if self.date_columns:
@@ -477,15 +741,21 @@ implementation:
                     cfg['high_card'] = cfg['n_unique'] > max(50, 0.05*nrows)
                     cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
                     
-                    enc_name, enc_obj, _ = choose_categorical_encoder(
+                    enc_name, enc_obj, enc_info = choose_categorical_encoder(
                         c, s, 
                         target_series=y, 
                         train_mode=True, 
                         model_type=model_type
                     )
                     
+                    # Skip columns marked for dropping
+                    if enc_name == 'drop':
+                        print(f"[INFO] Column '{c}' marked for drop: {enc_info.get('info', 'uninformative')}")
+                        continue
+                    
                     cfg['encoder_type'] = enc_name
                     cfg['encoder_obj'] = enc_obj
+                    cfg['encoder_info'] = enc_info
                     self.col_config[c] = cfg
                 if y is not None and model_type == 'classification':
                     for c in self.cat_cols:
@@ -544,7 +814,6 @@ implementation:
                 if hasattr(self, 'date_columns') and self.date_columns:
                     print(f"[INFO] Checking for date columns to extract...")
                     
-                    # Only extract dates that are still in object/string format
                     cols_to_extract = []
                     for date_col in self.date_columns:
                         if date_col in df.columns:
@@ -717,8 +986,53 @@ implementation:
                             df[c] = ord_enc.transform(df[[c]].astype(object)).astype(float)
                         except Exception as e:
                             print(f"[WARN] Ordinal encoding failed for '{c}': {e}, using category codes")
-                            # Fallback: use category codes
                             df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                    
+                    elif enc_type == 'binary':
+                        # Binary encoding for natural 0/1 features
+                        unique_vals = sorted(df[c].dropna().unique())
+                        if len(unique_vals) == 2:
+                            df[c] = df[c].map({unique_vals[0]: 0, unique_vals[1]: 1}).fillna(0).astype(float)
+                        else:
+                            print(f"[WARN] Binary encoding expected 2 values for '{c}', found {len(unique_vals)}")
+                            df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                    
+                    elif enc_type == 'hash':
+                        # Hash encoding for very high cardinality
+                        from category_encoders import HashingEncoder
+                        n_components = cfg.get('n_components', 32)
+                        if 'hash_encoder' not in cfg:
+                            hash_enc = HashingEncoder(n_components=n_components, cols=[c])
+                            hash_enc.fit(df[[c]])
+                            cfg['hash_encoder'] = hash_enc
+                        else:
+                            hash_enc = cfg['hash_encoder']
+                        
+                        hashed = hash_enc.transform(df[[c]])
+                        hashed.columns = [f"{c}_hash_{i}" for i in range(hashed.shape[1])]
+                        df = pd.concat([df.drop(columns=[c]), hashed], axis=1)
+                    
+                    elif enc_type == 'target_mean':
+                        # Target mean encoding for regression
+                        if training_mode and 'oof_encoding' in cfg:
+                            oof = cfg['oof_encoding']
+                            df[c] = oof.reindex(df.index, fill_value=cfg.get('target_global_mean', 0.0)).astype(float)
+                            print(f"[INFO] Applied OOF target mean encoding for '{c}' in TRAINING mode")
+                        else:
+                            mapping = cfg.get('target_mapping', {})
+                            global_mean = cfg.get('target_global_mean', 0.0)
+                            df[c] = df[c].map(lambda x: mapping.get(x, global_mean)).astype(float)
+                            print(f"[INFO] Applied test target mean encoding for '{c}' in INFERENCE mode")
+                    
+                    elif enc_type == 'drop':
+                        # Drop uninformative columns
+                        print(f"[INFO] Dropping uninformative column: {c}")
+                        df = df.drop(columns=[c])
+                    
+                    # FALLBACK: Category codes
+                    else:
+                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                
 
                     
                     # FALLBACK: Category codes
@@ -1031,23 +1345,15 @@ implementation:
             for col in X_raw.columns:
                 unique_pct = X_raw[col].nunique() / len(X_raw)
                 unique_report[col] = float(unique_pct)
-                
-                # Only drop high-cardinality columns if they're NOT continuous numeric
                 if unique_pct > unique_threshold:
-                    # Check if it's a continuous float/numeric column
                     is_numeric = pd.api.types.is_numeric_dtype(X_raw[col])
                     is_float = pd.api.types.is_float_dtype(X_raw[col])
-                    
-                    # Check if values are continuous (high variance, not just integer IDs)
                     if is_numeric and len(X_raw[col].dropna()) > 0:
                         col_std = X_raw[col].std()
                         col_range = X_raw[col].max() - X_raw[col].min()
-                        # If it's a float with decent variance/range, it's likely a continuous feature
                         is_continuous = is_float and col_std > 0 and col_range > 0
                     else:
                         is_continuous = False
-                    
-                    # Only drop if it's NOT a continuous numeric feature
                     if not is_continuous:
                         cols_to_drop_unique.append(col)
                         print(f"[INFO] Flagging '{col}' as ID-like: {unique_pct*100:.2f}% unique, continuous={is_continuous}")
