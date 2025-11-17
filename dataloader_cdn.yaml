@@ -1,7 +1,4 @@
 name: Data loader with cdn v2
-description: |
-  Downloads a dataset from a CDN URL, saves it in Parquet format, and splits it into train/test sets.
-  Prints dataframe diagnostics and ensures split follows given rules. If model_type is classification, prints target variable distribution.
 inputs:
   - {name: cdn_url, type: String, description: 'CDN URL to download dataset file (CSV, JSON, or Parquet)'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
