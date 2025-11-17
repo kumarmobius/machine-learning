@@ -1,4 +1,4 @@
-name: Train GradientBoosting v1.2
+name: model training
 inputs:
   - {name: X_data, type: Data, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Data, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
@@ -6,14 +6,15 @@ inputs:
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
-  - {name: n_estimators, type: Integer, description: "Number of boosting iterations (trees)", optional: true, default: "100"}
-  - {name: learning_rate, type: Float, description: "Learning rate for boosting", optional: true, default: "0.1"}
-  - {name: max_depth, type: Integer, description: "Maximum depth of individual trees (None for automatic)", optional: true, default: "6"}
+  - {name: model_name, type: String, description: "Model to train: knn | decisiontree", optional: true, default: "decisiontree"}
+  - {name: n_neighbors, type: Integer, description: "Number of neighbors (for KNN). Used only when model_name=knn", optional: true, default: "5"}
+  - {name: dt_max_depth, type: Integer, description: "Max depth for DecisionTree (None for automatic). Used only when model_name=decisiontree", optional: true, default: ""}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
   - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
   - {name: metrics_json, type: Data, description: "Training metrics JSON"}
+  - {name: model_config, type: Data, description: "Model configuration JSON (hyperparameters & metadata)"}
 
 implementation:
   container:
@@ -24,11 +25,11 @@ implementation:
       - -c
       - |
         import argparse, os, sys, json, traceback
-        import pandas as pd, numpy as np
-        import joblib
-        from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+        import pandas as pd, numpy as np, joblib
+        from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+        from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
         from sklearn.preprocessing import LabelEncoder
-        from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error, precision_score, recall_score, f1_score
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
         from sklearn.utils.class_weight import compute_sample_weight
         from sklearn.model_selection import cross_val_score
 
@@ -63,19 +64,20 @@ implementation:
         ap.add_argument('--enbalance', type=str, default="true")
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
-        ap.add_argument('--n_estimators', type=int, default=100)
-        ap.add_argument('--learning_rate', type=float, default=0.1)
-        ap.add_argument('--max_depth', type=str, default="")
-        ap.add_argument('--random_state', type=int, default=42)
+        ap.add_argument('--model_name', type=str, default="decisiontree")
+        ap.add_argument('--n_neighbors', type=int, default=5)
+        ap.add_argument('--dt_max_depth', type=str, default="")
+        ap.add_argument('--random_state', type=int, default=48)
         ap.add_argument('--model_pickle', type=str, required=True)
         ap.add_argument('--metrics_json', type=str, required=True)
+        ap.add_argument('--model_config', type=str, required=True)
         args = ap.parse_args()
 
         try:
             print("="*80)
-            print("TRAINING STARTED (Gradient Boosting - HistGradientBoosting)")
+            print("TRAINING STARTED (Model: KNN or DecisionTree)")
             print("="*80)
-            
+
             X = load_parquet_df(args.X_data)
             print(f"[INFO] X shape: {X.shape}")
             print("[INFO] X.head():")
@@ -94,6 +96,7 @@ implementation:
             else:
                 y = pd.Series(y_df).copy()
 
+            # align lengths/indices if mismatch
             if len(X) != len(y):
                 print(f"[WARN] Length mismatch: X={len(X)}, y={len(y)}")
                 common_idx = X.index.intersection(y.index)
@@ -102,28 +105,43 @@ implementation:
                     y = y.loc[common_idx].sort_index()
                 else:
                     m = min(len(X), len(y))
-                    X = X.reset_index(drop=True).iloc[:m, :]
-                    y = y.reset_index(drop=True).iloc[:m]
+                    X = X.reset_index(drop=True).iloc[:m, :].copy()
+                    y = y.reset_index(drop=True).iloc[:m].copy()
 
-            # === Print target variable distribution ===
             print("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
-            print(y.value_counts(dropna=False).to_string())
-            print("Unique classes:", y.nunique())
-            print("Class distribution percentages:")
-            print((y.value_counts(dropna=False, normalize=True) * 100).to_string())
+            try:
+                print(y.value_counts(dropna=False).to_string())
+            except Exception:
+                print("[INFO] Could not print value_counts (non-hashable types).")
+            try:
+                print("Unique classes:", int(y.nunique()))
+            except Exception:
+                print("Unique classes: unknown")
+            try:
+                print("Class distribution percentages:")
+                print((y.value_counts(dropna=False, normalize=True) * 100).to_string())
+            except Exception:
+                pass
 
             task = args.model_type.strip().lower()
             metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1])}
+            model_name = args.model_name.strip().lower()
+            model_obj = None
 
-            max_depth = None if args.max_depth.strip() in ("", "none", "null") else int(args.max_depth)
-            # HistGradientBoosting uses max_iter for number of boosting iterations - map n_estimators -> max_iter
-            max_iter = int(args.n_estimators)
+            # prepare model config skeleton
+            model_config = {
+                "model_name": model_name,
+                "task": task,
+                "random_state": int(args.random_state),
+                "params": {}
+            }
 
             if task == "classification":
                 print("[INFO] Classification task detected")
                 meta = try_load_metadata(args.preprocess_metadata)
                 label_mapping = meta.get("label_mapping") if meta else None
 
+                # try integer encoded labels, otherwise fallback to LabelEncoder
                 try:
                     y_prepared = pd.Series(y).astype(int)
                     map_info = {"mode": "already_encoded", "label_mapping_reference": label_mapping}
@@ -147,47 +165,63 @@ implementation:
                     except Exception as e:
                         print(f"[WARN] Could not compute sample weights: {e}")
 
-                print(f"[INFO] Training HistGradientBoostingClassifier with max_iter={max_iter}, learning_rate={args.learning_rate}")
-                clf = HistGradientBoostingClassifier(
-                    max_iter=200,              # More trees
-                    learning_rate=0.05,        # Slower (was 0.1)
-                    max_depth=5,               # MUCH shallower (was 20)
-                    min_samples_leaf=20,       # Minimum samples per leaf
-                    l2_regularization=1.0,     # L2 penalty
-                    max_bins=255,
-                    early_stopping=True,       # Stop when overfitting starts
-                    validation_fraction=0.1,   # Use 10% for validation
-                    n_iter_no_change=10,       # Stop if no improvement for 10 iterations
-                    class_weight='balanced',
-                    random_state=args.random_state,
-                    verbose=1  
-                )
+                if model_name == "knn":
+                    print(f"[INFO] Training KNeighborsClassifier (n_neighbors={args.n_neighbors})")
+                    clf = KNeighborsClassifier(n_neighbors=int(args.n_neighbors), n_jobs=-1)
+                    model_config["params"] = {"n_neighbors": int(args.n_neighbors)}
+                    # cross-val
+                    try:
+                        cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=-1)
+                        metrics["cv_accuracy_mean"] = float(cv_scores.mean())
+                        metrics["cv_accuracy_std"] = float(cv_scores.std())
+                        print(f"[INFO] CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                    except Exception as e:
+                        print(f"[WARN] CV failed: {e}")
+                    clf.fit(X, y_prepared)
+                    y_pred = clf.predict(X)
+                    metrics.update({
+                        "accuracy_train": float(accuracy_score(y_prepared, y_pred)),
+                        "precision_train": float(precision_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                        "recall_train": float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                        "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                        "model": "knn",
+                        "n_neighbors": int(args.n_neighbors),
+                        "balanced": bool_from_str(args.enbalance),
+                        "label_info": map_info
+                    })
+                    model_obj = clf
 
-                print("[INFO] Running 5-fold cross-validation to check for overfitting...")
-                cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=-1)
-                print(f"[INFO] CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
-                metrics["cv_accuracy_mean"] = float(cv_scores.mean())
-                metrics["cv_accuracy_std"] = float(cv_scores.std())
-                clf.fit(X, y_prepared, sample_weight=sample_weight)
+                elif model_name == "decisiontree":
+                    max_depth = None if args.dt_max_depth.strip() in ("", "none", "null") else int(args.dt_max_depth)
+                    print(f"[INFO] Training DecisionTreeClassifier (max_depth={max_depth})")
+                    clf = DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced' if bool_from_str(args.enbalance) else None, random_state=args.random_state)
+                    model_config["params"] = {"max_depth": max_depth, "class_weight": 'balanced' if bool_from_str(args.enbalance) else None}
+                    try:
+                        cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=-1)
+                        metrics["cv_accuracy_mean"] = float(cv_scores.mean())
+                        metrics["cv_accuracy_std"] = float(cv_scores.std())
+                        print(f"[INFO] CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                    except Exception as e:
+                        print(f"[WARN] CV failed: {e}")
+                    clf.fit(X, y_prepared, sample_weight=sample_weight)
+                    y_pred = clf.predict(X)
+                    metrics.update({
+                        "accuracy_train": float(accuracy_score(y_prepared, y_pred)),
+                        "precision_train": float(precision_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                        "recall_train": float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                        "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
+                        "model": "decisiontree",
+                        "max_depth": max_depth,
+                        "balanced": bool_from_str(args.enbalance),
+                        "label_info": map_info
+                    })
+                    model_obj = clf
 
-                y_pred = clf.predict(X)
-                metrics.update({
-                    "accuracy_train": float(accuracy_score(y_prepared, y_pred)),
-                    "precision_train": float(precision_score(y_prepared, y_pred, average='weighted', zero_division=0)),
-                    "recall_train": float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0)),
-                    "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
-                    "n_estimators": int(args.n_estimators),
-                    "learning_rate": float(args.learning_rate),
-                    "max_depth": max_depth,
-                    "balanced": bool_from_str(args.enbalance),
-                    "label_info": map_info
-                })
-
-                model_obj = clf
+                else:
+                    raise ValueError("Unsupported model_name for classification. Use 'knn' or 'decisiontree'.")
 
             elif task == "regression":
                 print("[INFO] Regression task detected")
-
                 y_num = pd.to_numeric(y, errors="coerce")
                 valid_mask = y_num.notna()
                 if not valid_mask.all():
@@ -196,30 +230,63 @@ implementation:
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_num = y_num[valid_mask].reset_index(drop=True)
 
-                print(f"[INFO] Training HistGradientBoostingRegressor with max_iter={max_iter}, learning_rate={args.learning_rate}")
-                reg = HistGradientBoostingRegressor(
-                    max_iter=max_iter,
-                    learning_rate=args.learning_rate,
-                    max_depth=max_depth,
-                    random_state=args.random_state
-                )
-                reg.fit(X, y_num)
+                if model_name == "knn":
+                    print(f"[INFO] Training KNeighborsRegressor (n_neighbors={args.n_neighbors})")
+                    reg = KNeighborsRegressor(n_neighbors=int(args.n_neighbors), n_jobs=-1)
+                    model_config["params"] = {"n_neighbors": int(args.n_neighbors)}
+                    try:
+                        cv_scores = cross_val_score(reg, X, y_num, cv=5, scoring='r2', n_jobs=-1)
+                        metrics["cv_r2_mean"] = float(cv_scores.mean())
+                        metrics["cv_r2_std"] = float(cv_scores.std())
+                        print(f"[INFO] CV R2: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                    except Exception as e:
+                        print(f"[WARN] CV failed: {e}")
+                    reg.fit(X, y_num)
+                    y_pred = reg.predict(X)
+                    metrics.update({
+                        "r2_train": float(r2_score(y_num, y_pred)),
+                        "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
+                        "mae_train": float(mean_absolute_error(y_num, y_pred)),
+                        "model": "knn",
+                        "n_neighbors": int(args.n_neighbors)
+                    })
+                    model_obj = reg
 
-                y_pred = reg.predict(X)
-                metrics.update({
-                    "r2_train": float(r2_score(y_num, y_pred)),
-                    "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
-                    "mae_train": float(mean_absolute_error(y_num, y_pred)),
-                    "n_estimators": int(args.n_estimators),
-                    "learning_rate": float(args.learning_rate),
-                    "max_depth": max_depth
-                })
+                elif model_name == "decisiontree":
+                    max_depth = None if args.dt_max_depth.strip() in ("", "none", "null") else int(args.dt_max_depth)
+                    print(f"[INFO] Training DecisionTreeRegressor (max_depth={max_depth})")
+                    reg = DecisionTreeRegressor(max_depth=max_depth, random_state=args.random_state)
+                    model_config["params"] = {"max_depth": max_depth}
+                    try:
+                        cv_scores = cross_val_score(reg, X, y_num, cv=5, scoring='r2', n_jobs=-1)
+                        metrics["cv_r2_mean"] = float(cv_scores.mean())
+                        metrics["cv_r2_std"] = float(cv_scores.std())
+                        print(f"[INFO] CV R2: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                    except Exception as e:
+                        print(f"[WARN] CV failed: {e}")
+                    reg.fit(X, y_num)
+                    y_pred = reg.predict(X)
+                    metrics.update({
+                        "r2_train": float(r2_score(y_num, y_pred)),
+                        "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
+                        "mae_train": float(mean_absolute_error(y_num, y_pred)),
+                        "model": "decisiontree",
+                        "max_depth": max_depth
+                    })
+                    model_obj = reg
 
-                model_obj = reg
+                else:
+                    raise ValueError("Unsupported model_name for regression. Use 'knn' or 'decisiontree'.")
 
             else:
                 raise ValueError(f"Unsupported model_type '{args.model_type}'")
 
+            # finalize model_config
+            model_config["random_state"] = int(args.random_state)
+            model_config["trained_samples"] = int(len(X))
+            model_config["trained_features"] = int(X.shape[1])
+
+            # save model, metrics and config
             ensure_dir_for(args.model_pickle)
             joblib.dump(model_obj, args.model_pickle)
 
@@ -227,8 +294,12 @@ implementation:
             with open(args.metrics_json, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
+            ensure_dir_for(args.model_config)
+            with open(args.model_config, "w", encoding="utf-8") as f:
+                json.dump(model_config, f, indent=2, ensure_ascii=False)
+
             print("="*80)
-            print("SUCCESS: Gradient Boosting training completed")
+            print("SUCCESS: Training completed")
             print(json.dumps(metrics, indent=2))
             print("="*80)
 
@@ -252,15 +323,17 @@ implementation:
       - {inputValue: target_column}
       - --preprocess_metadata
       - {inputPath: preprocess_metadata}
-      - --n_estimators
-      - {inputValue: n_estimators}
-      - --learning_rate
-      - {inputValue: learning_rate}
-      - --max_depth
-      - {inputValue: max_depth}
+      - --model_name
+      - {inputValue: model_name}
+      - --n_neighbors
+      - {inputValue: n_neighbors}
+      - --dt_max_depth
+      - {inputValue: dt_max_depth}
       - --random_state
       - {inputValue: random_state}
       - --model_pickle
       - {outputPath: model_pickle}
       - --metrics_json
       - {outputPath: metrics_json}
+      - --model_config
+      - {outputPath: model_config}
