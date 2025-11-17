@@ -1,11 +1,4 @@
 name: Train GradientBoosting v1.2
-description: |
-  Reads X and y from parquet, trains a gradient boosting classifier or regressor.
-  Assumes y is already encoded from preprocessing (no re-encoding needed).
-  Supports class imbalance when enbalance=true for classification.
-  Prints target variable distribution before training.
-  Saves trained model and training metrics.
-
 inputs:
   - {name: X_data, type: Data, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Data, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
