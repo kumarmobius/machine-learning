@@ -1,8 +1,4 @@
 name: Data loader v4
-description: |
-  Fetches JSON from API and prepares train/test/anomaly datasets in Parquet format. 
-  Prints dataframe diagnostics and ensures train/test splits follow requested column rules. 
-  If model_type is classification, prints target variable distribution.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
