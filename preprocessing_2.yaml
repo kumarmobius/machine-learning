@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2.6
+name: Advanced Preprocess v8.4.2.7
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -1026,7 +1026,11 @@ implementation:
                 for col in cols_to_drop_missing:
                     print(f"   - {col}: {missing_report[col]*100:.2f}% missing")
                 X_raw = X_raw.drop(columns=cols_to_drop_missing)
-# FIRST: Convert object columns to numeric where possible
+
+            print("Converting object columns in X to numeric where possible")
+            X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
+            print(f"Conversion report: {len(conv_report.get('converted', []))} columns converted")
+
             print("Converting object columns in X to numeric where possible")
             X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
             print(f"Conversion report: {len(conv_report.get('converted', []))} columns converted")
@@ -1048,6 +1052,10 @@ implementation:
                     has_orig = (col + "_orig") in X_conv.columns
                     
                     # Check if values are continuous (high variance, not just integer IDs)
+                    col_std = 0.0
+                    col_range = 0.0
+                    is_continuous = False
+                    
                     if is_numeric and len(X_conv[col].dropna()) > 0:
                         col_values = X_conv[col].dropna()
                         col_std = col_values.std()
@@ -1059,8 +1067,6 @@ implementation:
                         # 3. Not all integers (if it's a float type with decimal values)
                         has_decimals = not (col_values % 1 == 0).all() if col_range > 0 else False
                         is_continuous = (col_std > 0 and col_range > 0) and (has_decimals or col_std > 0.01)
-                    else:
-                        is_continuous = False
                     
                     # Only drop if:
                     # 1. It's NOT numeric, OR
