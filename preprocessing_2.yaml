@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2.5
+name: Advanced Preprocess v8.4.2.6
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -1026,24 +1026,45 @@ implementation:
                 for col in cols_to_drop_missing:
                     print(f"   - {col}: {missing_report[col]*100:.2f}% missing")
                 X_raw = X_raw.drop(columns=cols_to_drop_missing)
+# FIRST: Convert object columns to numeric where possible
+            print("Converting object columns in X to numeric where possible")
+            X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
+            print(f"Conversion report: {len(conv_report.get('converted', []))} columns converted")
+            
+            # THEN: Drop columns with too many unique values (likely IDs)
+            # Now numeric columns will be properly detected
             unique_report = {}
             cols_to_drop_unique = []
-            for col in X_raw.columns:
-                unique_pct = X_raw[col].nunique() / len(X_raw)
+            for col in X_conv.columns:
+                unique_pct = X_conv[col].nunique() / len(X_conv)
                 unique_report[col] = float(unique_pct)
+                
+                # Only drop high-cardinality columns if they're NOT continuous numeric
                 if unique_pct > unique_threshold:
-                    is_numeric = pd.api.types.is_numeric_dtype(X_raw[col])
-                    has_orig = (col + "_orig") in X_raw.columns
+                    # Check if it's a numeric column (including those converted from object)
+                    is_numeric = pd.api.types.is_numeric_dtype(X_conv[col])
                     
-                    if is_numeric and len(X_raw[col].dropna()) > 0:
-                        col_values = X_raw[col].dropna()
+                    # Also check if there's an '_orig' version (indicating conversion from object)
+                    has_orig = (col + "_orig") in X_conv.columns
+                    
+                    # Check if values are continuous (high variance, not just integer IDs)
+                    if is_numeric and len(X_conv[col].dropna()) > 0:
+                        col_values = X_conv[col].dropna()
                         col_std = col_values.std()
                         col_range = col_values.max() - col_values.min()
                         
+                        # Check if it's actually continuous:
+                        # 1. Has non-zero standard deviation
+                        # 2. Has non-zero range
+                        # 3. Not all integers (if it's a float type with decimal values)
                         has_decimals = not (col_values % 1 == 0).all() if col_range > 0 else False
                         is_continuous = (col_std > 0 and col_range > 0) and (has_decimals or col_std > 0.01)
                     else:
                         is_continuous = False
+                    
+                    # Only drop if:
+                    # 1. It's NOT numeric, OR
+                    # 2. It's numeric but NOT continuous (likely an ID)
                     should_drop = not is_numeric or not is_continuous
                     
                     if should_drop:
@@ -1058,7 +1079,10 @@ implementation:
                 print(f"Dropping {len(cols_to_drop_unique)} ID-like columns with >{unique_threshold*100}% unique values:")
                 for col in cols_to_drop_unique:
                     print(f"   - {col}: {unique_report[col]*100:.2f}% unique")
-                X_raw = X_raw.drop(columns=cols_to_drop_unique)
+                X_conv = X_conv.drop(columns=cols_to_drop_unique)
+            
+            # Update X_raw to the converted version
+            X_raw = X_conv
 
             print(f"Remaining features after filtering: {X_raw.shape[1]} columns")
             print("Converting object columns in X to numeric where possible")
