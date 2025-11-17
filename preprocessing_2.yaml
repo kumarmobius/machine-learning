@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.4.2.8
+name: Advanced Preprocess v8.4.2.9
 inputs:
   - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -1104,7 +1104,7 @@ implementation:
             
             # Drop the identified ID columns
             if cols_to_drop_unique:
-                print(f"\nDropping {len(cols_to_drop_unique)} ID-like columns with >{unique_threshold*100}% unique values:")
+                print(f"Dropping {len(cols_to_drop_unique)} ID-like columns with >{unique_threshold*100}% unique values:")
                 for col in cols_to_drop_unique:
                     print(f"   - {col}: {unique_report[col]*100:.2f}% unique")
                 X_conv = X_conv.drop(columns=cols_to_drop_unique)
