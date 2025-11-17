@@ -8,7 +8,7 @@ inputs:
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
   - {name: model_name, type: String, description: "Model to train: knn | decisiontree", optional: true, default: "decisiontree"}
   - {name: n_neighbors, type: Integer, description: "Number of neighbors (for KNN). Used only when model_name=knn", optional: true, default: "5"}
-  - {name: dt_max_depth, type: Integer, description: "Max depth for DecisionTree (None for automatic). Used only when model_name=decisiontree", optional: true, default: ""}
+  - {name: dt_max_depth, type: Integer, description: "Max depth for DecisionTree (None for automatic). Used only when model_name=decisiontree", optional: true, default: "5"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
