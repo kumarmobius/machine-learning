@@ -107,10 +107,6 @@ implementation:
                 raise ValueError(f"Could not load pickle from {path}: {e}")
 
         def extract_loss(model):
-            """
-            Try to extract a numeric 'loss' or best score from common attributes.
-            Returns a float or None.
-            """
             candidates = [
                 "loss_", "best_loss_", "best_score_", "train_score_", "oob_score_", "loss", "best_iteration_", "best_score"
             ]
