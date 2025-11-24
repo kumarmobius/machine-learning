@@ -9,7 +9,7 @@ inputs:
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time containing label_mapping for classification", optional: true}
 outputs:
-  - {name: metrics_json, type: Data, description: "Evaluation metrics JSON (minimal fields)"}
+  - {name: metrics_json, type: String, description: "Evaluation metrics JSON (minimal fields)"}
   - {name: predictions, type: Data, description: "Parquet with y_true and y_pred (and proba if available)"}
 implementation:
   container:
