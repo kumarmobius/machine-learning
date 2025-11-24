@@ -10,7 +10,7 @@ inputs:
   - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time containing label_mapping for classification", optional: true}
 outputs:
   - {name: metrics_json, type: String, description: "Evaluation metrics JSON (minimal fields)"}
-  - {name: predictions, type: Data, description: "Parquet with y_true and y_pred (and proba if available)"}
+  - {name: predictions, type: String, description: "Parquet with y_true and y_pred (and proba if available)"}
 implementation:
   container:
     image: kumar2004/ml-base:v1
