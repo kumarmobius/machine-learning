@@ -14,9 +14,9 @@ inputs:
   - {name: n_jobs, type: Integer, description: "n_jobs for parallel models (-1 for all cores)", optional: true, default: "-1"}
   - {name: use_scaler, type: String, description: "true/false. If true, apply StandardScaler for SVM/linear models", optional: true, default: "true"}
   - {name: svm_kernel, type: String, description: "kernel for SVC/SVR (rbf|linear|poly|sigmoid)", optional: true, default: "rbf"}
-  - {name: svm_C, type: Integer, description: "C parameter for SVMs", optional: true, default: "1.0"}
+  - {name: svm_C, type: Float, description: "C parameter for SVMs", optional: true, default: "1.0"}
   - {name: svm_gamma, type: String, description: "gamma for SVC/SVR ('scale','auto' or float)", optional: true, default: "scale"}
-  - {name: svm_nu, type: Integer, description: "nu parameter for NuSVC (0<nu<=1). Used only for nusvc", optional: true, default: "0.5"}
+  - {name: svm_nu, type: Float, description: "nu parameter for NuSVC (0<nu<=1). Used only for nusvc", optional: true, default: "0.5"}
   - {name: svm_probability, type: String, description: "true/false: enable probability=True for SVC (slower)", optional: true, default: "false"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
