@@ -1,17 +1,18 @@
-name: Stacking and Voting V1.1
+name: Stacking and Voting V2
 inputs:
-  - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame) - already preprocessed"}
-  - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded / preprocessed"}
-  - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
-  - {name: ensemble_type, type: String, description: "none | stacking | voting", optional: true, default: "none"}
+  - {name: X_data, type: Dataset}
+  - {name: y_data, type: Dataset}
+  - {name: model_type, type: String, optional: true}
+  - {name: ensemble_type, type: String, description: "none | stacking | voting", optional: true, default: "stacking"}
   - {name: n_ensemble_models, type: Integer, description: "If >1 and model_names not provided, randomly pick this many models from default pool", optional: true, default: "0"}
   - {name: model_names, type: String, description: "Optional comma-separated list of model names to use verbatim (overrides n_ensemble_models)", optional: true, default: ""}
-  - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking (e.g. 'lightgbm' or 'logistic'). If absent, use LightGBM when available, else fallback.", optional: true, default: ""}
-  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "42"}
+  - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking (e.g. 'lightgbm' or 'logistic'). If absent, prefer LightGBM/XGBoost when available, else fallback.", optional: true, default: ""}
+  - {name: stacking_cv, type: Integer, default: "5"}
+  - {name: random_state, type: Integer, optional: true, default: "50"}
 outputs:
-  - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
-  - {name: metrics_json, type: Data, description: "Training metrics JSON"}
-  - {name: model_config, type: Data, description: "Model configuration JSON (hyperparameters & metadata)"}
+  - {name: model_pickle, type: Data }
+  - {name: metrics_json, type: Data }
+  - {name: model_config, type: Data }
 
 implementation:
   container:
@@ -33,19 +34,30 @@ implementation:
             BaggingClassifier, BaggingRegressor,
             VotingClassifier, VotingRegressor, StackingClassifier, StackingRegressor
         )
-        from sklearn.linear_model import LogisticRegression, LinearRegression
+        from sklearn.linear_model import LogisticRegression, LinearRegression, SGDClassifier, SGDRegressor
+        from sklearn.naive_bayes import GaussianNB
+        from sklearn.neural_network import MLPClassifier, MLPRegressor
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
         from sklearn.utils.class_weight import compute_sample_weight
         from sklearn.model_selection import cross_val_score
         from sklearn.svm import SVC, LinearSVC, NuSVC, SVR, LinearSVR
         from scipy import stats
 
-        # Try LightGBM for stacking meta-learner
         try:
             from lightgbm import LGBMClassifier, LGBMRegressor
         except Exception:
             LGBMClassifier = None
             LGBMRegressor = None
+        try:
+            from xgboost import XGBClassifier, XGBRegressor
+        except Exception:
+            XGBClassifier = None
+            XGBRegressor = None
+        try:
+            from catboost import CatBoostClassifier, CatBoostRegressor
+        except Exception:
+            CatBoostClassifier = None
+            CatBoostRegressor = None
 
         def load_parquet_df(path):
             return pd.read_parquet(path, engine="auto")
@@ -55,9 +67,6 @@ implementation:
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
 
-        def bool_str(x):
-            return str(x).strip().lower() in ("1","true","t","yes","y")
-
         ap = argparse.ArgumentParser()
         ap.add_argument('--X_data', required=True)
         ap.add_argument('--y_data', required=True)
@@ -66,6 +75,7 @@ implementation:
         ap.add_argument('--n_ensemble_models', type=int, default=0)
         ap.add_argument('--model_names', default="")
         ap.add_argument('--meta_model_name', default="")
+        ap.add_argument('--stacking_cv', type=int, default=5)
         ap.add_argument('--random_state', type=int, default=42)
         ap.add_argument('--model_pickle', required=True)
         ap.add_argument('--metrics_json', required=True)
@@ -76,22 +86,33 @@ implementation:
             random.seed(int(args.random_state))
             np.random.seed(int(args.random_state))
 
-            # static sensible defaults (hardcoded as requested)
             STATIC = {
-                "n_estimators": 200,
+                "n_estimators": 300,    
                 "min_samples_leaf": 1,
-                "n_neighbors": 5,
-                "dt_max_depth": None,   # None -> let tree decide
+                "max_depth_tree": 8,  
+                "knn_k": 7,
                 "svm_C": 1.0,
                 "svm_gamma": "scale",
-                "meta_lgbm_n_estimators": 100
+                "nu_default": 0.5,
+                "meta_lgbm_n_estimators": 200,
+                "meta_xgb_n_estimators": 200,
+                "meta_cat_n_estimators": 200,
+                "mlp_hidden_layer_sizes": (256,128),
+                "sgd_max_iter": 1000,
+                "STACKING_CV": int(args.stacking_cv or 5),
+                "TRIAL_FIT_SVM": True
             }
 
-            # Default pools (diverse mix)
-            DEFAULT_POOL_CLASSIF = ["extratrees","randomforest","decisiontree","adaboost","gradientboosting","bagging","svc","nusvc","linearsvc","knn","logistic"]
-            DEFAULT_POOL_REGR = ["extratrees","randomforest","decisiontree","adaboost","gradientboosting","bagging","knn","linearreg","svr","linearsvr"]
+            DEFAULT_POOL_CLASSIF = [
+                "extratrees","randomforest","decisiontree","adaboost","gradientboosting","bagging",
+                "svc","nusvc","linearsvc","knn","logistic","sgd","gaussiannb","mlp",
+                "xgboost","lightgbm","catboost"
+            ]
+            DEFAULT_POOL_REGR = [
+                "extratrees","randomforest","decisiontree","adaboost","gradientboosting","bagging",
+                "knn","linearreg","svr","linearsvr","sgd","mlp","xgboost","lightgbm","catboost"
+            ]
 
-            # Load data (assume preprocessed)
             X = load_parquet_df(args.X_data)
             y_df = load_parquet_df(args.y_data)
             if isinstance(y_df, pd.DataFrame):
@@ -109,8 +130,7 @@ implementation:
             n_pick = int(args.n_ensemble_models or 0)
             model_names_input = (args.model_names or "").strip()
             meta_name = (args.meta_model_name or "").strip().lower()
-
-            # Choose selected model names:
+            stacking_cv = int(args.stacking_cv or STATIC["STACKING_CV"])
             if model_names_input:
                 selected_model_names = [m.strip().lower() for m in model_names_input.split(",") if m.strip()]
                 print(f"[INFO] Using provided model_names: {selected_model_names}")
@@ -124,11 +144,9 @@ implementation:
                         selected_model_names = random.sample(pool, n_pick)
                     print(f"[INFO] Randomly selected {len(selected_model_names)} models: {selected_model_names}")
                 elif n_pick == 1:
-                    # If user asked for n==1 but didn't provide model_names -> pick 1 random model
                     selected_model_names = [random.choice(pool)]
                     print(f"[INFO] n_ensemble_models==1 -> randomly picked single model: {selected_model_names}")
                 else:
-                    # n_pick == 0 and no model_names: if ensemble requested use full pool; else will train single default model
                     if ensemble_type in ("stacking","voting"):
                         selected_model_names = pool.copy()
                         print(f"[INFO] No model_names/n specified; using full default pool for ensemble: {selected_model_names}")
@@ -136,60 +154,77 @@ implementation:
                         selected_model_names = []
                         print("[INFO] No ensemble requested and no model_names provided -> will train single default model 'extratrees'")
 
-            # factory for base estimators (NO preprocessing inside — assume X already prepared)
             def make_base_estimator(name):
                 n = name.strip().lower()
-                # classification
                 if task == "classification":
                     if n == "knn":
-                        return KNeighborsClassifier(n_neighbors=STATIC["n_neighbors"], n_jobs=-1)
+                        return KNeighborsClassifier(n_neighbors=STATIC["knn_k"], n_jobs=-1)
                     if n == "decisiontree":
-                        return DecisionTreeClassifier(max_depth=STATIC["dt_max_depth"], class_weight='balanced', random_state=args.random_state)
+                        return DecisionTreeClassifier(max_depth=STATIC["max_depth_tree"], class_weight='balanced', random_state=args.random_state)
                     if n == "extratrees":
                         return ExtraTreesClassifier(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state, class_weight='balanced')
                     if n == "randomforest":
-                        return RandomForestClassifier(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state, class_weight='balanced')
+                        return RandomForestClassifier(n_estimators=STATIC["n_estimators"], max_depth=STATIC["max_depth_tree"], n_jobs=-1, random_state=args.random_state, class_weight='balanced')
                     if n == "adaboost":
                         return AdaBoostClassifier(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
                     if n == "gradientboosting":
-                        return GradientBoostingClassifier(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
+                        return GradientBoostingClassifier(n_estimators=int(STATIC["n_estimators"]/2), max_depth=6, random_state=args.random_state)
                     if n == "bagging":
-                        return BaggingClassifier(n_estimators=STATIC["n_estimators"], n_jobs=-1, random_state=args.random_state)
+                        return BaggingClassifier(n_estimators=100, n_jobs=-1, random_state=args.random_state)
                     if n == "svc":
                         return SVC(C=STATIC["svm_C"], gamma=STATIC["svm_gamma"], probability=True, class_weight='balanced', random_state=args.random_state)
                     if n == "nusvc":
-                        # keep default nu but we will skip NuSVC later when class counts make it infeasible
-                        return NuSVC(nu=0.5, probability=True, class_weight='balanced', random_state=args.random_state)
+                        return NuSVC(nu=STATIC["nu_default"], probability=True, class_weight='balanced', random_state=args.random_state)
                     if n == "linearsvc":
                         return LinearSVC(C=STATIC["svm_C"], max_iter=10000)
                     if n == "logistic":
                         return LogisticRegression(max_iter=2000, n_jobs=-1, random_state=args.random_state)
+                    if n == "sgd":
+                        return SGDClassifier(max_iter=STATIC["sgd_max_iter"], tol=1e-3, random_state=args.random_state)
+                    if n == "gaussiannb":
+                        return GaussianNB()
+                    if n == "mlp":
+                        return MLPClassifier(hidden_layer_sizes=STATIC["mlp_hidden_layer_sizes"], max_iter=500, random_state=args.random_state)
+                    if n == "xgboost" and XGBClassifier is not None:
+                        return XGBClassifier(n_estimators=STATIC["meta_xgb_n_estimators"], use_label_encoder=False, eval_metric='logloss', random_state=args.random_state)
+                    if n == "lightgbm" and LGBMClassifier is not None:
+                        return LGBMClassifier(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=args.random_state)
+                    if n == "catboost" and CatBoostClassifier is not None:
+                        return CatBoostClassifier(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=args.random_state)
                     raise ValueError(f"Unsupported classifier name: {name}")
                 else:
-                    # regression
                     if n == "knn":
-                        return KNeighborsRegressor(n_neighbors=STATIC["n_neighbors"], n_jobs=-1)
+                        return KNeighborsRegressor(n_neighbors=STATIC["knn_k"], n_jobs=-1)
                     if n == "decisiontree":
-                        return DecisionTreeRegressor(max_depth=STATIC["dt_max_depth"], random_state=args.random_state)
+                        return DecisionTreeRegressor(max_depth=STATIC["max_depth_tree"], random_state=args.random_state)
                     if n == "extratrees":
                         return ExtraTreesRegressor(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state)
                     if n == "randomforest":
-                        return RandomForestRegressor(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state)
+                        return RandomForestRegressor(n_estimators=STATIC["n_estimators"], max_depth=STATIC["max_depth_tree"], n_jobs=-1, random_state=args.random_state)
                     if n == "adaboost":
                         return AdaBoostRegressor(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
                     if n == "gradientboosting":
-                        return GradientBoostingRegressor(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
+                        return GradientBoostingRegressor(n_estimators=int(STATIC["n_estimators"]/2), max_depth=6, random_state=args.random_state)
                     if n == "bagging":
-                        return BaggingRegressor(n_estimators=STATIC["n_estimators"], n_jobs=-1, random_state=args.random_state)
+                        return BaggingRegressor(n_estimators=100, n_jobs=-1, random_state=args.random_state)
                     if n == "svr":
                         return SVR(C=STATIC["svm_C"], gamma=STATIC["svm_gamma"])
                     if n == "linearsvr":
                         return LinearSVR(C=STATIC["svm_C"], max_iter=10000)
                     if n in ("linearreg","linear"):
                         return LinearRegression()
+                    if n == "sgd":
+                        return SGDRegressor(max_iter=STATIC["sgd_max_iter"], tol=1e-3, random_state=args.random_state)
+                    if n == "mlp":
+                        return MLPRegressor(hidden_layer_sizes=STATIC["mlp_hidden_layer_sizes"], max_iter=500, random_state=args.random_state)
+                    if n == "xgboost" and XGBRegressor is not None:
+                        return XGBRegressor(n_estimators=STATIC["meta_xgb_n_estimators"], random_state=args.random_state)
+                    if n == "lightgbm" and LGBMRegressor is not None:
+                        return LGBMRegressor(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=args.random_state)
+                    if n == "catboost" and CatBoostRegressor is not None:
+                        return CatBoostRegressor(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=args.random_state)
                     raise ValueError(f"Unsupported regressor name: {name}")
 
-            # factory for meta-learner (stacking)
             def make_meta_estimator(name):
                 n = (name or "").strip().lower()
                 if n in ("", "lightgbm", "lgbm", "lgb"):
@@ -197,231 +232,211 @@ implementation:
                         return LGBMClassifier(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=args.random_state)
                     if task == "regression" and LGBMRegressor is not None:
                         return LGBMRegressor(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=args.random_state)
-                    # if LGBM unavailable, fall back
-                if n in ("logistic","logisticregression") and task == "classification":
-                    return LogisticRegression(max_iter=2000)
-                if n in ("linear","linearregression") and task == "regression":
-                    return LinearRegression()
-                # last resort fallbacks
+                if n in ("xgboost","xgb"):
+                    if task == "classification" and XGBClassifier is not None:
+                        return XGBClassifier(n_estimators=STATIC["meta_xgb_n_estimators"], use_label_encoder=False, eval_metric='logloss', random_state=args.random_state)
+                    if task == "regression" and XGBRegressor is not None:
+                        return XGBRegressor(n_estimators=STATIC["meta_xgb_n_estimators"], random_state=args.random_state)
+                if n in ("catboost","cat"):
+                    if task == "classification" and CatBoostClassifier is not None:
+                        return CatBoostClassifier(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=args.random_state)
+                    if task == "regression" and CatBoostRegressor is not None:
+                        return CatBoostRegressor(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=args.random_state)
                 if task == "classification":
                     return LogisticRegression(max_iter=2000)
                 else:
                     return LinearRegression()
 
-            # Build/Train models
             trained_object = None
+            trained_estimators = []
             trained_base_info = []
-            try:
-                if ensemble_type not in ("stacking","voting"):
-                    # single model path: if model_names provided and length>=1 use first, else default 'extratrees'
-                    if selected_model_names:
-                        model_to_train = selected_model_names[0]
-                    else:
-                        model_to_train = "extratrees"
-                    print(f"[INFO] Training single model: {model_to_train}")
-                    model_inst = make_base_estimator(model_to_train)
-                    # fit with balanced sample_weight for classifiers when supported
-                    if task == "classification":
+            model_to_train = None
+
+            if ensemble_type not in ("stacking","voting"):
+                if selected_model_names:
+                    model_to_train = selected_model_names[0]
+                else:
+                    model_to_train = "extratrees"
+                print(f"[INFO] Training single model: {model_to_train}")
+                model_inst = make_base_estimator(model_to_train)
+                if task == "classification":
+                    try:
+                        sw = compute_sample_weight(class_weight='balanced', y=pd.Series(y).astype(int))
+                    except Exception:
+                        sw = None
+                    if sw is not None:
                         try:
-                            sw = compute_sample_weight(class_weight='balanced', y=pd.Series(y).astype(int))
-                        except Exception:
-                            sw = None
-                        if sw is not None:
-                            try:
-                                model_inst.fit(X, y, sample_weight=sw)
-                            except TypeError:
-                                model_inst.fit(X, y)
-                        else:
+                            model_inst.fit(X, y, sample_weight=sw)
+                        except TypeError:
                             model_inst.fit(X, y)
                     else:
                         model_inst.fit(X, y)
-                    trained_object = model_inst
-                    trained_base_info = [model_to_train]
                 else:
-                    # ensemble path
-                    if not selected_model_names:
-                        raise ValueError("Ensemble requested but no base models selected.")
-                    # create estimators list (name, estimator)
-                    estimators = []
-                    for i, nm in enumerate(selected_model_names):
+                    model_inst.fit(X, y)
+                trained_object = model_inst
+                trained_base_info = [model_to_train]
+            else:
+                if not selected_model_names:
+                    raise ValueError("Ensemble requested but no base models selected.")
+                estimators = []
+                for i, nm in enumerate(selected_model_names):
+                    try:
+                        est = make_base_estimator(nm)
+                        estimators.append((f"{nm}_{i}", est))
+                    except Exception as e:
+                        print(f"[WARN] Skipping model {nm}: {e}")
+                if not estimators:
+                    raise ValueError("No valid base estimators available for ensemble after filtering.")
+                min_class_count = None
+                if task == "classification":
+                    try:
+                        class_counts = pd.Series(y).value_counts()
+                        min_class_count = int(class_counts.min())
+                        print(f"[INFO] class_counts min = {min_class_count}, distribution:\n{class_counts.to_string()}")
+                    except Exception as e:
+                        print(f"[WARN] Could not compute class counts: {e}")
+                        min_class_count = None
+                filtered_estimators = []
+                for name, est in estimators:
+                    nm = name.split("_")[0]
+                    if nm == "nusvc" and (min_class_count is not None and min_class_count < 2):
+                        print(f"[WARN] Skipping {name} because min_class_count={min_class_count} makes NuSVC infeasible")
+                        continue
+                    if nm in ("svc","linearsvc") and (min_class_count is not None and min_class_count < 1):
+                        print(f"[WARN] Skipping {name} because data too small for SVM")
+                        continue
+                    filtered_estimators.append((name, est))
+
+                if not filtered_estimators:
+                    raise ValueError("All base estimators were filtered out due to data constraints")
+                safe_estimators = []
+                for name, est in filtered_estimators:
+                    nm = name.split("_")[0]
+                    if nm in ("svc","nusvc","linearsvc","svr","linearsvr") and STATIC["TRIAL_FIT_SVM"]:
                         try:
-                            est = make_base_estimator(nm)
-                            estimators.append((f"{nm}_{i}", est))
-                        except Exception as e:
-                            print(f"[WARN] Skipping model {nm}: {e}")
-                    if not estimators:
-                        raise ValueError("No valid base estimators available for ensemble after filtering.")
-                    min_class_count = None
-                    if task == "classification":
-                        try:
-                            class_counts = pd.Series(y).value_counts()
-                            min_class_count = int(class_counts.min())
-                            print(f"[INFO] class_counts min = {min_class_count}, distribution:{class_counts.to_string()}")
-                        except Exception as e:
-                            print(f"[WARN] Could not compute class counts: {e}")
-                            min_class_count = None
-
-                    # Filter out known-fragile estimators based on data characteristics
-                    filtered_estimators = []
-                    for name, est in estimators:
-                        nm = name.split("_")[0]
-                        if nm == "nusvc" and (min_class_count is not None and min_class_count < 2):
-                            print(f"[WARN] Skipping {name} because min_class_count={min_class_count} makes NuSVC infeasible")
-                            continue
-                        if nm in ("svc","linearsvc") and (min_class_count is not None and min_class_count < 1):
-                            print(f"[WARN] Skipping {name} because data too small for SVM")
-                            continue
-                        filtered_estimators.append((name, est))
-
-                    if not filtered_estimators:
-                        raise ValueError("All base estimators were filtered out due to data constraints")
-
-                    # Quick trial-fit for fragile models (only SVM family) to detect early failures without killing the whole ensemble
-                    safe_estimators = []
-                    for name, est in filtered_estimators:
-                        nm = name.split("_")[0]
-                        if nm in ("svc","nusvc","linearsvc","svr","linearsvr"):
-                            try:
-                                print(f"[INFO] Trial-fitting fragile estimator {name} to check feasibility...")
-                                est.fit(X, y)
-                                safe_estimators.append((name, est))
-                            except Exception as e:
-                                print(f"[WARN] Trial-fit failed for {name}: {e}. Skipping this estimator.")
-                        else:
+                            print(f"[INFO] Trial-fitting fragile estimator {name} to check feasibility...")
+                            est.fit(X, y)
                             safe_estimators.append((name, est))
-
-                    if not safe_estimators:
-                        raise ValueError("No base estimators passed trial-fit. Reduce model list or check data.")
-
-                    # If only one estimator remains, train it and finish
-                    if len(safe_estimators) == 1:
-                        name0, est0 = safe_estimators[0]
-                        print(f"[INFO] Only one valid estimator ({name0}) -> training single model")
-                        est0.fit(X, y)
-                        trained_estimators = [(name0, est0)]
-                        model_obj = est0
+                        except Exception as e:
+                            print(f"[WARN] Trial-fit failed for {name}: {e}. Skipping this estimator.")
                     else:
-                        # Attempt to build Voting or Stacking, with robust error handling and fallback
-                        if ensemble_type == "voting":
-                            try:
-                                if task == "classification":
-                                    # try soft voting; fallback to hard if fails
-                                    try:
-                                        model_v = VotingClassifier(estimators=safe_estimators, voting="soft", n_jobs=-1)
-                                        model_v.fit(X, y)
-                                    except Exception:
-                                        model_v = VotingClassifier(estimators=safe_estimators, voting="hard", n_jobs=-1)
-                                        model_v.fit(X, y)
-                                    trained_object = model_v
-                                    trained_base_info = [nm for nm, _ in safe_estimators]
-                                    trained_object = model_v
-                                else:
-                                    model_v = VotingRegressor(estimators=safe_estimators, n_jobs=-1)
-                                    model_v.fit(X, y)
-                                    trained_object = model_v
-                                    trained_base_info = [nm for nm, _ in safe_estimators]
-                            except Exception as e:
-                                print(f"[WARN] Voting ensemble failed: {e}. Training base estimators individually as fallback.")
-                                trained_estimators = []
-                                for nm, est in safe_estimators:
-                                    try:
-                                        est.fit(X, y)
-                                        trained_estimators.append((nm, est))
-                                    except Exception as e2:
-                                        print(f"[WARN] Base estimator {nm} failed in fallback fit: {e2}")
-                                model_obj = None
-                        else:
-                            # stacking
-                            final_est = make_meta_estimator(meta_name)
-                            # Try stacking.fit; on failure attempt to remove failing base estimators and retry once
-                            try:
-                                if task == "classification":
-                                    stack = StackingClassifier(estimators=safe_estimators, final_estimator=final_est, n_jobs=-1, passthrough=False)
-                                else:
-                                    stack = StackingRegressor(estimators=safe_estimators, final_estimator=final_est, n_jobs=-1, passthrough=False)
-                                stack.fit(X, y)
-                                trained_object = stack
-                                trained_base_info = [nm for nm, _ in safe_estimators]
-                                model_obj = stack
-                            except Exception as e:
-                                print(f"[WARN] Initial stacking.fit failed: {e}. Attempting to identify and remove failing base estimators and retry once.")
-                                # identify failing base estimators by trial-fitting each separately
-                                surviving = []
-                                for nm, est in safe_estimators:
-                                    try:
-                                        print(f"[INFO] Trial-fitting estimator {nm} separately...")
-                                        est.fit(X, y)
-                                        surviving.append((nm, est))
-                                    except Exception as e2:
-                                        print(f"[WARN] Estimator {nm} failed trial-fit: {e2}. Removing it from ensemble.")
-                                if len(surviving) >= 2:
-                                    try:
-                                        if task == "classification":
-                                            stack2 = StackingClassifier(estimators=surviving, final_estimator=final_est, n_jobs=-1, passthrough=False)
-                                        else:
-                                            stack2 = StackingRegressor(estimators=surviving, final_estimator=final_est, n_jobs=-1, passthrough=False)
-                                        stack2.fit(X, y)
-                                        trained_object = stack2
-                                        trained_base_info = [nm for nm, _ in surviving]
-                                        model_obj = stack2
-                                    except Exception as e3:
-                                        print(f"[WARN] Retry stacking.fit also failed: {e3}. Falling back to training base estimators individually.")
-                                        trained_estimators = []
-                                        for nm, est in surviving:
-                                            try:
-                                                est.fit(X, y)
-                                                trained_estimators.append((nm, est))
-                                            except Exception as e4:
-                                                print(f"[WARN] Base estimator {nm} failed in fallback fit: {e4}")
-                                        model_obj = None
-                                else:
-                                    # not enough surviving estimators to make stacking meaningful
-                                    print("[WARN] Not enough surviving base estimators for stacking after filtering. Training surviving estimators individually or single model fallback.")
+                        safe_estimators.append((name, est))
+
+                if not safe_estimators:
+                    raise ValueError("No base estimators passed trial-fit. Reduce model list or check data.")
+                if len(safe_estimators) == 1:
+                    name0, est0 = safe_estimators[0]
+                    print(f"[INFO] Only one valid estimator ({name0}) -> training single model")
+                    est0.fit(X, y)
+                    trained_estimators = [(name0, est0)]
+                    trained_object = est0
+                else:
+                    if ensemble_type == "voting":
+                        try:
+                            if task == "classification":
+                                try:
+                                    vote = VotingClassifier(estimators=safe_estimators, voting="soft", n_jobs=-1)
+                                    vote.fit(X, y)
+                                except Exception:
+                                    vote = VotingClassifier(estimators=safe_estimators, voting="hard", n_jobs=-1)
+                                    vote.fit(X, y)
+                                trained_object = vote
+                                trained_base_info = [nm for nm,_ in safe_estimators]
+                            else:
+                                vote = VotingRegressor(estimators=safe_estimators, n_jobs=-1)
+                                vote.fit(X, y)
+                                trained_object = vote
+                                trained_base_info = [nm for nm,_ in safe_estimators]
+                        except Exception as e:
+                            print(f"[WARN] Voting ensemble failed: {e}. Training base estimators individually as fallback.")
+                            trained_estimators = []
+                            for nm, est in safe_estimators:
+                                try:
+                                    est.fit(X, y)
+                                    trained_estimators.append((nm, est))
+                                except Exception as e2:
+                                    print(f"[WARN] Base estimator {nm} failed in fallback fit: {e2}")
+                            trained_object = None
+                    else:
+                        final_est = make_meta_estimator(meta_name)
+                        try:
+                            if task == "classification":
+                                stack = StackingClassifier(estimators=safe_estimators, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
+                            else:
+                                stack = StackingRegressor(estimators=safe_estimators, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
+                            stack.fit(X, y)
+                            trained_object = stack
+                            trained_base_info = [nm for nm,_ in safe_estimators]
+                        except Exception as e:
+                            print(f"[WARN] Initial stacking.fit failed: {e}. Attempting to identify and remove failing base estimators and retry once.")
+                            surviving = []
+                            for nm, est in safe_estimators:
+                                try:
+                                    print(f"[INFO] Trial-fitting estimator {nm} separately...")
+                                    est.fit(X, y)
+                                    surviving.append((nm, est))
+                                except Exception as e2:
+                                    print(f"[WARN] Estimator {nm} failed trial-fit: {e2}. Removing it from ensemble.")
+                            if len(surviving) >= 2:
+                                try:
+                                    if task == "classification":
+                                        stack2 = StackingClassifier(estimators=surviving, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
+                                    else:
+                                        stack2 = StackingRegressor(estimators=surviving, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
+                                    stack2.fit(X, y)
+                                    trained_object = stack2
+                                    trained_base_info = [nm for nm,_ in surviving]
+                                except Exception as e3:
+                                    print(f"[WARN] Retry stacking.fit also failed: {e3}. Falling back to training base estimators individually.")
                                     trained_estimators = []
                                     for nm, est in surviving:
                                         try:
                                             est.fit(X, y)
                                             trained_estimators.append((nm, est))
-                                        except Exception as e5:
-                                            print(f"[WARN] Base estimator {nm} failed in fallback fit: {e5}")
-                                    if len(trained_estimators) == 1:
-                                        model_obj = trained_estimators[0][1]
-                                    else:
-                                        model_obj = None
-                    # --- END: Safer ensemble-building + fitting ---
-            except Exception as e:
-                print(f"[ERROR] Training failed: {e}")
-                traceback.print_exc()
-                raise
+                                        except Exception as e4:
+                                            print(f"[WARN] Base estimator {nm} failed in fallback fit: {e4}")
+                                    trained_object = None
+                            else:
+                                print("[WARN] Not enough surviving base estimators for stacking after filtering. Training surviving estimators individually or single model fallback.")
+                                trained_estimators = []
+                                for nm, est in surviving:
+                                    try:
+                                        est.fit(X, y)
+                                        trained_estimators.append((nm, est))
+                                    except Exception as e5:
+                                        print(f"[WARN] Base estimator {nm} failed in fallback fit: {e5}")
+                                if len(trained_estimators) == 1:
+                                    trained_object = trained_estimators[0][1]
+                                else:
+                                    trained_object = None
 
-            # compute training metrics
-            metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1]), "ensemble_type": ensemble_type, "models_used": selected_model_names or [model_to_train]}
+            metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1]), "ensemble_type": ensemble_type, "models_used": selected_model_names or [model_to_train], "stacking_cv": stacking_cv}
             try:
-                # If trained_object assigned earlier (voting/stacking) prefer that; otherwise use model_obj or fallback trained_estimators
                 predictor = None
-                if 'trained_object' in locals() and trained_object is not None:
+                if trained_object is not None:
                     predictor = trained_object
-                elif 'model_obj' in locals() and model_obj is not None:
-                    predictor = model_obj
-                elif 'trained_estimators' in locals() and trained_estimators:
-                    # simple ensemble via majority/average
-                    if task == "regression":
-                        preds = []
-                        for nm, est in trained_estimators:
-                            preds.append(est.predict(X))
-                        y_pred = np.mean(np.vstack(preds), axis=0)
-                        predictor = None
-                    else:
-                        preds = []
-                        for nm, est in trained_estimators:
-                            preds.append(np.array(est.predict(X)))
-                        preds = np.vstack(preds)
-                        from scipy import stats
-                        y_pred = stats.mode(preds, axis=0).mode[0].ravel()
-                        predictor = None
+                elif trained_estimators:
+                    predictor = None
+                else:
+                    predictor = None
 
                 if predictor is not None:
                     y_pred = predictor.predict(X)
+                else:
+                    if trained_estimators:
+                        if task == "regression":
+                            preds = []
+                            for nm, est in trained_estimators:
+                                preds.append(est.predict(X))
+                            y_pred = np.mean(np.vstack(preds), axis=0)
+                        else:
+                            preds = []
+                            for nm, est in trained_estimators:
+                                preds.append(np.array(est.predict(X)))
+                            preds = np.vstack(preds)
+                            y_pred = stats.mode(preds, axis=0).mode[0].ravel()
+                    else:
+                        raise ValueError("No predictor available to compute metrics.")
 
                 if task == "classification":
                     metrics.update({
@@ -438,18 +453,12 @@ implementation:
                     })
             except Exception as e:
                 print(f"[WARN] Could not compute metrics: {e}")
-
-            # Save outputs
             ensure_dir_for(args.model_pickle)
-            # prefer trained_object/model_obj; if None and trained_estimators present, save dict
             to_save = None
-            if 'trained_object' in locals() and trained_object is not None:
+            if trained_object is not None:
                 to_save = trained_object
-            elif 'model_obj' in locals() and model_obj is not None:
-                to_save = model_obj
-            elif 'trained_estimators' in locals() and trained_estimators:
-                save_obj = {nm: est for nm, est in trained_estimators}
-                to_save = save_obj
+            elif trained_estimators:
+                to_save = {nm: est for nm, est in trained_estimators}
             else:
                 raise ValueError("No trained model or estimators to save.")
 
@@ -462,8 +471,9 @@ implementation:
             model_config = {
                 "ensemble_type": ensemble_type,
                 "models_selected": selected_model_names,
-                "meta_model_name": meta_name or ("lightgbm" if (LGBMClassifier or LGBMRegressor) else "fallback"),
+                "meta_model_name": meta_name or ("lightgbm" if (LGBMClassifier or LGBMRegressor) else ("xgboost" if (XGBClassifier or XGBRegressor) else "fallback")),
                 "static_defaults": STATIC,
+                "stacking_cv": stacking_cv,
                 "random_state": int(args.random_state)
             }
             ensure_dir_for(args.model_config)
@@ -495,6 +505,8 @@ implementation:
       - {inputValue: model_names}
       - --meta_model_name
       - {inputValue: meta_model_name}
+      - --stacking_cv
+      - {inputValue: stacking_cv}
       - --random_state
       - {inputValue: random_state}
       - --model_pickle
