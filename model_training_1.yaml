@@ -1,4 +1,4 @@
-name: Stacking and Voting V1
+name: Stacking and Voting V1.1
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame) - already preprocessed"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded / preprocessed"}
@@ -251,15 +251,12 @@ implementation:
                             print(f"[WARN] Skipping model {nm}: {e}")
                     if not estimators:
                         raise ValueError("No valid base estimators available for ensemble after filtering.")
-
-                    # --- START: Safer ensemble-building + fitting (prevents NuSVC / nu infeasible) ---
-                    # If classification, compute class counts to avoid NuSVC infeasible nu
                     min_class_count = None
                     if task == "classification":
                         try:
                             class_counts = pd.Series(y).value_counts()
                             min_class_count = int(class_counts.min())
-                            print(f"[INFO] class_counts min = {min_class_count}, distribution:\n{class_counts.to_string()}")
+                            print(f"[INFO] class_counts min = {min_class_count}, distribution:{class_counts.to_string()}")
                         except Exception as e:
                             print(f"[WARN] Could not compute class counts: {e}")
                             min_class_count = None
