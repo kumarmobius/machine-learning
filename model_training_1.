@@ -1,0 +1,377 @@
+name: model training Stacking and Voting
+inputs:
+  - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame) - already preprocessed"}
+  - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded / preprocessed"}
+  - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
+  - {name: ensemble_type, type: String, description: "none | stacking | voting", optional: true, default: "none"}
+  - {name: n_ensemble_models, type: Integer, description: "If >1 and model_names not provided, randomly pick this many models from default pool", optional: true, default: "0"}
+  - {name: model_names, type: String, description: "Optional comma-separated list of model names to use verbatim (overrides n_ensemble_models)", optional: true, default: ""}
+  - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking (e.g. 'lightgbm' or 'logistic'). If absent, use LightGBM when available, else fallback.", optional: true, default: ""}
+  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "42"}
+outputs:
+  - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
+  - {name: metrics_json, type: Data, description: "Training metrics JSON"}
+  - {name: model_config, type: Data, description: "Model configuration JSON (hyperparameters & metadata)"}
+
+implementation:
+  container:
+    image: kumar2004/ml-base:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        """
+        Training step with:
+         - Inputs: X_data, y_data (preprocessed), model_type, ensemble_type, n_ensemble_models, model_names, meta_model_name, random_state
+         - No preprocessing applied inside this step.
+         - Default hyperparameters are static (sensible values) and used unless you change the code.
+        """
+        import argparse, json, os, sys, traceback, random
+        import pandas as pd, numpy as np, joblib
+        from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+        from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+        from sklearn.ensemble import (
+            ExtraTreesClassifier, ExtraTreesRegressor,
+            RandomForestClassifier, RandomForestRegressor,
+            AdaBoostClassifier, AdaBoostRegressor,
+            GradientBoostingClassifier, GradientBoostingRegressor,
+            BaggingClassifier, BaggingRegressor,
+            VotingClassifier, VotingRegressor, StackingClassifier, StackingRegressor
+        )
+        from sklearn.linear_model import LogisticRegression, LinearRegression
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
+        from sklearn.utils.class_weight import compute_sample_weight
+        from sklearn.model_selection import cross_val_score
+        from sklearn.svm import SVC, LinearSVC, NuSVC, SVR, LinearSVR
+        from scipy import stats
+
+        # Try LightGBM for stacking meta-learner
+        try:
+            from lightgbm import LGBMClassifier, LGBMRegressor
+        except Exception:
+            LGBMClassifier = None
+            LGBMRegressor = None
+
+        def load_parquet_df(path):
+            return pd.read_parquet(path, engine="auto")
+
+        def ensure_dir_for(p):
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def bool_str(x):
+            return str(x).strip().lower() in ("1","true","t","yes","y")
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--X_data', required=True)
+        ap.add_argument('--y_data', required=True)
+        ap.add_argument('--model_type', default="classification")
+        ap.add_argument('--ensemble_type', default="none")
+        ap.add_argument('--n_ensemble_models', type=int, default=0)
+        ap.add_argument('--model_names', default="")
+        ap.add_argument('--meta_model_name', default="")
+        ap.add_argument('--random_state', type=int, default=42)
+        ap.add_argument('--model_pickle', required=True)
+        ap.add_argument('--metrics_json', required=True)
+        ap.add_argument('--model_config', required=True)
+        args = ap.parse_args()
+
+        try:
+            random.seed(int(args.random_state))
+            np.random.seed(int(args.random_state))
+
+            # static sensible defaults (hardcoded as requested)
+            STATIC = {
+                "n_estimators": 200,
+                "min_samples_leaf": 1,
+                "n_neighbors": 5,
+                "dt_max_depth": None,   # None -> let tree decide
+                "svm_C": 1.0,
+                "svm_gamma": "scale",
+                "meta_lgbm_n_estimators": 100
+            }
+
+            # Default pools (diverse mix)
+            DEFAULT_POOL_CLASSIF = ["extratrees","randomforest","decisiontree","adaboost","gradientboosting","bagging","svc","nusvc","linearsvc","knn","logistic"]
+            DEFAULT_POOL_REGR = ["extratrees","randomforest","decisiontree","adaboost","gradientboosting","bagging","knn","linearreg","svr","linearsvr"]
+
+            # Load data (assume preprocessed)
+            X = load_parquet_df(args.X_data)
+            y_df = load_parquet_df(args.y_data)
+            if isinstance(y_df, pd.DataFrame):
+                if y_df.shape[1] == 1:
+                    y = y_df.iloc[:,0].copy()
+                else:
+                    raise ValueError("y_data has multiple columns — provide a single-column parquet (preprocessed/encoded).")
+            else:
+                y = pd.Series(y_df).copy()
+
+            print(f"[INFO] X shape: {X.shape}, y shape: {y.shape}")
+
+            task = args.model_type.strip().lower()
+            ensemble_type = args.ensemble_type.strip().lower()
+            n_pick = int(args.n_ensemble_models or 0)
+            model_names_input = (args.model_names or "").strip()
+            meta_name = (args.meta_model_name or "").strip().lower()
+
+            # Choose selected model names:
+            if model_names_input:
+                selected_model_names = [m.strip().lower() for m in model_names_input.split(",") if m.strip()]
+                print(f"[INFO] Using provided model_names: {selected_model_names}")
+            else:
+                pool = DEFAULT_POOL_CLASSIF if task == "classification" else DEFAULT_POOL_REGR
+                if n_pick > 1:
+                    if n_pick > len(pool):
+                        print(f"[WARN] n_ensemble_models={n_pick} > pool size {len(pool)}. Using full pool.")
+                        selected_model_names = pool.copy()
+                    else:
+                        selected_model_names = random.sample(pool, n_pick)
+                    print(f"[INFO] Randomly selected {len(selected_model_names)} models: {selected_model_names}")
+                elif n_pick == 1:
+                    # If user asked for n==1 but didn't provide model_names -> pick 1 random model
+                    selected_model_names = [random.choice(pool)]
+                    print(f"[INFO] n_ensemble_models==1 -> randomly picked single model: {selected_model_names}")
+                else:
+                    # n_pick == 0 and no model_names: if ensemble requested use full pool; else will train single default model
+                    if ensemble_type in ("stacking","voting"):
+                        selected_model_names = pool.copy()
+                        print(f"[INFO] No model_names/n specified; using full default pool for ensemble: {selected_model_names}")
+                    else:
+                        selected_model_names = []
+                        print("[INFO] No ensemble requested and no model_names provided -> will train single default model 'extratrees'")
+
+            # factory for base estimators (NO preprocessing inside — assume X already prepared)
+            def make_base_estimator(name):
+                n = name.strip().lower()
+                # classification
+                if task == "classification":
+                    if n == "knn":
+                        return KNeighborsClassifier(n_neighbors=STATIC["n_neighbors"], n_jobs=-1)
+                    if n == "decisiontree":
+                        return DecisionTreeClassifier(max_depth=STATIC["dt_max_depth"], class_weight='balanced', random_state=args.random_state)
+                    if n == "extratrees":
+                        return ExtraTreesClassifier(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state, class_weight='balanced')
+                    if n == "randomforest":
+                        return RandomForestClassifier(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state, class_weight='balanced')
+                    if n == "adaboost":
+                        return AdaBoostClassifier(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
+                    if n == "gradientboosting":
+                        return GradientBoostingClassifier(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
+                    if n == "bagging":
+                        return BaggingClassifier(n_estimators=STATIC["n_estimators"], n_jobs=-1, random_state=args.random_state)
+                    if n == "svc":
+                        return SVC(C=STATIC["svm_C"], gamma=STATIC["svm_gamma"], probability=True, class_weight='balanced', random_state=args.random_state)
+                    if n == "nusvc":
+                        return NuSVC(nu=0.5, probability=True, class_weight='balanced', random_state=args.random_state)
+                    if n == "linearsvc":
+                        return LinearSVC(C=STATIC["svm_C"], max_iter=10000)
+                    if n == "logistic":
+                        return LogisticRegression(max_iter=2000, n_jobs=-1, random_state=args.random_state)
+                    raise ValueError(f"Unsupported classifier name: {name}")
+                else:
+                    # regression
+                    if n == "knn":
+                        return KNeighborsRegressor(n_neighbors=STATIC["n_neighbors"], n_jobs=-1)
+                    if n == "decisiontree":
+                        return DecisionTreeRegressor(max_depth=STATIC["dt_max_depth"], random_state=args.random_state)
+                    if n == "extratrees":
+                        return ExtraTreesRegressor(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state)
+                    if n == "randomforest":
+                        return RandomForestRegressor(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=args.random_state)
+                    if n == "adaboost":
+                        return AdaBoostRegressor(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
+                    if n == "gradientboosting":
+                        return GradientBoostingRegressor(n_estimators=STATIC["n_estimators"], random_state=args.random_state)
+                    if n == "bagging":
+                        return BaggingRegressor(n_estimators=STATIC["n_estimators"], n_jobs=-1, random_state=args.random_state)
+                    if n == "svr":
+                        return SVR(C=STATIC["svm_C"], gamma=STATIC["svm_gamma"])
+                    if n == "linearsvr":
+                        return LinearSVR(C=STATIC["svm_C"], max_iter=10000)
+                    if n in ("linearreg","linear"):
+                        return LinearRegression()
+                    raise ValueError(f"Unsupported regressor name: {name}")
+
+            # factory for meta-learner (stacking)
+            def make_meta_estimator(name):
+                n = (name or "").strip().lower()
+                if n in ("", "lightgbm", "lgbm", "lgb"):
+                    if task == "classification" and LGBMClassifier is not None:
+                        return LGBMClassifier(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=args.random_state)
+                    if task == "regression" and LGBMRegressor is not None:
+                        return LGBMRegressor(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=args.random_state)
+                    # if LGBM unavailable, fall back
+                if n in ("logistic","logisticregression") and task == "classification":
+                    return LogisticRegression(max_iter=2000)
+                if n in ("linear","linearregression") and task == "regression":
+                    return LinearRegression()
+                # last resort fallbacks
+                if task == "classification":
+                    return LogisticRegression(max_iter=2000)
+                else:
+                    return LinearRegression()
+
+            # Build/Train models
+            trained_object = None
+            trained_base_info = []
+            try:
+                if ensemble_type not in ("stacking","voting"):
+                    # single model path: if model_names provided and length>=1 use first, else default 'extratrees'
+                    if selected_model_names:
+                        model_to_train = selected_model_names[0]
+                    else:
+                        model_to_train = "extratrees"
+                    print(f"[INFO] Training single model: {model_to_train}")
+                    model_inst = make_base_estimator(model_to_train)
+                    # fit with balanced sample_weight for classifiers when supported
+                    if task == "classification":
+                        try:
+                            sw = compute_sample_weight(class_weight='balanced', y=pd.Series(y).astype(int))
+                        except Exception:
+                            sw = None
+                        if sw is not None:
+                            try:
+                                model_inst.fit(X, y, sample_weight=sw)
+                            except TypeError:
+                                model_inst.fit(X, y)
+                        else:
+                            model_inst.fit(X, y)
+                    else:
+                        model_inst.fit(X, y)
+                    trained_object = model_inst
+                    trained_base_info = [model_to_train]
+                else:
+                    # ensemble path
+                    if not selected_model_names:
+                        raise ValueError("Ensemble requested but no base models selected.")
+                    # create estimators list (name, estimator)
+                    estimators = []
+                    for i, nm in enumerate(selected_model_names):
+                        try:
+                            est = make_base_estimator(nm)
+                            estimators.append((f"{nm}_{i}", est))
+                        except Exception as e:
+                            print(f"[WARN] Skipping model {nm}: {e}")
+                    if not estimators:
+                        raise ValueError("No valid base estimators available for ensemble after filtering.")
+
+                    # If only one estimator after filtering -> train single
+                    if len(estimators) == 1:
+                        name0, est0 = estimators[0]
+                        print(f"[INFO] Only one valid estimator ({name0}) -> training single model")
+                        est0.fit(X, y)
+                        trained_object = est0
+                        trained_base_info = [name0]
+                    else:
+                        # build ensemble object
+                        if ensemble_type == "voting":
+                            if task == "classification":
+                                try:
+                                    # try soft voting first
+                                    model_v = VotingClassifier(estimators=estimators, voting="soft", n_jobs=-1)
+                                    model_v.fit(X, y)
+                                except Exception:
+                                    model_v = VotingClassifier(estimators=estimators, voting="hard", n_jobs=-1)
+                                    model_v.fit(X, y)
+                                trained_object = model_v
+                            else:
+                                model_v = VotingRegressor(estimators=estimators, n_jobs=-1)
+                                model_v.fit(X, y)
+                                trained_object = model_v
+                            trained_base_info = [nm for nm, _ in estimators]
+                        else:
+                            # stacking
+                            final_est = make_meta_estimator(meta_name)
+                            if task == "classification":
+                                stack = StackingClassifier(estimators=estimators, final_estimator=final_est, n_jobs=-1, passthrough=False)
+                                stack.fit(X, y)
+                                trained_object = stack
+                            else:
+                                stack = StackingRegressor(estimators=estimators, final_estimator=final_est, n_jobs=-1, passthrough=False)
+                                stack.fit(X, y)
+                                trained_object = stack
+                            trained_base_info = [nm for nm, _ in estimators]
+
+            except Exception as e:
+                print(f"[ERROR] Training failed: {e}")
+                traceback.print_exc()
+                raise
+
+            # compute training metrics
+            metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1]), "ensemble_type": ensemble_type, "models_used": selected_model_names or [model_to_train]}
+            try:
+                if trained_object is not None:
+                    y_pred = trained_object.predict(X)
+                else:
+                    # if somehow None, just fail gracefully
+                    raise ValueError("No trained object available to predict.")
+                if task == "classification":
+                    metrics.update({
+                        "accuracy_train": float(accuracy_score(y, y_pred)),
+                        "precision_train": float(precision_score(y, y_pred, average='weighted', zero_division=0)),
+                        "recall_train": float(recall_score(y, y_pred, average='weighted', zero_division=0)),
+                        "f1_train": float(f1_score(y, y_pred, average='weighted', zero_division=0))
+                    })
+                else:
+                    metrics.update({
+                        "r2_train": float(r2_score(y, y_pred)),
+                        "rmse_train": float(np.sqrt(mean_squared_error(y, y_pred))),
+                        "mae_train": float(mean_absolute_error(y, y_pred))
+                    })
+            except Exception as e:
+                print(f"[WARN] Could not compute metrics: {e}")
+
+            # Save outputs
+            ensure_dir_for(args.model_pickle)
+            joblib.dump(trained_object, args.model_pickle)
+
+            ensure_dir_for(args.metrics_json)
+            with open(args.metrics_json, "w", encoding="utf-8") as fh:
+                json.dump(metrics, fh, indent=2, ensure_ascii=False)
+
+            model_config = {
+                "ensemble_type": ensemble_type,
+                "models_selected": selected_model_names,
+                "meta_model_name": meta_name or ("lightgbm" if (LGBMClassifier or LGBMRegressor) else "fallback"),
+                "static_defaults": STATIC,
+                "random_state": int(args.random_state)
+            }
+            ensure_dir_for(args.model_config)
+            with open(args.model_config, "w", encoding="utf-8") as fh:
+                json.dump(model_config, fh, indent=2, ensure_ascii=False)
+
+            print("="*80)
+            print("SUCCESS: Training finished")
+            print(json.dumps(metrics, indent=2))
+            print("="*80)
+
+        except Exception as e:
+            print("ERROR DURING TRAINING:", e, file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+
+    args:
+      - --X_data
+      - {inputPath: X_data}
+      - --y_data
+      - {inputPath: y_data}
+      - --model_type
+      - {inputValue: model_type}
+      - --ensemble_type
+      - {inputValue: ensemble_type}
+      - --n_ensemble_models
+      - {inputValue: n_ensemble_models}
+      - --model_names
+      - {inputValue: model_names}
+      - --meta_model_name
+      - {inputValue: meta_model_name}
+      - --random_state
+      - {inputValue: random_state}
+      - --model_pickle
+      - {outputPath: model_pickle}
+      - --metrics_json
+      - {outputPath: metrics_json}
+      - --model_config
+      - {outputPath: model_config}
