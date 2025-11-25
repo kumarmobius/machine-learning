@@ -1,7 +1,7 @@
 name: model training
 inputs:
-  - {name: X_data, type: Data, description: "Parquet file for features (DataFrame)"}
-  - {name: y_data, type: Data, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
+  - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
+  - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
