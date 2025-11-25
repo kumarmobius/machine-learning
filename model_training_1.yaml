@@ -1,4 +1,4 @@
-name: model training Stacking and Voting
+name: Stacking and Voting
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame) - already preprocessed"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded / preprocessed"}
@@ -21,12 +21,6 @@ implementation:
       - -u
       - -c
       - |
-        """
-        Training step with:
-         - Inputs: X_data, y_data (preprocessed), model_type, ensemble_type, n_ensemble_models, model_names, meta_model_name, random_state
-         - No preprocessing applied inside this step.
-         - Default hyperparameters are static (sensible values) and used unless you change the code.
-        """
         import argparse, json, os, sys, traceback, random
         import pandas as pd, numpy as np, joblib
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
