@@ -6,9 +6,9 @@ inputs:
   - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
   - {name: model_type, type: String, default: "classification", description: 'Type of model (classification or regression)'}
 outputs:
-  - {name: train_set, type: Data}
-  - {name: test_x, type: Data}
-  - {name: test_y, type: Data}
+  - {name: train_set, type: Dataset}
+  - {name: test_x, type: Dataset}
+  - {name: test_y, type: Dataset}
 implementation:
   container:
     image: kumar2004/ml-base:v1
