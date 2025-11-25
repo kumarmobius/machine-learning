@@ -1,4 +1,4 @@
-name: Evaluate Model v1.8
+name: Evaluate Model v2
 inputs:
   - {name: X_test, type: Data, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Data, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -323,6 +323,17 @@ implementation:
 
             # Align y_test labels to training encoding for classification
             y_original = y_raw.copy()  # Keep original for reference
+            def format_pct(x):
+                try:
+                    return round(float(x) * 100.0, 2)
+                except Exception:
+                    return x
+            
+            def format_num(x, ndigits=2):
+                try:
+                    return round(float(x), ndigits)
+                except Exception:
+                    return x
 
             if task != "regression" and label_mapping is not None:
                 print("="*80)
@@ -423,9 +434,9 @@ implementation:
                 rmse_val = float(np.sqrt(mse_val))
                 r2_val = float(r2_score(y_true_num, y_pred))
 
-                minimal_metrics["rmse"] = rmse_val
-                minimal_metrics["mse"] = mse_val
-                minimal_metrics["r2_score"] = r2_val
+                minimal_metrics["rmse"] = format_num(rmse_val)
+                minimal_metrics["mse"] = format_num(mse_val)
+                minimal_metrics["r2_score"] = format_num(r2_val)
 
             else:
                 # classification canonical metrics (weighted)
@@ -445,15 +456,15 @@ implementation:
                 recall_w = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
                 f1_w = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
 
-                minimal_metrics["accuracy"] = acc
-                minimal_metrics["precision"] = precision_w
-                minimal_metrics["recall"] = recall_w
-                minimal_metrics["f1_score"] = f1_w
+                minimal_metrics["accuracy"] = format_pct(acc)
+                minimal_metrics["precision"] = format_pct(precision_w)
+                minimal_metrics["recall"] = format_pct(recall_w)
+                minimal_metrics["f1_score"] = format_pct(f1_w)
 
                 if loss_val is not None:
                     # include only if numeric loss was found
                     try:
-                        minimal_metrics["loss"] = float(loss_val)
+                        minimal_metrics["loss"] = format_num(loss_val, ndigits=6)
                     except Exception:
                         pass
 
