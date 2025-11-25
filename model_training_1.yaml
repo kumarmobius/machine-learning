@@ -1,4 +1,4 @@
-name: Stacking and Voting V2
+name: Stacking and Voting V2.1
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -292,7 +292,7 @@ implementation:
                     try:
                         class_counts = pd.Series(y).value_counts()
                         min_class_count = int(class_counts.min())
-                        print(f"[INFO] class_counts min = {min_class_count}, distribution:\n{class_counts.to_string()}")
+                        print(f"[INFO] class_counts min = {min_class_count}, distribution:{class_counts.to_string()}")
                     except Exception as e:
                         print(f"[WARN] Could not compute class counts: {e}")
                         min_class_count = None
