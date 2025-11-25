@@ -1,6 +1,6 @@
 name: Advanced Preprocess v8.5
 inputs:
-  - {name: in_file, type: Data, description: "Path to the dataset file or directory"}
+  - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: enable_feature_selection, type: String, description: "true/false to enable feature selection", optional: true, default: "true"}
@@ -14,8 +14,8 @@ inputs:
   - {name: unique_threshold, type: Float, description: "Drop columns with unique % above this (ID columns)", optional: true, default: "0.95"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
 outputs:
-  - {name: train_X, type: Data, description: "Processed features parquet"}
-  - {name: train_y, type: Data, description: "Target parquet"}
+  - {name: train_X, type: Dataset, description: "Processed features parquet"}
+  - {name: train_y, type: Dataset, description: "Target parquet"}
   - {name: preprocessor, type: Data, description: "joblib dump of fitted Preprocessor"}
   - {name: feature_selector, type: Data, description: "joblib dump of fitted FeatureSelector"}
   - {name: preprocess_metadata, type: Data, description: "JSONf metadata"}
