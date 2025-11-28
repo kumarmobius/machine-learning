@@ -1,4 +1,4 @@
-name: Update Schema Row
+name: Update Schema Row v1
 description: Updates a row in a schema based on a mapping between column names and a JSON object.
 
 inputs:
@@ -109,7 +109,6 @@ implementation:
         http.mount("http://", adapter)
 
         def coerce_if_needed(key, value):
-            """If key listed in float_keys, try to convert to float; otherwise keep original type."""
             if key in float_keys:
                 try:
                     return float(value)
