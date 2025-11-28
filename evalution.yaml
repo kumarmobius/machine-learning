@@ -1,4 +1,4 @@
-name: Evaluate Model v2
+name: Evaluate Model v3
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -408,16 +408,6 @@ implementation:
             print(f"[INFO] Predictions unique values: {np.unique(y_pred)}")
             print(f"[INFO] Predictions sample (first 10): {y_pred[:10]}")
 
-            # Get probability predictions if available
-            y_proba = None
-            if hasattr(model, "predict_proba"):
-                try:
-                    y_proba = model.predict_proba(Xs)
-                    print(f"[INFO] Probability predictions shape: {y_proba.shape}")
-                    print(f"[INFO] Probability predictions sample (first 3):")
-                    print(y_proba[:3])
-                except Exception as e:
-                    print(f"[WARN] Could not get probability predictions: {e}")
 
             # Compute minimal metrics according to requested spec
             print("="*80)
@@ -485,13 +475,6 @@ implementation:
                 "y_true_original": y_original  # Keep original labels for reference
             })
 
-            if isinstance(y_proba, np.ndarray):
-                try:
-                    out["y_proba_max"] = y_proba.max(axis=1)
-                    for i in range(y_proba.shape[1]):
-                        out[f"y_proba_class_{i}"] = y_proba[:, i]
-                except Exception as e:
-                    print(f"[WARN] Could not save probabilities: {e}")
 
             out.to_parquet(preds_path, index=False)
             print(f"[INFO] Predictions saved successfully")
