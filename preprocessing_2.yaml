@@ -1,4 +1,4 @@
-name: Advanced Preprocess v8.5
+name: Advanced Preprocess v9
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -167,7 +167,7 @@ implementation:
             df=df.copy(); report={'converted':[],'skipped':[]}
             obj_cols=[c for c in df.columns if (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
             for col in obj_cols:
-                if col in ('__TARGET__TMP__',): continue
+                if col in ('__TARGET__TMP__',) or col in exclude_cols: continue
                 ser=df[col].astype(object); total_non_null=ser.notna().sum()
                 if total_non_null==0: report['skipped'].append(col); continue
                 parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma)) if advanced else pd.to_numeric(ser, errors='coerce')
@@ -988,7 +988,11 @@ implementation:
         args=parser.parse_args()
 
         try:
-            in_path=args.in_file; target_col=args.target_column; model_type=args.model_type.strip().lower()
+            in_path=args.in_file
+            target_col_input=args.target_column
+            target_cols = [t.strip() for t in target_col_input.split(',')] if ',' in target_col_input else [target_col_input.strip()]
+            model_type=args.model_type.strip().lower()
+            print(f"[INFO] Target columns: {target_cols}")
             enable_fs=str(args.enable_feature_selection).lower() in ("1","true","t","yes","y")
             outlier_strategy=args.outlier_strategy; outlier_fold=float(args.outlier_fold)
             max_knn_rows=int(args.max_knn_rows); detect_thresh=float(args.numeric_detection_threshold)
@@ -1004,14 +1008,18 @@ implementation:
             df = read_with_pandas(in_path)
             print(f"Loaded shape: {df.shape}")
             print(f"All columns: {list(df.columns)}")
-            if target_col not in df.columns:
-                print("ERROR target column " + str(target_col) + " not found", file=sys.stderr); sys.exit(1)
-            print_data_understanding(df, target_col, preview_rows)
+            for tc in target_cols:
+                if tc not in df.columns:
+                    print(f"ERROR: target column '{tc}' not found in {list(df.columns)}", file=sys.stderr)
+                    sys.exit(1)
+            print_data_understanding(df, target_cols[0], preview_rows)  # Show first target
+            print(f"[INFO] Multi-output targets: {target_cols}")
             before=len(df); df_hashable=make_hashable_for_dupes(df); df = df_hashable.drop_duplicates(keep='first')
             dropped_dupes = before - len(df)
             print(f"Removed duplicates: {dropped_dupes} rows dropped")
-            y_raw = df[target_col].copy()
-            X_raw = df.drop(columns=[target_col]).copy()
+            y_raw = df[target_cols].copy()  # DataFrame with multiple targets
+            X_raw = df.drop(columns=target_cols).copy()
+            print(f"[INFO] y_raw shape: {y_raw.shape}")
 
             missing_report = {}
             cols_to_drop_missing = []
@@ -1094,7 +1102,7 @@ implementation:
                     print(f"[INFO] Applying date extraction (found {len(date_report['date_columns'])} date columns in training)...")
                     X_raw, _ = detect_and_extract_dates(X_raw, enabled=True, exclude_cols=[target_col] if target_col else None)
                     print(f"[INFO] Date extraction applied. New shape: {X_raw.shape}")
-            X_dates, date_report = detect_and_extract_dates(X_conv, enabled=True, exclude_cols=None)
+            X_dates, date_report = detect_and_extract_dates(X_conv, enabled=True, exclude_cols=target_cols)
             print(f"Date detection report: {len(date_report.get('date_columns', []))} date columns found")
             config={
                 'outlier_strategy': outlier_strategy,
@@ -1106,30 +1114,53 @@ implementation:
                 'missing_threshold': missing_threshold,
                 'unique_threshold': unique_threshold
             }
-            y_info={'strategy': None, 'classes_': None}
-            label_mapping = None
-            if model_type=="regression":
-                y_series=pd.to_numeric(y_raw, errors='coerce')
-                y_info['strategy']="numeric_coerce"
+            y_info = {'strategies': {}, 'classes': {}}
+            label_mappings = {}
+            
+            if model_type == "regression":
+                y_series = y_raw.apply(pd.to_numeric, errors='coerce')
+                for col in target_cols:
+                    y_info['strategies'][col] = "numeric_coerce"
+                print(f"[INFO] Regression mode: all targets converted to numeric")
             else:
-                y_num=pd.to_numeric(y_raw, errors='coerce')
-                if y_num.notna().mean() > 0.8:
-                    y_series = np.floor(y_num + 0.5).astype("Int64")
-                else:
-                    le=LabelEncoder()
-                    y_series = pd.Series(le.fit_transform(y_raw.astype(str)), index=y_raw.index)
-                    y_info['strategy']="label_encode"
-                    y_info['classes_']=list(map(str, le.classes_))
-                    label_mapping = {str(original): int(encoded) for original, encoded in zip(le.classes_, range(len(le.classes_)))}
-                    print(f"[INFO] Created label mapping: {label_mapping}")
+                y_series = pd.DataFrame(index=y_raw.index)
+                for col in target_cols:
+                    y_num = pd.to_numeric(y_raw[col], errors='coerce')
+                    if y_num.notna().mean() > 0.8:
+                        y_series[col] = np.floor(y_num + 0.5).astype("Int64")
+                        y_info['strategies'][col] = 'numeric'
+                        print(f"[INFO] Target '{col}': numeric (no encoding needed)")
+                    else:
+                        le = LabelEncoder()
+                        y_series[col] = pd.Series(le.fit_transform(y_raw[col].astype(str)), index=y_raw.index)
+                        y_info['strategies'][col] = 'label_encode'
+                        y_info['classes'][col] = list(map(str, le.classes_))
+                        label_mappings[col] = {str(orig): int(enc) for orig, enc in zip(le.classes_, range(len(le.classes_)))}
+                        print(f"[INFO] Target '{col}': label encoded ({len(le.classes_)} classes)")
+                print(f"[INFO] Multi-target label mappings: {label_mappings}")
             if model_type == "classification":
-                class_counts = y_series.value_counts().sort_index()
                 print("="*80)
-                print("CLASS DISTRIBUTION ANALYSIS")
+                print("CLASS DISTRIBUTION ANALYSIS (Multi-Output)")
                 print("="*80)
-                for cls, count in class_counts.items():
-                    pct = (count / len(y_series)) * 100
-                    print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
+                for target_col in target_cols:
+                    print(f"Target: {target_col}")
+                    print("-" * 40)
+                    class_counts = y_series[target_col].value_counts().sort_index()
+                    for cls, count in class_counts.items():
+                        pct = (count / len(y_series)) * 100
+                        print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
+                    
+                    min_class = class_counts.min()
+                    max_class = class_counts.max()
+                    imbalance_ratio = max_class / min_class if min_class > 0 else float('inf')
+                    print(f"  Imbalance ratio (max/min): {imbalance_ratio:.2f}:1")
+                    if imbalance_ratio > 5:
+                        print(f"  [WARN] Severe imbalance in '{target_col}'!")
+                    elif imbalance_ratio > 2:
+                        print(f"  [INFO] Moderate imbalance in '{target_col}'")
+                    else:
+                        print(f"  [INFO] '{target_col}' is relatively balanced")
+                print("="*80)
                 min_class = class_counts.min()
                 max_class = class_counts.max()
                 imbalance_ratio = max_class / min_class if min_class > 0 else float('inf')
@@ -1143,19 +1174,27 @@ implementation:
                 else:
                     print("[INFO] Classes are relatively balanced")
                 print("="*80)
-            keep_mask_y = y_series.notna()
+            keep_mask_y = y_series.notna().all(axis=1)
             dropped_y = int((~keep_mask_y).sum())
-            if dropped_y>0:
-                print(f"Dropped rows with null target: {dropped_y}")
+            if dropped_y > 0:
+                print(f"[INFO] Dropped rows with null in ANY target: {dropped_y}")
+                for col in target_cols:
+                    null_count = y_series[col].isna().sum()
+                    if null_count > 0:
+                        print(f"  - '{col}': {null_count} null values")
+            
             X_input = X_dates.loc[keep_mask_y].reset_index(drop=True)
             y_series = y_series.loc[keep_mask_y].reset_index(drop=True)
+            print(f"[INFO] Final y_series shape: {y_series.shape}")
 
             print(f"Final dataset before preprocessing: {X_input.shape}")
             print_head(X_input, "X head before Preprocessor.fit", preview_rows)
             print_dtypes(X_input, "X dtypes before Preprocessor.fit")
             print("Fitting Preprocessor...")
             pre=Preprocessor()
-            pre.fit(X_input, y=y_series if model_type=="classification" else y_series, config=config, target_col=target_col, model_type=model_type)
+            y_for_fit = y_series[target_cols[0]] if model_type == "classification" and len(target_cols) == 1 else (y_series.iloc[:, 0] if len(target_cols) > 1 else y_series)
+            
+            pre.fit(X_input, y=y_for_fit if model_type=="classification" else None, config=config, target_col=target_cols, model_type=model_type)
 
             print(f"Numeric columns identified: {len(pre.num_cols)}")
             print(f"Categorical columns identified: {len(pre.cat_cols)}")
@@ -1176,12 +1215,17 @@ implementation:
 
             # Feature selection (optional)
             if enable_fs:
-                print("Performing feature selection...")
-                fs=FeatureSelector(task=("classification" if model_type=="classification" else "regression"))
-                fs.fit(Xp, y_series.values)
+                print("Performing feature selection (using first target for multi-output)...")
+                fs = FeatureSelector(task=("classification" if model_type=="classification" else "regression"))
+                
+                # Use first target for feature selection
+                y_for_fs = y_series[target_cols[0]] if isinstance(y_series, pd.DataFrame) else y_series
+                fs.fit(Xp, y_for_fs.values)
+                
                 Xs = fs.transform(Xp)
                 print(f"Selected {len(fs.selected_features)} features from {Xp.shape[1]}")
                 print(f"Selected features: {fs.selected_features}")
+                print(f"[INFO] Feature selection based on target: {target_cols[0]}")
             else:
                 print("Feature selection disabled, using all features")
                 Xs = Xp.copy()
@@ -1189,8 +1233,14 @@ implementation:
             ensure_dir_for(out_X); ensure_dir_for(out_y); ensure_dir_for(preproc_path); ensure_dir_for(fs_path); ensure_dir_for(meta_path)
             
             Xs.to_parquet(out_X, index=False)
-            y_df=pd.DataFrame({target_col: y_series})
+            # y_series is already a DataFrame with multiple columns
+            if isinstance(y_series, pd.Series):
+                y_df = pd.DataFrame({target_cols[0]: y_series})
+            else:
+                y_df = y_series.copy()  # Already a DataFrame
+            
             y_df.to_parquet(out_y, index=False)
+            print(f"[INFO] Saved y with shape {y_df.shape} and columns {list(y_df.columns)}")
             
             with gzip.open(preproc_path, "wb") as f:
                 cloudpickle.dump(pre, f)
@@ -1204,25 +1254,26 @@ implementation:
                     cloudpickle.dump(dummy_fs, f)
 
             metadata={
-                'timestamp': datetime.utcnow().isoformat()+'Z',
-                'model_type': model_type,
-                'target_column': target_col,
-                'enable_feature_selection': enable_fs,
-                'y_strategy': y_info,
-                'config': config,
-                'dropped_duplicates': dropped_dupes,
-                'dropped_missing_cols': cols_to_drop_missing,
-                'dropped_unique_cols': cols_to_drop_unique,
-                'missing_report': missing_report,
-                'unique_report': unique_report,
-                'label_mapping': label_mapping,
-                'conversion_report': conv_report,
-                'date_report': date_report,
-                'num_cols': pre.global_metadata.get('num_cols', []),
-                'cat_cols': pre.global_metadata.get('cat_cols', []),
-                'selected_features': fs.selected_features if fs else list(Xs.columns),
-                'final_shape': {'rows': Xs.shape[0], 'cols': Xs.shape[1]}
-            }
+              'timestamp': datetime.utcnow().isoformat()+'Z',
+              'model_type': model_type,
+              'target_columns': target_cols,  # plural
+              'n_targets': len(target_cols),
+              'enable_feature_selection': enable_fs,
+              'y_strategies': y_info,  # contains per-target info
+              'config': config,
+              'dropped_duplicates': dropped_dupes,
+              'dropped_missing_cols': cols_to_drop_missing,
+              'dropped_unique_cols': cols_to_drop_unique,
+              'missing_report': missing_report,
+              'unique_report': unique_report,
+              'label_mappings': label_mappings,  # plural, dict of dicts
+              'conversion_report': conv_report,
+              'date_report': date_report,
+              'num_cols': pre.global_metadata.get('num_cols', []),
+              'cat_cols': pre.global_metadata.get('cat_cols', []),
+              'selected_features': fs.selected_features if fs else list(Xs.columns),
+              'final_shape': {'rows': Xs.shape[0], 'cols': Xs.shape[1], 'n_targets': len(target_cols)}
+          }
             with open(meta_path,'w',encoding='utf-8') as fh:
                 json.dump(metadata, fh, indent=2, ensure_ascii=False)
 
@@ -1231,7 +1282,7 @@ implementation:
             print("="*80)
             print(f"Input shape: {df.shape}")
             print(f"Final X shape: {Xs.shape}")
-            print(f"Final y shape: {y_df.shape}")
+            print(f"Final y shape: {y_df.shape} (targets: {list(y_df.columns)})")
             print(f"Duplicates removed: {dropped_dupes}")
             print(f"Columns dropped (missing): {len(cols_to_drop_missing)}")
             print(f"Columns dropped (unique ID): {len(cols_to_drop_unique)}")
