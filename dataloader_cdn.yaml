@@ -1,4 +1,4 @@
-name: Data loader with cdn v3
+name: Data loader with cdn v3.1
 inputs:
   - {name: cdn_url, type: String, description: 'CDN URL to download dataset file (CSV, JSON, or Parquet)'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
@@ -168,9 +168,9 @@ implementation:
             logger.info("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
             # If multiple targets, print distributions per column
             for col in target_cols:
-                logger.info("Column '%s' distribution:\n%s", col, target_df[col].value_counts(dropna=False).to_string())
+                logger.info("Column '%s' distribution:%s", col, target_df[col].value_counts(dropna=False).to_string())
                 logger.info("Unique classes in %s: %s", col, target_df[col].nunique())
-                logger.info("Class distribution percentages for %s:\n%s", col, (target_df[col].value_counts(dropna=False, normalize=True) * 100).to_string())
+                logger.info("Class distribution percentages for %s:%s", col, (target_df[col].value_counts(dropna=False, normalize=True) * 100).to_string())
         else:
             logger.info("Model type is regression — skipping target distribution summary.")
 
