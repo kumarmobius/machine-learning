@@ -1,8 +1,8 @@
-name: Data loader with cdn v2
+name: Data loader with cdn v3
 inputs:
   - {name: cdn_url, type: String, description: 'CDN URL to download dataset file (CSV, JSON, or Parquet)'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
-  - {name: target_column, type: String, description: 'Name of target column used for splitting'}
+  - {name: target_column, type: String, description: 'Name of target column or comma-separated list of target columns (e.g. "c1,c2,c3")'}
   - {name: model_type, type: String, default: "classification", description: 'Type of model (classification or regression)'}
 outputs:
   - {name: train_set, type: Dataset}
@@ -37,7 +37,8 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument('--cdn_url', type=str, required=True)
         parser.add_argument('--split_size', type=float, default=15)
-        parser.add_argument('--target_column', type=str, required=True)
+        parser.add_argument('--target_column', type=str, required=True,
+                            help='Single column name or comma-separated columns, e.g. "c1,c2,c3"')
         parser.add_argument('--model_type', type=str, default="classification")
         parser.add_argument('--train_set', type=str, required=True)
         parser.add_argument('--test_x', type=str, required=True)
@@ -151,31 +152,33 @@ implementation:
         logger.info("DF_DTYPES:%s", df.dtypes.to_string())
         logger.info("DF_NULL_COUNTS:%s", df.isnull().sum().to_string())
 
-        # === Prepare target ===
-        if args.target_column in df.columns:
-            target_values = df[args.target_column].copy()
-        else:
-            logger.warning(" Target column '%s' not found. Creating zero target values.", args.target_column)
-            target_values = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index, name=args.target_column)
-            # add synthetic target to dataframe so train_set contains it
-            df[args.target_column] = target_values
+        # === Prepare target(s) ===
+        target_cols = [c.strip() for c in args.target_column.split(",") if c.strip()]
+        if not target_cols:
+            raise ValueError("No target columns provided")
+
+        missing = [c for c in target_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Target columns not found in dataframe: {missing}")
+
+        target_df = df[target_cols].copy()
 
         # === Print target variable distribution if classification ===
         if args.model_type.lower() == "classification":
             logger.info("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
-            logger.info("%s", target_values.value_counts(dropna=False).to_string())
-            logger.info("Unique classes: %s", target_values.nunique())
-            logger.info("Class distribution percentages:%s", (target_values.value_counts(dropna=False, normalize=True) * 100).to_string())
+            # If multiple targets, print distributions per column
+            for col in target_cols:
+                logger.info("Column '%s' distribution:\n%s", col, target_df[col].value_counts(dropna=False).to_string())
+                logger.info("Unique classes in %s: %s", col, target_df[col].nunique())
+                logger.info("Class distribution percentages for %s:\n%s", col, (target_df[col].value_counts(dropna=False, normalize=True) * 100).to_string())
         else:
             logger.info("Model type is regression — skipping target distribution summary.")
 
-        # CRITICAL FIX: Stratify by actual target values (not binary mask!)
-        # This ensures train/test have the same class distribution
-        if args.model_type.lower() == "classification":
+        # CRITICAL FIX: Stratify only if classification AND single target column
+        if args.model_type.lower() == "classification" and len(target_cols) == 1:
+            target_values = target_df[target_cols[0]]
             if target_values.nunique() > 1:
-                # ensure classes have enough samples for stratification
                 class_counts = target_values.value_counts(dropna=False)
-                # conservative minimum; adjust as needed for very small datasets
                 min_required_per_class = 2
                 insufficient = class_counts[class_counts < min_required_per_class]
                 if not insufficient.empty:
@@ -188,7 +191,9 @@ implementation:
                 stratify_param = None
                 logger.warning("[WARN] Only one class in target, stratification disabled")
         else:
-            stratify_param = None  # No stratification for regression
+            stratify_param = None
+            if args.model_type.lower() == "classification" and len(target_cols) > 1:
+                logger.info("Multiple target columns provided; stratified split is not supported for multi-target classification — proceeding without stratification")
 
         # === Convert split size ===
         split_size_input = float(args.split_size)
@@ -198,32 +203,40 @@ implementation:
 
         # === Perform train-test split (with fallback) ===
         try:
+            # Passing df (features) and target_df (DataFrame) — returned order: train_df, test_df, train_targets, test_targets
             train_df, test_df, train_y, test_y = train_test_split(
-                df, target_values, test_size=test_size, random_state=42, stratify=stratify_param
+                df, target_df, test_size=test_size, random_state=42, stratify=stratify_param
             )
         except ValueError as e:
             logger.warning("Stratified split failed (%s). Retrying without stratification.", e)
             train_df, test_df, train_y, test_y = train_test_split(
-                df, target_values, test_size=test_size, random_state=42, stratify=None
+                df, target_df, test_size=test_size, random_state=42, stratify=None
             )
 
         # Reset indices
         train_df = train_df.reset_index(drop=True)
         test_df = test_df.reset_index(drop=True)
-        train_y = train_y.reset_index(drop=True)
-        test_y = test_y.reset_index(drop=True)
+        # train_y/test_y can be Series (single target) or DataFrame (multi-target)
+        if isinstance(train_y, (pd.Series,)):
+            train_y = train_y.reset_index(drop=True)
+            test_y = test_y.reset_index(drop=True)
+            train_y_df = pd.DataFrame({target_cols[0]: train_y})
+            test_y_df = pd.DataFrame({target_cols[0]: test_y})
+        else:
+            train_y_df = train_y.reset_index(drop=True)
+            test_y_df = test_y.reset_index(drop=True)
 
-        # If classification, print train/test distributions and check match
-        if args.model_type.lower() == "classification":
+        # If classification and single target, print train/test distributions and check match
+        if args.model_type.lower() == "classification" and len(target_cols) == 1:
             logger.info("="*80)
             logger.info("CLASS DISTRIBUTION VERIFICATION")
             logger.info("="*80)
 
-            logger.info("TRAIN SET CLASS DISTRIBUTION:%s", train_y.value_counts(dropna=False).sort_index().to_string())
-            logger.info("TEST SET CLASS DISTRIBUTION:%s", test_y.value_counts(dropna=False).sort_index().to_string())
+            logger.info("TRAIN SET CLASS DISTRIBUTION:%s", train_y_df[target_cols[0]].value_counts(dropna=False).sort_index().to_string())
+            logger.info("TEST SET CLASS DISTRIBUTION:%s", test_y_df[target_cols[0]].value_counts(dropna=False).sort_index().to_string())
 
-            train_pct = train_y.value_counts(normalize=True, dropna=False).sort_index()
-            test_pct = test_y.value_counts(normalize=True, dropna=False).sort_index()
+            train_pct = train_y_df[target_cols[0]].value_counts(normalize=True, dropna=False).sort_index()
+            test_pct = test_y_df[target_cols[0]].value_counts(normalize=True, dropna=False).sort_index()
             all_idx = train_pct.index.union(test_pct.index)
             train_pct = train_pct.reindex(all_idx, fill_value=0)
             test_pct = test_pct.reindex(all_idx, fill_value=0)
@@ -236,9 +249,11 @@ implementation:
             logger.info("="*80)
 
         # === Create outputs ===
-        test_x_df = test_df.drop(columns=[args.target_column], errors="ignore")
+        # test_x_df -> drop all target columns
+        test_x_df = test_df.drop(columns=target_cols, errors="ignore")
         train_set_df = train_df.copy()
-        test_y_df = pd.DataFrame({args.target_column: test_y})
+        # ensure train_set contains target columns (they are present in train_df since we split full df)
+        # test_y_df already created above as DataFrame
 
         # === Diagnostics for splits ===
         logger.info("===== TRAIN SET =====")
