@@ -194,7 +194,7 @@ implementation:
 
    
         os.makedirs(args.pca_output, exist_ok=True)
-        log.info(f"Saving outputs to: {args.pca_output}\n")
+        log.info(f"Saving outputs to: {args.pca_output}")
         
         # 1. Save transformed data as Parquet (efficient storage)
         transformed_path = os.path.join(args.pca_output, 'pca_transformed.parquet')
