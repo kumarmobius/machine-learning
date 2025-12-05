@@ -1,4 +1,4 @@
-name: Evaluate Model v4
+name: Evaluate Model v5
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -215,9 +215,20 @@ implementation:
             # Extract target column (for single-target eval)
             if isinstance(y_df, pd.DataFrame):
                 if target_col:
-                    if target_col not in y_df.columns:
+                    # Check if target_col is comma-separated list of columns
+                    if ',' in target_col:
+                        # Multi-target scenario: user passed comma-separated list
+                        target_cols = [c.strip() for c in target_col.split(',')]
+                        missing = [c for c in target_cols if c not in y_df.columns]
+                        if missing:
+                            raise ValueError(f"Target columns {missing} not in y_test. Available columns: {list(y_df.columns)}")
+                        # Extract only the specified columns
+                        y_raw = None  # Signal multi-target path
+                        y_df = y_df[target_cols].copy()  # Keep only requested targets
+                    elif target_col not in y_df.columns:
                         raise ValueError(f"--target_column '{target_col}' not in y_test. Available columns: {list(y_df.columns)}")
-                    y_raw = y_df[target_col].copy()
+                    else:
+                        y_raw = y_df[target_col].copy()
                 elif y_df.shape[1] == 1:
                     y_raw = y_df.iloc[:, 0].copy()
                 else:
