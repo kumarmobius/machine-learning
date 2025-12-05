@@ -1,4 +1,4 @@
-name: Advanced Preprocess v9
+name: Advanced Preprocess v9.1
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Name of the target column"}
@@ -163,11 +163,12 @@ implementation:
                 except Exception: return np.nan
             return np.nan
 
-        def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True):
+        def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True, exclude_cols=None):
             df=df.copy(); report={'converted':[],'skipped':[]}
+            exclude_cols = set(exclude_cols or [])  # ← ADD THIS
             obj_cols=[c for c in df.columns if (df[c].dtype=='object' or str(df[c].dtype).startswith('string'))]
             for col in obj_cols:
-                if col in ('__TARGET__TMP__',) or col in exclude_cols: continue
+                if col in ('__TARGET__TMP__',) or col in exclude_cols: continue  # Now works!
                 ser=df[col].astype(object); total_non_null=ser.notna().sum()
                 if total_non_null==0: report['skipped'].append(col); continue
                 parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma)) if advanced else pd.to_numeric(ser, errors='coerce')
@@ -1090,9 +1091,10 @@ implementation:
 
             print(f"Remaining features after filtering: {X_raw.shape[1]} columns")
             print("Converting object columns in X to numeric where possible")
-            X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
+            X_conv, conv_report = convert_object_columns_advanced(X_raw, detect_threshold=detect_thresh, decimal_comma=False, advanced=True, exclude_cols=target_cols)
             print(f"Conversion report: {len(conv_report.get('converted', []))} columns converted")
             print("Detecting date-like columns in X")
+            # Around line 999
             if meta_path and os.path.exists(meta_path):
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
@@ -1100,7 +1102,7 @@ implementation:
                 date_report = meta.get("date_report", {})
                 if date_report and date_report.get("date_columns"):
                     print(f"[INFO] Applying date extraction (found {len(date_report['date_columns'])} date columns in training)...")
-                    X_raw, _ = detect_and_extract_dates(X_raw, enabled=True, exclude_cols=[target_col] if target_col else None)
+                    X_raw, _ = detect_and_extract_dates(X_raw, enabled=True, exclude_cols=target_cols)  # ← FIXED
                     print(f"[INFO] Date extraction applied. New shape: {X_raw.shape}")
             X_dates, date_report = detect_and_extract_dates(X_conv, enabled=True, exclude_cols=target_cols)
             print(f"Date detection report: {len(date_report.get('date_columns', []))} date columns found")
