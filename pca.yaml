@@ -1,4 +1,4 @@
-name: PCA Transformer v1.2
+name: PCA Transformer v1.3
 inputs:
   - {name: input_data, type: Dataset, description: "Input dataset (CSV, Parquet, or JSONL)"}
   - {name: pca_variant, type: String, description: "PCA variant: pca, kernel, incremental, sparse, fa, ica", optional: true, default: "pca"}
@@ -211,7 +211,7 @@ implementation:
             print("=" * 80)
 
             print("[STEP 1/6] Loading dataset...")
-            df_raw = load_table(args.input_data)
+            df_raw = pd.read_parquet(args.input_data)
             print(f"[INFO] Raw shape: {df_raw.shape[0]} rows x {df_raw.shape[1]} columns")
 
             print("[STEP 2/6] Selecting numeric columns and checking sanity...")
