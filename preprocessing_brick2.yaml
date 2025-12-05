@@ -1,4 +1,4 @@
-name: Feature Engineering v1
+name: Feature Engineering v1.1
 inputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features from Brick 1"}
   - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
@@ -593,7 +593,7 @@ implementation:
                     pass
             
             # Save outputs
-            print("\n[STEP 6/8] Saving engineered features...")
+            print("[STEP 6/8] Saving engineered features...")
             ensure_dir_for(args.engineered_X)
             ensure_dir_for(args.train_y)
             ensure_dir_for(args.preprocessor)
