@@ -1,4 +1,4 @@
-name: PCA V1
+name: PCA V2
 inputs:
   - {name: input_data_path, type: Dataset, description: "Input dataset path (CSV, Parquet, or JSONL)"}
   - {name: n_components, type: string, default: "auto", description: "Number of components, ratio, or 'auto'"}
@@ -8,7 +8,7 @@ inputs:
   - {name: output_format, type: string, default: "csv", description: "csv | json | parquet"}
 
 outputs:
-  - {name: training_results_out, type: Dataset, description: "PCA-transformed dataset"}
+  - {name: to_be_trained, type: Dataset, description: "PCA-transformed dataset"}
   - {name: pca_pickle_file, type: Model, description: "Cloudpickle PCA model file"}
   - {name: pca_metadata_file, type: File, description: "Metadata JSON file"}
 
@@ -32,36 +32,31 @@ implementation:
         parser.add_argument('--pca_variant', default="Standard PCA")
         parser.add_argument('--random_state', type=int, default=42)
         parser.add_argument('--output_format', default="csv")
-        parser.add_argument('--training_results_out', required=True)
+        parser.add_argument('--to_be_trained', required=True)
         parser.add_argument('--pca_pickle_file', required=True)
         parser.add_argument('--pca_metadata_file', required=True)
         args = parser.parse_args()
 
         logging.basicConfig(level=logging.INFO)
-        log = logging.getLogger("raw_pca")
+        log = logging.getLogger("pca_pipeline")
 
         def load(path):
-            if path.startswith(("http://", "https://")):
-                r = requests.get(path, timeout=60)
-                r.raise_for_status()
-                b = BytesIO(r.content)
-                if path.endswith(".csv"): return pd.read_csv(b)
-                if path.endswith(".parquet"): return pd.read_parquet(b)
-                if path.endswith(".json") or path.endswith(".jsonl"): return pd.read_json(b, lines=True)
-                if path.endswith(".pkl"): return pickle.load(b)
-                raise SystemExit("Unsupported remote format.")
-            else:
-                if path.endswith(".csv"): return pd.read_csv(path)
-                if path.endswith(".parquet"): return pd.read_parquet(path)
-                if path.endswith(".json") or path.endswith(".jsonl"): return pd.read_json(path, lines=True)
-                if path.endswith(".pkl"): return pickle.load(open(path, "rb"))
-                raise SystemExit("Unsupported local format.")
+            if path.endswith(".csv"): return pd.read_csv(path)
+            if path.endswith(".parquet"): return pd.read_parquet(path)
+            if path.endswith(".json") or path.endswith(".jsonl"): return pd.read_json(path, lines=True)
+            if path.endswith(".pkl"): return pickle.load(open(path, "rb"))
+            raise SystemExit("Unsupported file format.")
 
         df = load(args.input_data_path)
-        log.info(f"Raw dataset loaded with shape: {df.shape}")
+        log.info(f"Dataset loaded with shape: {df.shape}")
 
-        # No preprocessing. No target column. PCA on everything.
-        X_raw = df.values
+        # PCA on all numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            raise SystemExit("No numeric columns found in dataset")
+        
+        X_raw = df[numeric_cols].values
+        log.info(f"Using {len(numeric_cols)} numeric features")
 
         # Determine n_components
         use_auto = args.n_components.lower() == "auto"
@@ -72,7 +67,7 @@ implementation:
             variance = np.cumsum(full_pca.explained_variance_ratio_)
             threshold = float(args.auto_variance_threshold)
             n_comp = np.argmax(variance >= threshold) + 1
-            log.info(f"Auto-selected components: {n_comp}")
+            log.info(f"Auto-selected {n_comp} components for {threshold*100}% variance threshold")
         else:
             num = float(args.n_components)
             n_comp = int(num) if num.is_integer() else num
@@ -82,7 +77,7 @@ implementation:
         if variant == "Standard PCA":
             pca = PCA(n_components=n_comp, random_state=args.random_state)
         elif variant == "Kernel PCA":
-            pca = KernelPCA(n_components=int(n_comp), kernel='rbf')
+            pca = KernelPCA(n_components=int(n_comp), kernel='rbf', random_state=args.random_state)
         elif variant == "Incremental PCA":
             pca = IncrementalPCA(n_components=int(n_comp))
         elif variant == "Randomized PCA":
@@ -97,10 +92,12 @@ implementation:
             raise SystemExit(f"Unknown PCA variant: {variant}")
 
         X_pca = pca.fit_transform(X_raw)
-        df_pca = pd.DataFrame(X_pca, columns=[f"Component_{i+1}" for i in range(X_pca.shape[1])])
+        df_pca = pd.DataFrame(X_pca, columns=[f"PC{i+1}" for i in range(X_pca.shape[1])])
+        
+        log.info(f"PCA transformation complete: {X_raw.shape} -> {X_pca.shape}")
 
         fmt = args.output_format.lower()
-        out_path = args.training_results_out
+        out_path = args.to_be_trained
 
         if fmt == "csv":
             df_pca.to_csv(out_path, index=False)
@@ -109,20 +106,36 @@ implementation:
         else:
             df_pca.to_parquet(out_path, index=False)
 
+        log.info(f"Transformed data saved to: {out_path}")
+
         with gzip.open(args.pca_pickle_file, "wb") as f:
             cloudpickle.dump(pca, f)
+
+        log.info(f"PCA model saved to: {args.pca_pickle_file}")
 
         metadata = {
             "variant": variant,
             "n_components": X_pca.shape[1],
-            "original_features": df.shape[1],
+            "original_features": len(numeric_cols),
             "auto_selected": use_auto,
-            "feature_names": list(df.columns),
-            "model_file": args.pca_pickle_file
+            "variance_threshold": float(args.auto_variance_threshold) if use_auto else None,
+            "random_state": args.random_state,
+            "feature_names": numeric_cols,
+            "output_format": fmt,
+            "input_shape": list(X_raw.shape),
+            "output_shape": list(X_pca.shape)
         }
+
+        if hasattr(pca, 'explained_variance_ratio_'):
+            metadata["explained_variance_ratio"] = pca.explained_variance_ratio_.tolist()
+            metadata["cumulative_variance"] = np.cumsum(pca.explained_variance_ratio_).tolist()
+            metadata["total_variance_explained"] = float(np.sum(pca.explained_variance_ratio_))
 
         with open(args.pca_metadata_file, "w") as f:
             json.dump(metadata, f, indent=2)
+
+        log.info(f"Metadata saved to: {args.pca_metadata_file}")
+        log.info("PCA pipeline completed successfully")
 
     args:
       - --input_data_path
@@ -137,8 +150,8 @@ implementation:
       - {inputValue: random_state}
       - --output_format
       - {inputValue: output_format}
-      - --training_results_out
-      - {outputPath: training_results_out}
+      - --to_be_trained
+      - {outputPath: to_be_trained}
       - --pca_pickle_file
       - {outputPath: pca_pickle_file}
       - --pca_metadata_file
