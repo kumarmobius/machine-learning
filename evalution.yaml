@@ -1,4 +1,4 @@
-name: Evaluate Model v5
+name: Evaluate Model v6
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -365,9 +365,20 @@ implementation:
             else:
                 # single target path
                 if y_raw is None:
-                    raise ValueError("Could not determine single target column from y_test; provide --target_column or supply a single-column y_test.")
-                y_original = y_raw.reset_index(drop=True)
-                if task != "regression" and label_mapping is not None:
+                    # Check if we have a multi-column y_df that should be treated as multi-target
+                    if isinstance(y_df, pd.DataFrame) and y_df.shape[1] > 1:
+                        # This is a multi-target scenario - treat it as such
+                        y_multi_df = y_df.copy().reset_index(drop=True)
+                        y_original = y_multi_df.copy()
+                        print(f"[INFO] Multi-target ground truth detected with columns: {list(y_multi_df.columns)}")
+                        y = None  # Signal to skip single-target processing
+                    else:
+                        raise ValueError("Could not determine single target column from y_test; provide --target_column or supply a single-column y_test.")
+                else:
+                    y_original = y_raw.reset_index(drop=True)
+                
+                # Only process single-target label mapping if we have a single target
+                if y_raw is not None and task != "regression" and label_mapping is not None:
                     print("[INFO] Applying label mapping to single-target y_test")
                     y_str = y_original.astype(str)
                     y_encoded = y_str.map(lambda val: label_mapping.get(val, None))
@@ -397,9 +408,12 @@ implementation:
                     y = y_original.copy()
 
             # Final length check
-            if isinstance(y, (pd.Series, pd.DataFrame)):
+            if 'y' in locals() and y is not None and isinstance(y, (pd.Series, pd.DataFrame)):
                 if len(Xs) != len(y):
                     raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y)}")
+            elif 'y_multi_df' in locals():
+                if len(Xs) != len(y_multi_df):
+                    raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y_multi_df)}")
             print(f"[INFO] Final evaluation set size: {len(Xs)} samples")
 
             # -------------------------
