@@ -1,4 +1,4 @@
-name: Evaluate Model v6
+name: Evaluate Model v7
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -395,14 +395,21 @@ implementation:
                     else:
                         y = y_encoded.astype(int).reset_index(drop=True)
                 elif task == "regression":
-                    y = pd.to_numeric(y_original, errors="coerce").reset_index(drop=True)
-                    valid_mask = y.notna()
-                    if not valid_mask.all():
-                        invalid_count = (~valid_mask).sum()
-                        print(f"[WARN] Dropping {invalid_count} rows with non-numeric targets")
-                        Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
-                        y = y[valid_mask].reset_index(drop=True)
-                        y_original = y_original[valid_mask].reset_index(drop=True)
+                    # Check if y_original is a DataFrame (multi-target) or Series (single-target)
+                    if isinstance(y_original, pd.DataFrame):
+                        # Multi-target regression: handle each column
+                        print("[INFO] Multi-target regression detected, skipping single-target numeric conversion")
+                        y = y_original.copy()  # Keep as DataFrame
+                    else:
+                        # Single-target regression
+                        y = pd.to_numeric(y_original, errors="coerce").reset_index(drop=True)
+                        valid_mask = y.notna()
+                        if not valid_mask.all():
+                            invalid_count = (~valid_mask).sum()
+                            print(f"[WARN] Dropping {invalid_count} rows with non-numeric targets")
+                            Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
+                            y = y[valid_mask].reset_index(drop=True)
+                            y_original = y_original[valid_mask].reset_index(drop=True)
                 else:
                     # no mapping available; assume encoded
                     y = y_original.copy()
