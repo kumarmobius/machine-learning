@@ -3,7 +3,7 @@ inputs:
   - {name: input_data, type: Dataset, description: "Input dataset (CSV, Parquet, or JSONL)"}
   - {name: pca_variant, type: String, description: "PCA variant: pca, kernel, incremental, sparse, fa, ica", optional: true, default: "pca"}
   - {name: n_components, type: String, description: "Number of components or 'auto'", optional: true, default: "auto"}
-  - {name: variance_threshold, type: Integer, description: "Explained variance threshold for auto components in standard PCA (0–1)", optional: true, default: "0.95"}
+  - {name: variance_threshold, type: Float, description: "Explained variance threshold for auto components in standard PCA (0–1)", optional: true, default: "0.95"}
   - {name: kernel, type: String, description: "Kernel for kernel PCA (e.g. rbf, poly, linear)", optional: true, default: "rbf"}
 outputs:
   - {name: transformed_X, type: Dataset, description: "Reduced-dimension dataset parquet"}
