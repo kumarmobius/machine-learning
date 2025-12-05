@@ -1,4 +1,4 @@
-name: PCA Transformer v1.1
+name: PCA Transformer v1.2
 inputs:
   - {name: input_data, type: Dataset, description: "Input dataset (CSV, Parquet, or JSONL)"}
   - {name: pca_variant, type: String, description: "PCA variant: pca, kernel, incremental, sparse, fa, ica", optional: true, default: "pca"}
@@ -173,10 +173,6 @@ implementation:
             }
 
         def compute_top_loadings(model, feature_names, top_n: int = 10):
-            """
-            Compute top contributing features per component using absolute loadings.
-            Returns dict: { "PC1": [{feature, loading}, ...], ... }
-            """
             if not hasattr(model, "components_"):
                 return {}
 
