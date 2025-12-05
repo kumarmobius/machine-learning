@@ -1,4 +1,4 @@
-name: PCA_Transform v2
+name: PCA_Transform v2,1
 description: |
   Perform Principal Component Analysis (PCA) or its variants on preprocessed numeric datasets 
   for dimensionality reduction. Automatically determines optimal components based on variance 
@@ -6,26 +6,20 @@ description: |
 
 inputs:
   - {name: input_data_path, type: Dataset, description: 'Path to preprocessed input dataset (CSV, Parquet, or JSONL)'}
-  - {name: n_components, type: string, default: 'auto', description: 'Number of components (e.g., 2, 5) or "auto" to determine based on variance_threshold'}
+  - {name: n_components, type: String, default: 'auto', description: 'Number of components (e.g., 2, 5) or "auto" to determine based on variance_threshold'}
   - {name: variance_threshold, type: Float, default: '0.95', description: 'Cumulative variance threshold for auto mode (0.0-1.0)'}
-  - {name: pca_variant, type: string, default: 'Standard PCA', description: 'Select PCA variant: Standard PCA | Kernel PCA | Incremental PCA | Sparse PCA | Factor Analysis (FA) | Independent Component Analysis (ICA)'}
+  - {name: pca_variant, type: String, default: 'Standard PCA', description: 'Select PCA variant: Standard PCA | Kernel PCA | Incremental PCA | Sparse PCA | Factor Analysis (FA) | Independent Component Analysis (ICA)'}
   - {name: random_state, type: Integer, default: '42', description: 'Random seed for reproducibility'}
 
 outputs:
   - {name: pca_transformed_data, type: Dataset, description: 'PCA transformed dataset'}
   - {name: pca_model_output, type: Model, description: 'Trained PCA model (pickle file)'}
-  - {name: pca_metadata_output, type: Metrics, description: 'PCA metadata and statistics'}
+  - {name: pca_metadata_output, type: String, description: 'PCA metadata and statistics'}
 
 implementation:
   container:
     image: python:3.9
     command:
-      - sh
-      - -c
-      - |
-        python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "pandas==1.5.3" "numpy<2,>=1.22" "scikit-learn==1.3.0" "pyarrow>=10,<16" "cloudpickle==2.2.1"
-        exec "$0" "$@"
       - python3
       - -u
       - -c
