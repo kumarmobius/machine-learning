@@ -1,4 +1,4 @@
-name: PCA_Transform v3
+name: PCA Transform v4
 description: |
   Perform Principal Component Analysis (PCA) or its variants on preprocessed numeric datasets 
   for dimensionality reduction. Automatically determines optimal components based on variance 
@@ -6,32 +6,56 @@ description: |
 
 inputs:
   - {name: input_data_path, type: Dataset, description: 'Path to preprocessed input dataset (CSV, Parquet, or JSONL)'}
-  - {name: n_components, type: String, default: 'auto', description: 'Number of components (e.g., 2, 5) or "auto" to determine based on variance_threshold'}
-  - {name: variance_threshold, type: Float, default: '0.95', description: 'Cumulative variance threshold for auto mode (0.0-1.0)'}
-  - {name: pca_variant, type: String, default: 'Standard PCA', description: 'Select PCA variant: Standard PCA | Kernel PCA | Incremental PCA | Sparse PCA | Factor Analysis (FA) | Independent Component Analysis (ICA)'}
-  - {name: random_state, type: Integer, default: '42', description: 'Random seed for reproducibility'}
+  - {name: n_components, type: String, default: 'auto', optional: true, description: 'Number of components (e.g., 2, 5) or "auto" to determine based on variance_threshold'}
+  - {name: variance_threshold, type: Float, default: '0.95', optional: true, description: 'Cumulative variance threshold for auto mode (0.0-1.0)'}
+  - {name: pca_variant, type: String, default: 'Standard PCA', optional: true, description: 'Select PCA variant: Standard PCA | Kernel PCA | Incremental PCA | Sparse PCA | Factor Analysis (FA) | Independent Component Analysis (ICA)'}
+  - {name: random_state, type: Integer, default: '42', optional: true, description: 'Random seed for reproducibility'}
 
 outputs:
-  - {name: pca_transformed_data, type: Dataset, description: 'PCA transformed dataset'}
-  - {name: pca_model_output, type: Model, description: 'Trained PCA model (pickle file)'}
-  - {name: pca_metadata_output, type: String, description: 'PCA metadata and statistics'}
+  - {name: pca_transformed_data, type: Dataset, description: 'PCA transformed dataset (parquet)'}
+  - {name: pca_model_output, type: Model, description: 'Trained PCA model (cloudpickle)'}
+  - {name: pca_metadata_output, type: Data, description: 'PCA metadata and statistics (JSON)'}
 
 implementation:
   container:
-    image: python:3.9
+    image: kumar2004/ml-base:v1
     command:
       - python3
       - -u
       - -c
       - |
         import argparse
-        import logging
         import os
+        import sys
         import json
+        import traceback
         import numpy as np
         import pandas as pd
         import cloudpickle
         from sklearn.decomposition import PCA, KernelPCA, IncrementalPCA, SparsePCA, FactorAnalysis, FastICA
+
+        def ensure_dir_for(p):
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def load_dataset(path):
+            print(f"[INFO] Loading dataset from: {path}")
+            
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Input file not found: {path}")
+            
+            if path.endswith('.csv'):
+                df = pd.read_csv(path)
+            elif path.endswith('.parquet') or path.endswith('.pq'):
+                df = pd.read_parquet(path)
+            elif path.endswith('.json') or path.endswith('.jsonl'):
+                df = pd.read_json(path, lines=True)
+            else:
+                raise ValueError(f"Unsupported format. Supported: .csv, .parquet, .json, .jsonl")
+            
+            print(f"[INFO] Dataset loaded. Shape: {df.shape}")
+            return df
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--input_data_path', required=True)
@@ -44,176 +68,192 @@ implementation:
         parser.add_argument('--pca_metadata_output', required=True)
         args = parser.parse_args()
 
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-        log = logging.getLogger("pca_transform")
-
-        def load_dataset(path):
-            log.info(f"Loading preprocessed dataset from: {path}")
+        try:
+            print("="*80)
+            print("PCA TRANSFORMATION - START")
+            print("="*80)
             
-            if path.endswith('.csv'):
-                df = pd.read_csv(path)
-            elif path.endswith('.parquet'):
-                df = pd.read_parquet(path)
-            elif path.endswith('.json') or path.endswith('.jsonl'):
-                df = pd.read_json(path, lines=True)
+            # Load data
+            df = load_dataset(args.input_data_path.strip())
+            original_shape = df.shape
+            
+            # Validate numeric data
+            print("[STEP 1/6] Validating data...")
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            if len(numeric_cols) == 0:
+                raise ValueError("No numeric columns found. PCA requires numeric features.")
+            
+            X = df[numeric_cols].values
+            print(f"[INFO] Using {len(numeric_cols)} numeric columns")
+            print(f"[INFO] Feature names: {numeric_cols[:10]}{'...' if len(numeric_cols) > 10 else ''}")
+            
+            # Check for NaN/inf
+            if np.any(np.isnan(X)):
+                raise ValueError("Data contains NaN values. Please preprocess data first.")
+            if np.any(np.isinf(X)):
+                raise ValueError("Data contains infinite values. Please preprocess data first.")
+            
+            # Parse parameters
+            variant = args.pca_variant.strip()
+            n_comp_input = args.n_components.strip().lower()
+            
+            print(f"[STEP 2/6] PCA Configuration:")
+            print(f"  Variant: {variant}")
+            print(f"  n_components: {n_comp_input}")
+            print(f"  variance_threshold: {args.variance_threshold}")
+            print(f"  random_state: {args.random_state}")
+            
+            # Determine n_components
+            print("[STEP 3/6] Determining number of components...")
+            if n_comp_input == 'auto':
+                if variant == 'Standard PCA':
+                    print(f"[INFO] Auto mode: Finding components for {args.variance_threshold*100:.1f}% variance...")
+                    pca_temp = PCA(n_components=args.variance_threshold, random_state=args.random_state)
+                    pca_temp.fit(X)
+                    n_components = pca_temp.n_components_
+                    print(f"[INFO] Selected {n_components} components (explains {args.variance_threshold*100:.1f}% variance)")
+                else:
+                    n_components = min(X.shape[1], max(2, int(X.shape[1] * 0.5)))
+                    print(f"[INFO] Auto mode for {variant}: Using {n_components} components (50% of features)")
             else:
-                raise ValueError(f"Unsupported file format. Supported: .csv, .parquet, .json, .jsonl")
+                try:
+                    n_components = int(n_comp_input)
+                    if n_components < 1:
+                        raise ValueError("n_components must be >= 1")
+                    if n_components > X.shape[1]:
+                        print(f"[WARN] n_components ({n_components}) > n_features ({X.shape[1]}). Using {X.shape[1]}")
+                        n_components = X.shape[1]
+                    print(f"[INFO] Using specified n_components: {n_components}")
+                except ValueError as e:
+                    raise ValueError(f"Invalid n_components: '{n_comp_input}'. Use 'auto' or positive integer.")
             
-            log.info(f"Dataset loaded successfully. Shape: {df.shape}")
-            return df
-
-        df = load_dataset(args.input_data_path.strip())
-        original_shape = df.shape
-
-        log.info("Validating preprocessed data...")
-        
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        X = df[numeric_cols].values
-        
-        if len(numeric_cols) == 0:
-            raise ValueError("No numeric columns found in dataset. PCA requires numeric features.")
-        
-        log.info(f"Using {len(numeric_cols)} numeric columns for PCA")
-        log.info(f"Feature names: {numeric_cols[:10]}{'...' if len(numeric_cols) > 10 else ''}")
-
-        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
-            raise ValueError("Data contains NaN or infinite values. Please ensure data is fully preprocessed.")
-
-        variant = args.pca_variant.strip()
-        n_comp_input = args.n_components.strip().lower()
-        
-        log.info(f"PCA Configuration:")
-        log.info(f"  Variant: {variant}")
-        log.info(f"  Component Selection: {n_comp_input}")
-        
-        if n_comp_input == 'auto':
+            # Initialize PCA model
+            print(f"[STEP 4/6] Initializing {variant}...")
             if variant == 'Standard PCA':
-                log.info(f"  Auto mode: Finding components for {args.variance_threshold*100:.1f}% variance...")
-                pca_temp = PCA(n_components=args.variance_threshold, random_state=args.random_state)
-                pca_temp.fit(X)
-                n_components = pca_temp.n_components_
-                log.info(f"  ✓ Auto selected {n_components} components")
+                pca_model = PCA(n_components=n_components, random_state=args.random_state)
+            elif variant == 'Kernel PCA':
+                pca_model = KernelPCA(n_components=n_components, kernel='rbf', random_state=args.random_state)
+            elif variant == 'Incremental PCA':
+                pca_model = IncrementalPCA(n_components=n_components)
+            elif variant == 'Sparse PCA':
+                pca_model = SparsePCA(n_components=n_components, random_state=args.random_state, max_iter=100)
+            elif variant == 'Factor Analysis (FA)':
+                pca_model = FactorAnalysis(n_components=n_components, random_state=args.random_state)
+            elif variant == 'Independent Component Analysis (ICA)':
+                pca_model = FastICA(n_components=n_components, random_state=args.random_state, max_iter=200)
             else:
-                n_components = min(X.shape[1], max(2, int(X.shape[1] * 0.5)))
-                log.info(f"  Auto mode: Using {n_components} components for {variant}")
-        else:
-            try:
-                n_components = int(n_comp_input)
-                if n_components < 1:
-                    raise ValueError("n_components must be positive")
-                if n_components > X.shape[1]:
-                    log.warning(f"n_components ({n_components}) > n_features ({X.shape[1]}). Using {X.shape[1]}")
-                    n_components = X.shape[1]
-                log.info(f"  Using specified n_components: {n_components}")
-            except ValueError:
-                raise ValueError(f"Invalid n_components: '{n_comp_input}'. Use 'auto' or a positive integer.")
-
-        log.info(f"Initializing {variant}...")
-        
-        if variant == 'Standard PCA':
-            pca_model = PCA(n_components=n_components, random_state=args.random_state)
-        elif variant == 'Kernel PCA':
-            pca_model = KernelPCA(n_components=n_components, kernel='rbf', random_state=args.random_state)
-        elif variant == 'Incremental PCA':
-            pca_model = IncrementalPCA(n_components=n_components)
-        elif variant == 'Sparse PCA':
-            pca_model = SparsePCA(n_components=n_components, random_state=args.random_state)
-        elif variant == 'Factor Analysis (FA)':
-            pca_model = FactorAnalysis(n_components=n_components, random_state=args.random_state)
-        elif variant == 'Independent Component Analysis (ICA)':
-            pca_model = FastICA(n_components=n_components, random_state=args.random_state)
-        else:
-            raise ValueError(f"Unknown PCA variant: {variant}")
-
-        log.info("Fitting and transforming data...")
-        X_transformed = pca_model.fit_transform(X)
-        
-        component_names = [f'PC{i+1}' for i in range(X_transformed.shape[1])]
-        df_transformed = pd.DataFrame(X_transformed, columns=component_names)
-        
-        log.info(f"✓ Transformation complete: {original_shape} → {df_transformed.shape}")
-
-        metadata = {
-            'variant': variant,
-            'n_components': n_components,
-            'n_components_input': args.n_components,
-            'variance_threshold': args.variance_threshold,
-            'original_shape': list(original_shape),
-            'transformed_shape': list(df_transformed.shape),
-            'feature_names': numeric_cols,
-            'component_names': component_names,
-            'n_features': len(numeric_cols),
-            'random_state': args.random_state
-        }
-        
-        if hasattr(pca_model, 'explained_variance_ratio_'):
-            explained_var = pca_model.explained_variance_ratio_
-            cumulative_var = np.cumsum(explained_var)
+                raise ValueError(f"Unknown PCA variant: {variant}")
             
-            metadata['explained_variance_ratio'] = explained_var.tolist()
-            metadata['cumulative_variance'] = cumulative_var.tolist()
-            metadata['total_variance_explained'] = float(np.sum(explained_var))
+            # Fit and transform
+            print(f"[INFO] Fitting and transforming data...")
+            X_transformed = pca_model.fit_transform(X)
             
-            log.info("="*70)
-            log.info("EXPLAINED VARIANCE BY COMPONENT")
-            log.info("="*70)
-            for i, (var, cumvar) in enumerate(zip(explained_var, cumulative_var)):
-                log.info(f"  PC{i+1:2d}: {var*100:6.2f}%  |  Cumulative: {cumvar*100:6.2f}%")
-            log.info("-"*70)
-            log.info(f"  Total Variance Explained: {np.sum(explained_var)*100:.2f}%")
-            log.info("="*70)
-        
-        if hasattr(pca_model, 'components_'):
-            components = pca_model.components_
-            metadata['component_loadings'] = {}
+            component_names = [f'PC{i+1}' for i in range(X_transformed.shape[1])]
+            df_transformed = pd.DataFrame(X_transformed, columns=component_names)
             
-            log.info("Top Contributing Features per Component:")
-            log.info("-"*70)
-            for i, component in enumerate(components[:5]):
-                top_indices = np.argsort(np.abs(component))[-5:][::-1]
-                top_features = [(numeric_cols[idx], float(component[idx])) for idx in top_indices]
-                metadata['component_loadings'][f'PC{i+1}'] = top_features
+            print(f"[INFO] Transformation complete: {original_shape} → {df_transformed.shape}")
+            
+            # Build metadata
+            print("[STEP 5/6] Computing statistics...")
+            metadata = {
+                'variant': variant,
+                'n_components': int(n_components),
+                'n_components_input': args.n_components,
+                'variance_threshold': float(args.variance_threshold),
+                'original_shape': {'rows': int(original_shape[0]), 'cols': int(original_shape[1])},
+                'transformed_shape': {'rows': int(df_transformed.shape[0]), 'cols': int(df_transformed.shape[1])},
+                'feature_names': numeric_cols,
+                'component_names': component_names,
+                'n_features': len(numeric_cols),
+                'random_state': args.random_state
+            }
+            
+            # Explained variance (if available)
+            if hasattr(pca_model, 'explained_variance_ratio_'):
+                explained_var = pca_model.explained_variance_ratio_
+                cumulative_var = np.cumsum(explained_var)
                 
-                log.info(f"  PC{i+1}:")
-                for feat, load in top_features[:3]:
-                    log.info(f"    {feat}: {load:+.4f}")
-            if len(components) > 5:
-                log.info(f"  ... and {len(components)-5} more components")
-        
-        if hasattr(pca_model, 'singular_values_'):
-            metadata['singular_values'] = pca_model.singular_values_.tolist()
-        
-        if hasattr(pca_model, 'noise_variance_'):
-            metadata['noise_variance'] = float(pca_model.noise_variance_)
-
-        log.info("Saving outputs...")
-        
-        os.makedirs(os.path.dirname(args.pca_transformed_data) or '.', exist_ok=True)
-        df_transformed.to_parquet(args.pca_transformed_data, index=False)
-        log.info(f"✓ Transformed data saved: {args.pca_transformed_data}")
-        
-        model_data = {
-            'pca_model': pca_model,
-            'feature_names': numeric_cols,
-            'component_names': component_names,
-            'variant': variant,
-            'n_components': n_components
-        }
-        
-        os.makedirs(os.path.dirname(args.pca_model_output) or '.', exist_ok=True)
-        with open(args.pca_model_output, 'wb') as f:
-            cloudpickle.dump(model_data, f)
-        log.info(f"✓ Model saved: {args.pca_model_output}")
-        
-        os.makedirs(os.path.dirname(args.pca_metadata_output) or '.', exist_ok=True)
-        with open(args.pca_metadata_output, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        log.info(f"✓ Metadata saved: {args.pca_metadata_output}")
-        
-        log.info("="*70)
-        log.info("PCA TRANSFORMATION COMPLETED SUCCESSFULLY")
-        log.info("="*70)
-
+                metadata['explained_variance_ratio'] = [float(x) for x in explained_var]
+                metadata['cumulative_variance'] = [float(x) for x in cumulative_var]
+                metadata['total_variance_explained'] = float(np.sum(explained_var))
+                
+                print("="*70)
+                print("EXPLAINED VARIANCE BY COMPONENT")
+                print("="*70)
+                for i, (var, cumvar) in enumerate(zip(explained_var, cumulative_var)):
+                    print(f"  PC{i+1:2d}: {var*100:6.2f}%  |  Cumulative: {cumvar*100:6.2f}%")
+                print("-"*70)
+                print(f"  Total Variance Explained: {np.sum(explained_var)*100:.2f}%")
+                print("="*70)
+            
+            # Component loadings (if available)
+            if hasattr(pca_model, 'components_'):
+                components = pca_model.components_
+                metadata['component_loadings'] = {}
+                
+                print("Top Contributing Features per Component:")
+                print("-"*70)
+                for i, component in enumerate(components[:5]):
+                    top_indices = np.argsort(np.abs(component))[-5:][::-1]
+                    top_features = [(numeric_cols[idx], float(component[idx])) for idx in top_indices]
+                    metadata['component_loadings'][f'PC{i+1}'] = top_features
+                    
+                    print(f"  PC{i+1}:")
+                    for feat, load in top_features[:3]:
+                        print(f"    {feat}: {load:+.4f}")
+                if len(components) > 5:
+                    print(f"  ... and {len(components)-5} more components")
+            
+            # Additional stats
+            if hasattr(pca_model, 'singular_values_'):
+                metadata['singular_values'] = [float(x) for x in pca_model.singular_values_]
+            
+            if hasattr(pca_model, 'noise_variance_'):
+                metadata['noise_variance'] = float(pca_model.noise_variance_)
+            
+            # Save outputs
+            print("[STEP 6/6] Saving outputs...")
+            
+            # Save transformed data
+            ensure_dir_for(args.pca_transformed_data)
+            df_transformed.to_parquet(args.pca_transformed_data, index=False)
+            print(f"[INFO] Saved transformed data: {args.pca_transformed_data}")
+            
+            # Save model
+            model_data = {
+                'pca_model': pca_model,
+                'feature_names': numeric_cols,
+                'component_names': component_names,
+                'variant': variant,
+                'n_components': int(n_components)
+            }
+            
+            ensure_dir_for(args.pca_model_output)
+            with open(args.pca_model_output, 'wb') as f:
+                cloudpickle.dump(model_data, f)
+            print(f"[INFO] Saved model: {args.pca_model_output}")
+            
+            # Save metadata
+            ensure_dir_for(args.pca_metadata_output)
+            with open(args.pca_metadata_output, 'w') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] Saved metadata: {args.pca_metadata_output}")
+            
+            print("="*80)
+            print("PCA TRANSFORMATION COMPLETED SUCCESSFULLY")
+            print("="*80)
+            print(f"Original shape: {original_shape}")
+            print(f"Transformed shape: {df_transformed.shape}")
+            print(f"Components: {n_components}")
+            if hasattr(pca_model, 'explained_variance_ratio_'):
+                print(f"Variance explained: {np.sum(explained_var)*100:.2f}%")
+            print("="*80)
+            
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
     args:
       - --input_data_path
       - {inputPath: input_data_path}
