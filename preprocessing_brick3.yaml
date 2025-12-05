@@ -1,4 +1,4 @@
-name: Feature Selection v3
+name: Feature Selection v4
 inputs:
   - name: engineered_X
     type: Dataset
@@ -20,22 +20,18 @@ outputs:
   - name: selected_X
     type: Dataset
     description: Final selected features
-    default: selected_X.parquet
 
   - name: selected_y
     type: Dataset
     description: Final selected targets
-    default: selected_y.parquet
 
   - name: feature_selector
     type: Data
     description: Pickled FeatureSelector
-    default: feature_selector.pkl.gz
 
   - name: fs_metadata
     type: Data
     description: Feature selection metadata
-    default: fs_metadata.json
 
 implementation:
   container:
@@ -274,6 +270,5 @@ implementation:
 
     - --feature_selector
     - {outputPath: feature_selector}
-
     - --fs_metadata
     - {outputPath: fs_metadata}
