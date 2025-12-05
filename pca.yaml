@@ -1,17 +1,12 @@
-name: PCA_with_nan_numeric
-description: |
-  Perform PCA or PCA variants directly on the raw input dataset without any preprocessing.
-  No scaling, no NaN handling, no type conversion. Raw data goes in, PCA comes out.
-
+name: PCA
 inputs:
   - {name: input_data_path, type: Directory, description: "Dataset path (CSV, Parquet, or JSONL)"}
   - {name: target_column, type: string, default: "", description: "Optional target column to exclude from PCA"}
   - {name: n_components, type: string, default: "auto", description: "Number of components, ratio, or 'auto'"}
   - {name: auto_variance_threshold, type: string, default: "0.88", description: "Variance threshold for auto mode"}
   - {name: pca_variant, type: string, default: "Standard PCA", description: "PCA variant selection"}
-  - {name: random_state, type: Integer, default: "42", description: "Random seed"}
+  - {name: random_state, type: Integer, default: "50", description: "Random seed"}
   - {name: output_format, type: string, default: "csv", description: "csv | json | parquet"}
-
 outputs:
   - {name: training_results_out, type: Dataset, description: "PCA-transformed dataset"}
   - {name: pca_pickle_file, type: Model, description: "Cloudpickle PCA model file"}
