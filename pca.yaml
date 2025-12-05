@@ -1,4 +1,4 @@
-name: PCA_Transform
+name: PCA_Transform V1
 inputs:
   - {name: input_data_path, type: Dataset, description: 'Path to preprocessed input dataset (CSV, Parquet, or JSONL)'}
   - {name: n_components, type: string, default: 'auto', description: 'Number of components (e.g., 2, 5) or "auto" to determine based on variance_threshold'}
@@ -13,12 +13,6 @@ implementation:
   container:
     image: python:3.9
     command:
-      - sh
-      - -c
-      - |
-        python3 -m pip install --quiet --upgrade pip setuptools wheel
-        python3 -m pip install --quiet "pandas==1.5.3" "numpy<2,>=1.22" "scikit-learn==1.3.0" "pyarrow>=10,<16" "cloudpickle==2.2.1"
-        exec "$0" "$@"
       - python3
       - -u
       - -c
@@ -46,7 +40,6 @@ implementation:
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         log = logging.getLogger("pca_transform")
 
-        # ============= DATA LOADING =============
         def load_dataset(path):
             log.info(f"Loading preprocessed dataset from: {path}")
             
@@ -66,7 +59,6 @@ implementation:
         df = load_dataset(args.input_data_path.strip())
         original_shape = df.shape
 
-        # ============= DATA VALIDATION =============
         log.info("Validating preprocessed data...")
         
         # Select only numeric columns
@@ -233,7 +225,7 @@ implementation:
         summary_path = os.path.join(args.pca_output, 'summary.txt')
         with open(summary_path, 'w') as f:
             f.write("="*70 )
-            f.write("PCA TRANSFORMATION SUMMARY\n")
+            f.write("PCA TRANSFORMATION SUMMARY")
             f.write("="*70)
             f.write(f"Variant: {variant}")
             f.write(f"Input Shape: {original_shape}")
@@ -249,7 +241,7 @@ implementation:
                     cumvar = metadata['cumulative_variance'][i]
                     f.write(f"  PC{i+1}: {var*100:.2f}% (Cumulative: {cumvar*100:.2f}%)\n")
             
-            f.write("\n" + "="*70 + "\n")
+
         log.info(f"✓ Summary report saved: summary.txt")
         
         log.info(f"{'='*70}")
