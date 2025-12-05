@@ -1,89 +1,128 @@
-name: PCA V2
+name: PCA_with_nan_numeric
+description: |
+  Perform Principal Component Analysis (PCA) or its variants (Kernel PCA, Incremental PCA, Sparse PCA, etc.)
+  on numeric datasets for dimensionality reduction and print variant-specific results.
+
 inputs:
-  - {name: input_data_path, type: Dataset, description: "Input dataset path (CSV, Parquet, or JSONL)"}
-  - {name: n_components, type: string, default: "auto", description: "Number of components, ratio, or 'auto'"}
-  - {name: auto_variance_threshold, type: string, default: "0.88", description: "Variance threshold for auto mode"}
-  - {name: pca_variant, type: string, default: "Standard PCA", description: "PCA variant selection"}
-  - {name: random_state, type: Integer, default: "42", description: "Random seed"}
-  - {name: output_format, type: string, default: "csv", description: "csv | json | parquet"}
+  - {name: input_data_path, type: Dataset, description: 'Path to input dataset (CSV, Parquet, or JSONL)'}
+  - {name: target_column, type: string, default: '', description: 'Optional target column to exclude from PCA'}
+  - {name: n_components, type: string, default: '0.95', description: 'Number of components or variance ratio (e.g., 2 or 0.95)'}
+  - {name: pca_variant, type: string, default: 'Standard PCA', description: 'Select PCA variant: Standard PCA | Kernel PCA | Incremental PCA | Randomized PCA | Sparse PCA | Principal Component Regression (PCR) | Factor Analysis (FA) | Independent Component Analysis (ICA)'}
+  - {name: scale_data, type: string, default: 'true', description: 'Whether to standardize features before PCA'}
+  - {name: random_state, type: Integer, default: '42', description: 'Random seed for reproducibility'}
+  - {name: output_format, type: string, default: 'csv', description: 'Output format for transformed dataset: csv | json | parquet'}
 
 outputs:
-  - {name: to_be_trained, type: Dataset, description: "PCA-transformed dataset"}
-  - {name: pca_pickle_file, type: Model, description: "Cloudpickle PCA model file"}
-  - {name: pca_metadata_file, type: File, description: "Metadata JSON file"}
+  - {name: training_results_out, type: Dataset, description: 'Directory to save PCA outputs in desired format'}
 
 implementation:
   container:
     image: python:3.9
     command:
+      - sh
+      - -c
+      - |
+        python3 -m pip install --quiet --upgrade pip setuptools wheel
+        python3 -m pip install --quiet "pandas==1.5.3" "numpy<2,>=1.22" "scikit-learn==1.3.0" "pyarrow>=10,<16" "requests"
+        exec "$0" "$@"
       - python3
       - -u
       - -c
       - |
-        import argparse, logging, os, pickle, pandas as pd, numpy as np, requests
+        import argparse, logging, os, pickle, numpy as np, pandas as pd, requests
         from io import BytesIO
+        from sklearn.preprocessing import StandardScaler
         from sklearn.decomposition import PCA, KernelPCA, IncrementalPCA, SparsePCA, FactorAnalysis, FastICA
-        import cloudpickle, gzip, json
+        from sklearn.linear_model import LinearRegression
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--input_data_path', required=True)
-        parser.add_argument('--n_components', default="auto")
-        parser.add_argument('--auto_variance_threshold', default="0.88")
+        parser.add_argument('--target_column', default="")
+        parser.add_argument('--n_components', default="0.95")
         parser.add_argument('--pca_variant', default="Standard PCA")
+        parser.add_argument('--scale_data', default="true")
         parser.add_argument('--random_state', type=int, default=42)
-        parser.add_argument('--output_format', default="csv")
-        parser.add_argument('--to_be_trained', required=True)
-        parser.add_argument('--pca_pickle_file', required=True)
-        parser.add_argument('--pca_metadata_file', required=True)
+        parser.add_argument('--output_format', default="csv", choices=["csv","json","parquet"])
+        parser.add_argument('--training_results_out', required=True)
         args = parser.parse_args()
 
         logging.basicConfig(level=logging.INFO)
-        log = logging.getLogger("pca_pipeline")
+        log = logging.getLogger("pca_variant")
 
-        def load(path):
-            if path.endswith(".csv"): return pd.read_csv(path)
-            if path.endswith(".parquet"): return pd.read_parquet(path)
-            if path.endswith(".json") or path.endswith(".jsonl"): return pd.read_json(path, lines=True)
-            if path.endswith(".pkl"): return pickle.load(open(path, "rb"))
-            raise SystemExit("Unsupported file format.")
+        # --- Load dataset ---
+        def load_data(path):
+            if path.startswith(("http://", "https://")):
+                r = requests.get(path, timeout=60)
+                r.raise_for_status()
+                b = BytesIO(r.content)
+                if path.endswith(".csv"):
+                    return pd.read_csv(b)
+                elif path.endswith(".parquet"):
+                    return pd.read_parquet(b)
+                elif path.endswith(".json") or path.endswith(".jsonl"):
+                    return pd.read_json(b, lines=True)
+                elif path.endswith(".pkl"):
+                    return pickle.load(b)
+                else:
+                    raise SystemExit("Unsupported remote file format.")
+            else:
+                if path.endswith(".csv"):
+                    return pd.read_csv(path)
+                elif path.endswith(".parquet"):
+                    return pd.read_parquet(path)
+                elif path.endswith(".json") or path.endswith(".jsonl"):
+                    return pd.read_json(path, lines=True)
+                elif path.endswith(".pkl"):
+                    return pickle.load(open(path, "rb"))
+                else:
+                    raise SystemExit("Unsupported local file format.")
 
-        df = load(args.input_data_path)
+        df = load_data(args.input_data_path.strip())
         log.info(f"Dataset loaded with shape: {df.shape}")
 
-        # PCA on all numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if not numeric_cols:
-            raise SystemExit("No numeric columns found in dataset")
-        
-        X_raw = df[numeric_cols].values
-        log.info(f"Using {len(numeric_cols)} numeric features")
-
-        # Determine n_components
-        use_auto = args.n_components.lower() == "auto"
-
-        if use_auto:
-            full_pca = PCA(random_state=args.random_state)
-            full_pca.fit(X_raw)
-            variance = np.cumsum(full_pca.explained_variance_ratio_)
-            threshold = float(args.auto_variance_threshold)
-            n_comp = np.argmax(variance >= threshold) + 1
-            log.info(f"Auto-selected {n_comp} components for {threshold*100}% variance threshold")
+        # --- Prepare data ---
+        if args.target_column and args.target_column in df.columns:
+            y = df[args.target_column]
+            X = df.drop(columns=[args.target_column])
+            log.info(f"Excluding target column '{args.target_column}' from PCA")
         else:
-            num = float(args.n_components)
-            n_comp = int(num) if num.is_integer() else num
+            X, y = df, None
+
+        # Convert numeric-like strings to actual numbers
+        X = X.apply(pd.to_numeric, errors='ignore')
+
+        # Select only numeric columns for PCA
+        X = X.select_dtypes(include=[np.number])
+        if X.empty:
+            raise SystemExit("No numeric columns found for PCA after conversion.")
+
+        # Handle NaN and infinite values
+        X = X.replace([np.inf, -np.inf], np.nan)
+        X = X.fillna(X.mean())
+
+        X_scaled = StandardScaler().fit_transform(X) if args.scale_data.lower() == "true" else X.values
+
+        try:
+            n_comp = float(args.n_components)
+            if n_comp.is_integer(): n_comp = int(n_comp)
+        except ValueError:
+            raise SystemExit("--n_components must be numeric (e.g., 2 or 0.95).")
 
         variant = args.pca_variant.strip()
+        log.info(f"Using PCA variant: {variant}")
 
         if variant == "Standard PCA":
             pca = PCA(n_components=n_comp, random_state=args.random_state)
         elif variant == "Kernel PCA":
-            pca = KernelPCA(n_components=int(n_comp), kernel='rbf', random_state=args.random_state)
+            pca = KernelPCA(n_components=int(n_comp) if n_comp >= 1 else None, kernel='rbf', random_state=args.random_state)
         elif variant == "Incremental PCA":
             pca = IncrementalPCA(n_components=int(n_comp))
         elif variant == "Randomized PCA":
             pca = PCA(n_components=int(n_comp), svd_solver='randomized', random_state=args.random_state)
         elif variant == "Sparse PCA":
             pca = SparsePCA(n_components=int(n_comp), random_state=args.random_state)
+        elif variant == "Principal Component Regression (PCR)":
+            pca = PCA(n_components=int(n_comp))
         elif variant == "Factor Analysis (FA)":
             pca = FactorAnalysis(n_components=int(n_comp), random_state=args.random_state)
         elif variant == "Independent Component Analysis (ICA)":
@@ -91,68 +130,83 @@ implementation:
         else:
             raise SystemExit(f"Unknown PCA variant: {variant}")
 
-        X_pca = pca.fit_transform(X_raw)
-        df_pca = pd.DataFrame(X_pca, columns=[f"PC{i+1}" for i in range(X_pca.shape[1])])
-        
-        log.info(f"PCA transformation complete: {X_raw.shape} -> {X_pca.shape}")
+        X_pca = pca.fit_transform(X_scaled)
+        df_pca = pd.DataFrame(X_pca, columns=[f"Component_{i+1}" for i in range(X_pca.shape[1])])
+        if y is not None: df_pca[args.target_column] = y.values
 
+        explained_var = getattr(pca, "explained_variance_ratio_", None)
+        comps = getattr(pca, "components_", None)
+
+        print("================ PCA VARIANT RESULTS ================")
+        print(f"Variant Used: {variant}")
+        print(f"Original Shape: {X.shape} -> Transformed Shape: {df_pca.shape}")
+
+        # --- Variant-specific printing ---
+        if variant in ["Standard PCA", "Randomized PCA", "Incremental PCA"]:
+            if explained_var is not None:
+                print("Explained Variance Ratio:")
+                for i, v in enumerate(explained_var):
+                    print(f"  PC{i+1}: {v:.4f}")
+                print(f"Total Explained Variance: {np.sum(explained_var):.4f}")
+
+        elif variant == "Sparse PCA":
+            print("Top 5 Component Loadings (Sparse Matrix):")
+            for i, comp in enumerate(comps[:5]):
+                print(f"  Component_{i+1}: {np.round(comp[:5], 4)}")
+
+        elif variant == "Independent Component Analysis (ICA)":
+            print("First 5 Independent Components:")
+            print(np.round(X_pca[:5, :5], 4))
+
+        elif variant == "Principal Component Regression (PCR)" and y is not None:
+            reg = LinearRegression()
+            reg.fit(X_pca, y)
+            score = reg.score(X_pca, y)
+            print(f"PCR RÂ² Score: {score:.4f}")
+
+        elif variant == "Factor Analysis (FA)":
+            print("Factor Loadings (first 5 features):")
+            print(np.round(pca.components_[:5, :5], 4))
+
+        elif variant == "Kernel PCA":
+            print("Kernel PCA completed using RBF kernel.")
+            print("Transformed data sample (first 3 rows):")
+            print(np.round(X_pca[:3, :5], 4))
+
+        print("---------------------")
+
+        os.makedirs(args.training_results_out, exist_ok=True)
         fmt = args.output_format.lower()
-        out_path = args.to_be_trained
 
-        if fmt == "csv":
-            df_pca.to_csv(out_path, index=False)
-        elif fmt == "json":
-            df_pca.to_json(out_path, orient="records", lines=True)
-        else:
-            df_pca.to_parquet(out_path, index=False)
+        def save_df(df, name):
+            path = os.path.join(args.training_results_out, f"{name}.{fmt}")
+            if fmt == "csv": df.to_csv(path, index=False)
+            elif fmt == "json": df.to_json(path, orient="records", lines=True)
+            elif fmt == "parquet": df.to_parquet(path, index=False)
+            return path
 
-        log.info(f"Transformed data saved to: {out_path}")
+        save_df(df_pca, "pca_transformed")
 
-        with gzip.open(args.pca_pickle_file, "wb") as f:
-            cloudpickle.dump(pca, f)
+        model_path = os.path.join(args.training_results_out, "pca_model.pkl")
+        with open(model_path, "wb") as f:
+            pickle.dump(pca, f)
 
-        log.info(f"PCA model saved to: {args.pca_pickle_file}")
-
-        metadata = {
-            "variant": variant,
-            "n_components": X_pca.shape[1],
-            "original_features": len(numeric_cols),
-            "auto_selected": use_auto,
-            "variance_threshold": float(args.auto_variance_threshold) if use_auto else None,
-            "random_state": args.random_state,
-            "feature_names": numeric_cols,
-            "output_format": fmt,
-            "input_shape": list(X_raw.shape),
-            "output_shape": list(X_pca.shape)
-        }
-
-        if hasattr(pca, 'explained_variance_ratio_'):
-            metadata["explained_variance_ratio"] = pca.explained_variance_ratio_.tolist()
-            metadata["cumulative_variance"] = np.cumsum(pca.explained_variance_ratio_).tolist()
-            metadata["total_variance_explained"] = float(np.sum(pca.explained_variance_ratio_))
-
-        with open(args.pca_metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        log.info(f"Metadata saved to: {args.pca_metadata_file}")
-        log.info("PCA pipeline completed successfully")
+        log.info(f"PCA results and model saved in {args.training_results_out}")
 
     args:
       - --input_data_path
       - {inputValue: input_data_path}
+      - --target_column
+      - {inputValue: target_column}
       - --n_components
       - {inputValue: n_components}
-      - --auto_variance_threshold
-      - {inputValue: auto_variance_threshold}
       - --pca_variant
       - {inputValue: pca_variant}
+      - --scale_data
+      - {inputValue: scale_data}
       - --random_state
       - {inputValue: random_state}
       - --output_format
       - {inputValue: output_format}
-      - --to_be_trained
-      - {outputPath: to_be_trained}
-      - --pca_pickle_file
-      - {outputPath: pca_pickle_file}
-      - --pca_metadata_file
-      - {outputPath: pca_metadata_file}
+      - --training_results_out
+      - {outputPath: training_results_out}
