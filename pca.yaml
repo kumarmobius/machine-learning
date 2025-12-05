@@ -1,4 +1,9 @@
-name: PCA_Transform V1
+name: PCA_Transform v2
+description: |
+  Perform Principal Component Analysis (PCA) or its variants on preprocessed numeric datasets 
+  for dimensionality reduction. Automatically determines optimal components based on variance 
+  threshold or uses user-specified number. Assumes data is already preprocessed and scaled.
+
 inputs:
   - {name: input_data_path, type: Dataset, description: 'Path to preprocessed input dataset (CSV, Parquet, or JSONL)'}
   - {name: n_components, type: string, default: 'auto', description: 'Number of components (e.g., 2, 5) or "auto" to determine based on variance_threshold'}
@@ -7,12 +12,20 @@ inputs:
   - {name: random_state, type: Integer, default: '42', description: 'Random seed for reproducibility'}
 
 outputs:
-  - {name: pca_output, type: Dataset, description: 'Directory containing transformed data, model, and metadata'}
+  - {name: pca_transformed_data, type: Dataset, description: 'PCA transformed dataset'}
+  - {name: pca_model_output, type: Model, description: 'Trained PCA model (pickle file)'}
+  - {name: pca_metadata_output, type: Metrics, description: 'PCA metadata and statistics'}
 
 implementation:
   container:
     image: python:3.9
     command:
+      - sh
+      - -c
+      - |
+        python3 -m pip install --quiet --upgrade pip setuptools wheel
+        python3 -m pip install --quiet "pandas==1.5.3" "numpy<2,>=1.22" "scikit-learn==1.3.0" "pyarrow>=10,<16" "cloudpickle==2.2.1"
+        exec "$0" "$@"
       - python3
       - -u
       - -c
@@ -26,17 +39,17 @@ implementation:
         import cloudpickle
         from sklearn.decomposition import PCA, KernelPCA, IncrementalPCA, SparsePCA, FactorAnalysis, FastICA
 
-        # Setup argument parser
         parser = argparse.ArgumentParser()
         parser.add_argument('--input_data_path', required=True)
         parser.add_argument('--n_components', default='auto')
         parser.add_argument('--variance_threshold', type=float, default=0.95)
         parser.add_argument('--pca_variant', default='Standard PCA')
         parser.add_argument('--random_state', type=int, default=42)
-        parser.add_argument('--pca_output', required=True)
+        parser.add_argument('--pca_transformed_data', required=True)
+        parser.add_argument('--pca_model_output', required=True)
+        parser.add_argument('--pca_metadata_output', required=True)
         args = parser.parse_args()
 
-        # Setup logging
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         log = logging.getLogger("pca_transform")
 
@@ -55,13 +68,11 @@ implementation:
             log.info(f"Dataset loaded successfully. Shape: {df.shape}")
             return df
 
-        # Load data
         df = load_dataset(args.input_data_path.strip())
         original_shape = df.shape
 
         log.info("Validating preprocessed data...")
         
-        # Select only numeric columns
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         X = df[numeric_cols].values
         
@@ -71,7 +82,6 @@ implementation:
         log.info(f"Using {len(numeric_cols)} numeric columns for PCA")
         log.info(f"Feature names: {numeric_cols[:10]}{'...' if len(numeric_cols) > 10 else ''}")
 
-        # Check for any remaining NaN or infinite values
         if np.any(np.isnan(X)) or np.any(np.isinf(X)):
             raise ValueError("Data contains NaN or infinite values. Please ensure data is fully preprocessed.")
 
@@ -82,9 +92,7 @@ implementation:
         log.info(f"  Variant: {variant}")
         log.info(f"  Component Selection: {n_comp_input}")
         
-        # Determine n_components
         if n_comp_input == 'auto':
-            # For auto mode, first fit with variance threshold to determine optimal number
             if variant == 'Standard PCA':
                 log.info(f"  Auto mode: Finding components for {args.variance_threshold*100:.1f}% variance...")
                 pca_temp = PCA(n_components=args.variance_threshold, random_state=args.random_state)
@@ -92,7 +100,6 @@ implementation:
                 n_components = pca_temp.n_components_
                 log.info(f"  ✓ Auto selected {n_components} components")
             else:
-                # For other variants, use a reasonable default
                 n_components = min(X.shape[1], max(2, int(X.shape[1] * 0.5)))
                 log.info(f"  Auto mode: Using {n_components} components for {variant}")
         else:
@@ -109,7 +116,6 @@ implementation:
 
         log.info(f"Initializing {variant}...")
         
-        # Initialize appropriate PCA variant
         if variant == 'Standard PCA':
             pca_model = PCA(n_components=n_components, random_state=args.random_state)
         elif variant == 'Kernel PCA':
@@ -125,11 +131,9 @@ implementation:
         else:
             raise ValueError(f"Unknown PCA variant: {variant}")
 
-        # Fit and transform
         log.info("Fitting and transforming data...")
         X_transformed = pca_model.fit_transform(X)
         
-        # Create transformed dataframe
         component_names = [f'PC{i+1}' for i in range(X_transformed.shape[1])]
         df_transformed = pd.DataFrame(X_transformed, columns=component_names)
         
@@ -148,7 +152,6 @@ implementation:
             'random_state': args.random_state
         }
         
-        # Add variant-specific metadata
         if hasattr(pca_model, 'explained_variance_ratio_'):
             explained_var = pca_model.explained_variance_ratio_
             cumulative_var = np.cumsum(explained_var)
@@ -167,24 +170,21 @@ implementation:
             log.info("="*70)
         
         if hasattr(pca_model, 'components_'):
-            # Store top features for each component
             components = pca_model.components_
             metadata['component_loadings'] = {}
             
             log.info("Top Contributing Features per Component:")
             log.info("-"*70)
-            for i, component in enumerate(components[:5]):  # Show first 5 components
-                # Get top 5 contributing features
+            for i, component in enumerate(components[:5]):
                 top_indices = np.argsort(np.abs(component))[-5:][::-1]
                 top_features = [(numeric_cols[idx], float(component[idx])) for idx in top_indices]
                 metadata['component_loadings'][f'PC{i+1}'] = top_features
                 
                 log.info(f"  PC{i+1}:")
-                for feat, load in top_features[:3]:  # Show top 3 in logs
+                for feat, load in top_features[:3]:
                     log.info(f"    {feat}: {load:+.4f}")
             if len(components) > 5:
                 log.info(f"  ... and {len(components)-5} more components")
-            log.info("")
         
         if hasattr(pca_model, 'singular_values_'):
             metadata['singular_values'] = pca_model.singular_values_.tolist()
@@ -192,16 +192,12 @@ implementation:
         if hasattr(pca_model, 'noise_variance_'):
             metadata['noise_variance'] = float(pca_model.noise_variance_)
 
-   
-        os.makedirs(args.pca_output, exist_ok=True)
-        log.info(f"Saving outputs to: {args.pca_output}")
+        log.info("Saving outputs...")
         
-        # 1. Save transformed data as Parquet (efficient storage)
-        transformed_path = os.path.join(args.pca_output, 'pca_transformed.parquet')
-        df_transformed.to_parquet(transformed_path, index=False)
-        log.info(f Transformed data saved: pca_transformed.parquet")
+        os.makedirs(os.path.dirname(args.pca_transformed_data) or '.', exist_ok=True)
+        df_transformed.to_parquet(args.pca_transformed_data, index=False)
+        log.info(f"✓ Transformed data saved: {args.pca_transformed_data}")
         
-        # 2. Save model using cloudpickle
         model_data = {
             'pca_model': pca_model,
             'feature_names': numeric_cols,
@@ -210,49 +206,19 @@ implementation:
             'n_components': n_components
         }
         
-        model_path = os.path.join(args.pca_output, 'pca_model.pkl')
-        with open(model_path, 'wb') as f:
+        os.makedirs(os.path.dirname(args.pca_model_output) or '.', exist_ok=True)
+        with open(args.pca_model_output, 'wb') as f:
             cloudpickle.dump(model_data, f)
-        log.info(f"✓ Model saved: pca_model.pkl")
+        log.info(f"✓ Model saved: {args.pca_model_output}")
         
-        # 3. Save metadata as JSON
-        metadata_path = os.path.join(args.pca_output, 'metadata.json')
-        with open(metadata_path, 'w') as f:
+        os.makedirs(os.path.dirname(args.pca_metadata_output) or '.', exist_ok=True)
+        with open(args.pca_metadata_output, 'w') as f:
             json.dump(metadata, f, indent=2)
-        log.info(f"✓ Metadata saved: metadata.json")
+        log.info(f"✓ Metadata saved: {args.pca_metadata_output}")
         
-        # 4. Save summary report
-        summary_path = os.path.join(args.pca_output, 'summary.txt')
-        with open(summary_path, 'w') as f:
-            f.write("="*70 )
-            f.write("PCA TRANSFORMATION SUMMARY")
-            f.write("="*70)
-            f.write(f"Variant: {variant}")
-            f.write(f"Input Shape: {original_shape}")
-            f.write(f"Output Shape: {df_transformed.shape}")
-            f.write(f"Number of Components: {n_components}")
-            f.write(f"Original Features: {len(numeric_cols)}")
-            f.write(f"Random State: {args.random_state}")
-            
-            if 'total_variance_explained' in metadata:
-                f.write(f"Total Variance Explained: {metadata['total_variance_explained']*100:.2f}%")
-                f.write("Explained Variance Ratio:")
-                for i, var in enumerate(metadata['explained_variance_ratio']):
-                    cumvar = metadata['cumulative_variance'][i]
-                    f.write(f"  PC{i+1}: {var*100:.2f}% (Cumulative: {cumvar*100:.2f}%)\n")
-            
-
-        log.info(f"✓ Summary report saved: summary.txt")
-        
-        log.info(f"{'='*70}")
+        log.info("="*70)
         log.info("PCA TRANSFORMATION COMPLETED SUCCESSFULLY")
-        log.info(f"{'='*70}")
-        log.info(f"All outputs saved to: {args.pca_output}")
-        log.info(f"  - pca_transformed.parquet (transformed data)")
-        log.info(f"  - pca_model.pkl (model for inference)")
-        log.info(f"  - metadata.json (detailed metadata)")
-        log.info(f"  - summary.txt (human-readable summary)")
-        log.info(f"{'='*70}")
+        log.info("="*70)
 
     args:
       - --input_data_path
@@ -265,5 +231,9 @@ implementation:
       - {inputValue: pca_variant}
       - --random_state
       - {inputValue: random_state}
-      - --pca_output
-      - {outputPath: pca_output}
+      - --pca_transformed_data
+      - {outputPath: pca_transformed_data}
+      - --pca_model_output
+      - {outputPath: pca_model_output}
+      - --pca_metadata_output
+      - {outputPath: pca_metadata_output}
