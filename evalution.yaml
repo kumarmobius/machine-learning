@@ -1,4 +1,4 @@
-name: Evaluate Model v3
+name: Evaluate Model v4
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -22,6 +22,7 @@ implementation:
         import argparse, os, sys, json, io, gzip, zipfile, traceback, numbers
         import pandas as pd, numpy as np, joblib, cloudpickle
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error, confusion_matrix
+        from scipy import stats
 
         def is_likely_json(sample_bytes):
             if not sample_bytes: return False
@@ -211,7 +212,7 @@ implementation:
 
             y_df = read_with_pandas(y_path)
 
-            # Extract target column
+            # Extract target column (for single-target eval)
             if isinstance(y_df, pd.DataFrame):
                 if target_col:
                     if target_col not in y_df.columns:
@@ -220,16 +221,13 @@ implementation:
                 elif y_df.shape[1] == 1:
                     y_raw = y_df.iloc[:, 0].copy()
                 else:
-                    raise ValueError(f"y_test has {y_df.shape[1]} columns. Please provide --target_column. Available: {list(y_df.columns)}")
+                    # keep full dataframe; multi-target evaluation will be handled later
+                    y_raw = None
             else:
                 y_raw = pd.Series(y_df).copy()
 
-            if len(y_raw) == 0:
+            if y_raw is not None and len(y_raw) == 0:
                 raise ValueError("y_test has 0 rows. Check the input file.")
-
-            print(f"[INFO] y_test shape: {y_raw.shape}")
-            print(f"[INFO] y_test unique values: {y_raw.nunique()}")
-            print(f"[INFO] y_test sample values: {y_raw.head(10).tolist()}")
 
             # Load metadata and label mapping
             print("[INFO] Loading preprocessing metadata...")
@@ -272,32 +270,57 @@ implementation:
                 print(f"[WARN] Could not get target column from preprocessor: {e}")
                 print(f"[WARN] Using: {target_col_name}")
 
+            # If y_raw is None (multi-target input), try to attach one column if user specified target_col; else
             test_full = X_raw.copy()
-            test_full[target_col_name] = y_raw.values
-
+            if y_raw is not None:
+                test_full[target_col_name] = y_raw.values
+            else:
+                # For multi-target y_df (DataFrame with many columns), we won't add a single target column.
+                # Many preprocessors expect target column to exist; if preprocessor requires it and fails, user should pass single-target y.
+                print("[INFO] y_test appears multi-column; adding no single target column to test_full (preprocessor must handle this).")
             print(f"[INFO] X_raw shape: {X_raw.shape}")
-            print(f"[INFO] X_raw columns: {list(X_raw.columns)}")
             print(f"[INFO] Reconstructed test_full shape: {test_full.shape}")
-            print(f"[INFO] Reconstructed columns: {list(test_full.columns)}")
             print("="*80)
 
             print("[INFO] Applying preprocessor to reconstructed test data...")
-            print("[INFO] Note: Target column added temporarily for structural consistency")
+            print("[INFO] Note: Target column added temporarily for structural consistency if present")
 
-            Xp_full = pre.transform(test_full, training_mode=False)
+            # Try both flavors for pre.transform -- some preprocessors accept transform(X), others transform(df, training_mode=...)
+            Xp_full = None
+            try:
+                Xp_full = pre.transform(test_full, training_mode=False)
+            except TypeError:
+                try:
+                    Xp_full = pre.transform(test_full)
+                except Exception as e:
+                    raise RuntimeError(f"Preprocessor.transform failed: {e}")
+            except Exception as e:
+                raise RuntimeError(f"Preprocessor.transform failed: {e}")
 
-            print(f"[INFO] X after preprocessing: {Xp_full.shape}")
-            print(f"[INFO] Columns after preprocessing: {list(Xp_full.columns)}")
-
-            if target_col_name in Xp_full.columns:
-                print(f"[INFO] Removing target column '{target_col_name}' from processed features")
-                Xp = Xp_full.drop(columns=[target_col_name])
+            print(f"[INFO] X after preprocessing: {getattr(Xp_full, 'shape', None)}")
+            # If pre.transform returned array-like, convert to DataFrame with same columns if available
+            if isinstance(Xp_full, (pd.DataFrame, pd.Series)):
+                Xp_df = Xp_full.copy()
             else:
-                print(f"[INFO] Target column already removed during preprocessing")
-                Xp = Xp_full
+                # try to get output feature names from pre
+                try:
+                    cols = getattr(pre, "feature_names_out", None) or getattr(pre, "output_columns", None)
+                    if cols is None:
+                        cols = [f"f{i}" for i in range(Xp_full.shape[1])]
+                    Xp_df = pd.DataFrame(Xp_full, columns=list(cols))
+                except Exception:
+                    Xp_df = pd.DataFrame(Xp_full)
+
+            print(f"[INFO] Columns after preprocessing: {list(Xp_df.columns)[:20]} (total {len(Xp_df.columns)})")
+
+            if target_col_name in Xp_df.columns:
+                print(f"[INFO] Removing target column '{target_col_name}' from processed features")
+                Xp = Xp_df.drop(columns=[target_col_name])
+            else:
+                print(f"[INFO] Target column not present in processed features (or multi-target scenario)")
+                Xp = Xp_df
 
             print(f"[INFO] Final Xp shape: {Xp.shape}")
-            print(f"[INFO] Final Xp columns: {list(Xp.columns)}")
             print("="*80)
 
             # Apply feature selector if available
@@ -306,185 +329,292 @@ implementation:
                 if hasattr(fs, "selected_features"):
                     want_cols = list(fs.selected_features)
                     print(f"[INFO] Selecting {len(want_cols)} features")
-                    print(f"[INFO] Selected features: {want_cols}")
-
                     missing_cols = set(want_cols) - set(Xp.columns)
                     if missing_cols:
                         print(f"[WARN] Missing features after preprocessing: {missing_cols}")
                         print(f"[WARN] These will be filled with zeros")
-
                     Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
                 else:
-                    Xs = fs.transform(Xp)
+                    try:
+                        Xs = fs.transform(Xp)
+                    except Exception as e:
+                        raise RuntimeError(f"Feature selector transform failed: {e}")
                 print(f"[INFO] X after feature selection: {Xs.shape}")
             else:
                 Xs = Xp
                 print("[INFO] No feature selection applied")
 
-            # Align y_test labels to training encoding for classification
-            y_original = y_raw.copy()  # Keep original for reference
-            def format_pct(x):
-                try:
-                    return round(float(x) * 100.0, 2)
-                except Exception:
-                    return x
-            
-            def format_num(x, ndigits=2):
-                try:
-                    return round(float(x), ndigits)
-                except Exception:
-                    return x
-
-            if task != "regression" and label_mapping is not None:
-                print("="*80)
-                print("APPLYING LABEL MAPPING TO TEST DATA")
-                print("="*80)
-                print(f"[INFO] Label mapping: {label_mapping}")
-
-                y_str = y_raw.astype(str)
-                y_encoded = y_str.map(lambda val: label_mapping.get(val, None))
-
-                unmapped_mask = y_encoded.isna()
-                if unmapped_mask.any():
-                    unmapped_count = int(unmapped_mask.sum())
-                    unmapped_values = y_str[unmapped_mask].unique().tolist()
-                    print(f"[WARN] Found {unmapped_count} unmapped labels in y_test: {unmapped_values}")
-                    print(f"[WARN] Available mappings: {list(label_mapping.keys())}")
-                    print(f"[WARN] These rows will be excluded from evaluation")
-
-                    keep_mask = ~unmapped_mask
-                    Xs = Xs.iloc[keep_mask.values].reset_index(drop=True)
-                    y = y_encoded[keep_mask].astype(int).reset_index(drop=True)
-                    y_original = y_original[keep_mask].reset_index(drop=True)
-                else:
-                    y = y_encoded.astype(int).reset_index(drop=True)
-
-                print(f"[INFO] y_test after encoding - unique values: {y.unique()}")
-                print(f"[INFO] y_test after encoding - value counts:")
-                print(y.value_counts().sort_index())
-                print(f"[INFO] y_test after encoding - sample: {y.head(10).tolist()}")
-                print("="*80)
-
-            elif task == "regression":
-                print("[INFO] Regression task - converting y_test to numeric...")
-                y = pd.to_numeric(y_raw, errors="coerce")
-
-                valid_mask = y.notna()
-                if not valid_mask.all():
-                    invalid_count = (~valid_mask).sum()
-                    print(f"[WARN] Dropping {invalid_count} rows with non-numeric targets")
-                    Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
-                    y = y[valid_mask].reset_index(drop=True)
-                    y_original = y_original[valid_mask].reset_index(drop=True)
-
+            # Align y_test labels to training encoding for classification OR prepare y_df for multi-target evaluation
+            y_original = None
+            if isinstance(y_df, pd.DataFrame) and (target_col == "" and y_raw is None):
+                # multi-target truth provided
+                y_multi_df = y_df.copy().reset_index(drop=True)
+                y_original = y_multi_df.copy()
+                print(f"[INFO] Multi-target ground truth detected with columns: {list(y_multi_df.columns)}")
             else:
-                print("[WARN] Classification task but no label_mapping found!")
-                print("[WARN] Assuming y_test labels already match training encoding")
-                y = y_raw
-                try:
-                    y = pd.to_numeric(y, errors='coerce')
-                    if y.isna().any():
-                        print(f"[ERROR] Could not convert some labels to numeric!")
-                        print(f"[ERROR] This will cause evaluation to fail")
-                except Exception as e:
-                    print(f"[WARN] Could not convert labels to numeric: {e}")
+                # single target path
+                if y_raw is None:
+                    raise ValueError("Could not determine single target column from y_test; provide --target_column or supply a single-column y_test.")
+                y_original = y_raw.reset_index(drop=True)
+                if task != "regression" and label_mapping is not None:
+                    print("[INFO] Applying label mapping to single-target y_test")
+                    y_str = y_original.astype(str)
+                    y_encoded = y_str.map(lambda val: label_mapping.get(val, None))
+                    unmapped_mask = y_encoded.isna()
+                    if unmapped_mask.any():
+                        unmapped_count = int(unmapped_mask.sum())
+                        unmapped_values = y_str[unmapped_mask].unique().tolist()
+                        print(f"[WARN] Found {unmapped_count} unmapped labels in y_test: {unmapped_values}")
+                        print(f"[WARN] These rows will be excluded from evaluation")
+                        keep_mask = ~unmapped_mask
+                        Xs = Xs.iloc[keep_mask.values].reset_index(drop=True)
+                        y = y_encoded[keep_mask].astype(int).reset_index(drop=True)
+                        y_original = y_original[keep_mask].reset_index(drop=True)
+                    else:
+                        y = y_encoded.astype(int).reset_index(drop=True)
+                elif task == "regression":
+                    y = pd.to_numeric(y_original, errors="coerce").reset_index(drop=True)
+                    valid_mask = y.notna()
+                    if not valid_mask.all():
+                        invalid_count = (~valid_mask).sum()
+                        print(f"[WARN] Dropping {invalid_count} rows with non-numeric targets")
+                        Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
+                        y = y[valid_mask].reset_index(drop=True)
+                        y_original = y_original[valid_mask].reset_index(drop=True)
+                else:
+                    # no mapping available; assume encoded
+                    y = y_original.copy()
 
             # Final length check
-            if len(y) != len(Xs):
-                raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y)}")
+            if isinstance(y, (pd.Series, pd.DataFrame)):
+                if len(Xs) != len(y):
+                    raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y)}")
+            print(f"[INFO] Final evaluation set size: {len(Xs)} samples")
 
-            print(f"[INFO] Final evaluation set size: {len(y)} samples")
-            print(f"[INFO] Final X shape: {Xs.shape}")
-            print(f"[INFO] Final y shape: {y.shape}")
-
-            # Make predictions
+            # -------------------------
+            # Robust multi-target prediction & metrics
+            # -------------------------
             print("="*80)
-            print("MAKING PREDICTIONS")
+            print("MAKING PREDICTIONS (robust multi-target aware)")
             print("="*80)
 
-            y_pred = model.predict(Xs)
-            print(f"[INFO] Predictions shape: {y_pred.shape}")
-            print(f"[INFO] Predictions dtype: {y_pred.dtype}")
-            print(f"[INFO] Predictions unique values: {np.unique(y_pred)}")
-            print(f"[INFO] Predictions sample (first 10): {y_pred[:10]}")
+            def aggregate_preds_list(preds_stack, task):
+                arr = np.vstack(preds_stack)
+                if task == "regression":
+                    return np.mean(arr, axis=0)
+                else:
+                    mode_res = stats.mode(arr, axis=0, keepdims=False)
+                    # stats.mode result differs across scipy versions: handle both patterns
+                    if hasattr(mode_res, "mode"):
+                        return mode_res.mode
+                    return mode_res[0]
 
+            def predict_for_obj(obj, Xs, task):
+                # direct estimator
+                if hasattr(obj, "predict"):
+                    return np.asarray(obj.predict(Xs)).ravel()
+                # dict-of-estimators
+                if isinstance(obj, dict):
+                    preds = []
+                    for nm, est in obj.items():
+                        if hasattr(est, "predict"):
+                            preds.append(np.asarray(est.predict(Xs)).ravel())
+                    if not preds:
+                        raise ValueError("No usable estimators found in dict for prediction")
+                    return aggregate_preds_list(preds, task)
+                raise ValueError(f"Unsupported model object: {type(obj)}")
 
-            # Compute minimal metrics according to requested spec
-            print("="*80)
+            models_loaded = model
+            is_model_dict = isinstance(models_loaded, dict)
+
+            preds_df = None
+            ytrue_df = None
+
+            # If we have multi-target truth DataFrame (y_multi_df), we will use it for per-target metrics when possible
+            multi_truth_df = None
+            if 'y_multi_df' in locals():
+                multi_truth_df = y_multi_df
+
+            if is_model_dict:
+                # model saved as dict {target_name: estimator_or_dict}
+                target_names = list(models_loaded.keys())
+                print(f"[INFO] Loaded model is a dict with targets: {target_names}")
+                all_preds = {}
+                all_ytrue_cols = {}
+                for tgt in target_names:
+                    print(f"[INFO] Predicting target: {tgt}")
+                    obj = models_loaded[tgt]
+                    yhat = predict_for_obj(obj, Xs, task)
+                    all_preds[tgt] = yhat
+                    # determine ground truth column for tgt
+                    if multi_truth_df is not None and tgt in multi_truth_df.columns:
+                        all_ytrue_cols[tgt] = multi_truth_df[tgt].values
+                    elif isinstance(y, pd.Series):
+                        all_ytrue_cols[tgt] = y.values
+                    else:
+                        # unknown mapping; fill NaNs
+                        all_ytrue_cols[tgt] = np.full(len(yhat), np.nan)
+                preds_df = pd.DataFrame({f"y_pred_{t}": all_preds[t] for t in target_names})
+                ytrue_df = pd.DataFrame({f"y_true_{t}": all_ytrue_cols[t] for t in target_names})
+            else:
+                # single model object
+                print(f"[INFO] Loaded model object type: {type(models_loaded)}")
+                try:
+                    raw_pred = models_loaded.predict(Xs)
+                except Exception as e:
+                    raise RuntimeError(f"Model.predict failed: {e}")
+                raw_pred = np.asarray(raw_pred)
+                if raw_pred.ndim == 1:
+                    preds_df = pd.DataFrame({"y_pred": raw_pred})
+                    if isinstance(y, pd.Series) or isinstance(y, pd.DataFrame):
+                        if isinstance(y, pd.Series):
+                            ytrue_df = pd.DataFrame({"y_true": y.values})
+                        else:
+                            # if y is df with single col
+                            if y.shape[1] == 1:
+                                ytrue_df = pd.DataFrame({"y_true": y.iloc[:,0].values})
+                            else:
+                                raise ValueError("Model produced single output but y_test has multiple columns; provide --target_column")
+                    else:
+                        ytrue_df = pd.DataFrame({"y_true": np.full(len(raw_pred), np.nan)})
+                elif raw_pred.ndim == 2:
+                    n_targets = raw_pred.shape[1]
+                    # try to get names
+                    try:
+                        tgt_names = getattr(models_loaded, "target_names", None) or getattr(models_loaded, "targets", None)
+                        if tgt_names and len(tgt_names) == n_targets:
+                            col_names = list(tgt_names)
+                        else:
+                            col_names = [f"target_{i}" for i in range(n_targets)]
+                    except Exception:
+                        col_names = [f"target_{i}" for i in range(n_targets)]
+                    preds_df = pd.DataFrame({f"y_pred_{col_names[i]}": raw_pred[:, i] for i in range(n_targets)})
+                    # Map y_true if possible
+                    if multi_truth_df is not None and multi_truth_df.shape[1] == n_targets:
+                        ytrue_df = pd.DataFrame({f"y_true_{col_names[i]}": multi_truth_df.iloc[:, i].values for i in range(n_targets)})
+                    elif isinstance(y, pd.Series) and n_targets == 1:
+                        ytrue_df = pd.DataFrame({f"y_true_{col_names[0]}": y.values})
+                    else:
+                        ytrue_df = pd.DataFrame({f"y_true_{col_names[i]}": np.full(preds_df.shape[0], np.nan) for i in range(n_targets)})
+                else:
+                    raise ValueError("Unsupported prediction output shape from model.predict")
+
+            # Compute metrics
+            print("[INFO] Computing metrics for predictions...")
             minimal_metrics = {}
             minimal_metrics["model_name"] = model_name_str
             minimal_metrics["model_type"] = "classification" if task != "regression" else "regression"
-
-            # try to extract loss if present on model object
             loss_val = extract_loss(model)
 
-            if task == "regression":
-                y_true_num = pd.to_numeric(y, errors="coerce")
-                mse_val = float(mean_squared_error(y_true_num, y_pred))
-                rmse_val = float(np.sqrt(mse_val))
-                r2_val = float(r2_score(y_true_num, y_pred))
+            per_target_metrics = {}
+            agg_numeric = {}
 
-                minimal_metrics["rmse"] = format_num(rmse_val)
-                minimal_metrics["mse"] = format_num(mse_val)
-                minimal_metrics["r2_score"] = format_num(r2_val)
+            for pcol in preds_df.columns:
+                tname = pcol.replace("y_pred_", "")
+                ypred_vals = preds_df[pcol].values
+                ytrue_col = f"y_true_{tname}"
+                if ytrue_col not in ytrue_df.columns:
+                    # fallback: if single y_true column exists
+                    if "y_true" in ytrue_df.columns and preds_df.shape[1] == 1:
+                        ytrue_vals = ytrue_df["y_true"].values
+                    else:
+                        print(f"[WARN] No ground truth column for prediction {pcol} — skipping metrics for this target")
+                        continue
+                else:
+                    ytrue_vals = ytrue_df[ytrue_col].values
 
-            else:
-                # classification canonical metrics (weighted)
-                y_true = y
-                # ensure comparable dtypes
-                try:
-                    if pd.api.types.is_numeric_dtype(y_true) and not pd.api.types.is_numeric_dtype(y_pred):
-                        y_pred = pd.Series(y_pred).astype(y_true.dtype)
-                    elif not pd.api.types.is_numeric_dtype(y_true) and pd.api.types.is_numeric_dtype(y_pred):
-                        y_true = y_true.astype(str)
-                        y_pred = pd.Series(y_pred).astype(str)
-                except Exception as e:
-                    print(f"[WARN] Type alignment issue: {e}")
-
-                acc = float(accuracy_score(y_true, y_pred))
-                precision_w = float(precision_score(y_true, y_pred, average="weighted", zero_division=0))
-                recall_w = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
-                f1_w = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
-
-                minimal_metrics["accuracy"] = format_pct(acc)
-                minimal_metrics["precision"] = format_pct(precision_w)
-                minimal_metrics["recall"] = format_pct(recall_w)
-                minimal_metrics["f1_score"] = format_pct(f1_w)
-
-                if loss_val is not None:
-                    # include only if numeric loss was found
+                if task == "regression":
+                    ytrue_num = pd.to_numeric(ytrue_vals, errors="coerce")
+                    valid_mask = ~np.isnan(ytrue_num)
+                    if not valid_mask.all():
+                        print(f"[WARN] Dropping {np.sum(~valid_mask)} rows with NaN y_true for target {tname}")
+                    if valid_mask.sum() == 0:
+                        print(f"[WARN] No valid ground truth for {tname}; skipping")
+                        continue
+                    ytrue_f = ytrue_num[valid_mask]
+                    ypred_f = np.asarray(ypred_vals)[valid_mask]
+                    mse_val = float(mean_squared_error(ytrue_f, ypred_f))
+                    rmse_val = float(np.sqrt(mse_val))
+                    r2_val = float(r2_score(ytrue_f, ypred_f))
+                    per_target_metrics[tname] = {"rmse": round(rmse_val,6), "mse": round(mse_val,6), "r2": round(r2_val,6)}
+                    agg_numeric.setdefault("rmse", []).append(rmse_val)
+                    agg_numeric.setdefault("mse", []).append(mse_val)
+                    agg_numeric.setdefault("r2", []).append(r2_val)
+                else:
+                    ytrue_c = ytrue_vals
+                    ypred_c = ypred_vals
+                    # try to align types
                     try:
-                        minimal_metrics["loss"] = format_num(loss_val, ndigits=6)
+                        if pd.api.types.is_numeric_dtype(pd.Series(ytrue_c)) and not pd.api.types.is_numeric_dtype(pd.Series(ypred_c)):
+                            ypred_c = pd.Series(ypred_c).astype(pd.Series(ytrue_c).dtype).values
+                        elif not pd.api.types.is_numeric_dtype(pd.Series(ytrue_c)) and pd.api.types.is_numeric_dtype(pd.Series(ypred_c)):
+                            ytrue_c = pd.Series(ytrue_c).astype(str).values
+                            ypred_c = pd.Series(ypred_c).astype(str).values
                     except Exception:
                         pass
+                    mask_valid = pd.notna(ytrue_c)
+                    if not mask_valid.all():
+                        ytrue_c = ytrue_c[mask_valid]
+                        ypred_c = np.asarray(ypred_c)[mask_valid]
+                    if len(ytrue_c) == 0:
+                        print(f"[WARN] No valid ground truth for {tname}; skipping")
+                        continue
+                    acc = float(accuracy_score(ytrue_c, ypred_c))
+                    precision_w = float(precision_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
+                    recall_w = float(recall_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
+                    f1_w = float(f1_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
+                    per_target_metrics[tname] = {"accuracy": round(acc,6), "precision": round(precision_w,6), "recall": round(recall_w,6), "f1": round(f1_w,6)}
+                    agg_numeric.setdefault("accuracy", []).append(acc)
+                    agg_numeric.setdefault("precision", []).append(precision_w)
+                    agg_numeric.setdefault("recall", []).append(recall_w)
+                    agg_numeric.setdefault("f1", []).append(f1_w)
+                    if loss_val is not None:
+                        try:
+                            per_target_metrics[tname]["loss"] = float(round(loss_val,6))
+                        except Exception:
+                            pass
 
-            # Save only minimal_metrics to metrics_json
+            # Build minimal_metrics: include per-target metrics and aggregates
+            minimal_metrics["per_target"] = per_target_metrics
+            # aggregates
+            aggregates = {}
+            for k, vals in agg_numeric.items():
+                try:
+                    aggregates[f"{k}_mean"] = round(float(np.mean(vals)),6)
+                except Exception:
+                    pass
+            minimal_metrics["aggregate"] = aggregates
+            minimal_metrics["model_loss_extracted"] = extract_loss(model)
+
+            # Save minimal metrics
             print(f"[INFO] Saving minimal metrics to: {metrics_path}")
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(minimal_metrics, f, indent=2, ensure_ascii=False)
             print(f"[INFO] Metrics saved successfully: keys = {list(minimal_metrics.keys())}")
 
-            # Save predictions (keep same format as before)
+            # Prepare predictions output table
             print(f"[INFO] Saving predictions to: {preds_path}")
             ensure_dir_for(preds_path)
 
-            out = pd.DataFrame({
-                "y_true": y,
-                "y_pred": y_pred,
-                "y_true_original": y_original  # Keep original labels for reference
-            })
+            # merge ytrue_df and preds_df side-by-side (columns may overlap names)
+            out_df = pd.concat([ytrue_df.reset_index(drop=True), preds_df.reset_index(drop=True)], axis=1)
+            # also include original y if available (single-target case)
+            if isinstance(y_original, (pd.Series, pd.DataFrame)):
+                try:
+                    out_df["y_true_original"] = (y_original.reset_index(drop=True) if isinstance(y_original, pd.Series) else json.dumps(y_original.iloc[0].to_dict()))
+                except Exception:
+                    # best-effort: skip if mismatch
+                    pass
 
-
-            out.to_parquet(preds_path, index=False)
+            out_df.to_parquet(preds_path, index=False)
             print(f"[INFO] Predictions saved successfully")
-            print(f"[INFO] Predictions dataframe shape: {out.shape}")
-            print(f"[INFO] Predictions dataframe columns: {list(out.columns)}")
-
+            print(f"[INFO] Predictions dataframe shape: {out_df.shape}")
+            print(f"[INFO] Predictions dataframe columns: {list(out_df.columns)}")
             print("="*80)
             print("SUCCESS: Evaluation completed successfully")
             print("="*80)
-            print(f"Total samples evaluated: {len(y)}")
+            print(f"Total samples evaluated: {len(Xs)}")
             print(f"Metrics saved to: {metrics_path}")
             print(f"Predictions saved to: {preds_path}")
             print("="*80)
