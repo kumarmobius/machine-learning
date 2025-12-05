@@ -1,4 +1,4 @@
-name: PCA Transformer v1
+name: PCA Transformer v1.1
 inputs:
   - {name: input_data, type: Dataset, description: "Input dataset (CSV, Parquet, or JSONL)"}
   - {name: pca_variant, type: String, description: "PCA variant: pca, kernel, incremental, sparse, fa, ica", optional: true, default: "pca"}
@@ -64,10 +64,7 @@ implementation:
 
         def parse_n_components(n_str: str, variant: str, p: int, variance_threshold: float,
                                X: pd.DataFrame) -> tuple:
-            """
-            Returns (n_components, aux_info) where aux_info may contain
-            precomputed variance details used for metadata.
-            """
+
             n_str = str(n_str).strip().lower()
             aux = {}
 
@@ -128,10 +125,6 @@ implementation:
             )
 
         def extract_variance_stats(model, variant: str):
-            """
-            Extracts explained variance, ratios, cumulative variance, singular values, noise variance.
-            Handles the KernelPCA special case via eigenvalues when needed.
-            """
             explained_variance = None
             explained_variance_ratio = None
             cumulative_variance_ratio = None
