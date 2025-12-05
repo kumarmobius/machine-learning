@@ -1,4 +1,4 @@
-name: PCA_Transform v2,1
+name: PCA_Transform v3
 description: |
   Perform Principal Component Analysis (PCA) or its variants on preprocessed numeric datasets 
   for dimensionality reduction. Automatically determines optimal components based on variance 
@@ -216,7 +216,7 @@ implementation:
 
     args:
       - --input_data_path
-      - {inputValue: input_data_path}
+      - {inputPath: input_data_path}
       - --n_components
       - {inputValue: n_components}
       - --variance_threshold
