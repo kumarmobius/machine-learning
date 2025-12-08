@@ -1,10 +1,11 @@
-name: Evaluate Model v7
+name: Evaluate Model v8
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
   - {name: target_column, type: String, description: "Target column in y_test if multi-column", optional: true, default: ""}
   - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
+  - {name: pca, type: Data, description: "Path to saved PCA / dimensionality transformer (joblib/cloudpickle). Optional. If provided, PCA.transform will be applied AFTER preprocessing (and after feature selection if provided).", optional: true}
   - {name: model_pickle, type: Data, description: "Path to saved model (joblib/pickle)"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time containing label_mapping for classification", optional: true}
@@ -149,6 +150,7 @@ implementation:
         parser.add_argument("--target_column", type=str, default="")
         parser.add_argument("--preprocessor", type=str, required=True)
         parser.add_argument("--feature_selector", type=str, required=False, default="")
+        parser.add_argument("--pca", type=str, required=False, default="")
         parser.add_argument("--model_pickle", type=str, required=True)
         parser.add_argument("--model_type", type=str, default="classification")
         parser.add_argument("--preprocess_metadata", type=str, required=False, default="")
@@ -165,6 +167,7 @@ implementation:
             y_path = args.y_test
             preprocessor_path = args.preprocessor
             feature_selector_path = args.feature_selector or ""
+            pca_path = args.pca or ""
             model_path = args.model_pickle
             metrics_path = args.metrics_json
             preds_path = args.predictions
@@ -354,6 +357,31 @@ implementation:
             else:
                 Xs = Xp
                 print("[INFO] No feature selection applied")
+
+            # -------------------------
+            # Apply PCA if provided (after preprocessing and feature selection)
+            # -------------------------
+            if pca_path and os.path.exists(pca_path):
+                print("[INFO] PCA provided — attempting to load and apply PCA transform")
+                try:
+                    pca_obj = load_pickle_any(pca_path)
+                    if hasattr(pca_obj, "transform"):
+                        # ensure numpy array for transform
+                        Xs_arr = Xs.values if isinstance(Xs, (pd.DataFrame, pd.Series)) else np.asarray(Xs)
+                        Xs_pca = pca_obj.transform(Xs_arr)
+                        # fix shape if 1D
+                        if Xs_pca.ndim == 1:
+                            Xs_pca = Xs_pca.reshape(-1, 1)
+                        ncomp = Xs_pca.shape[1]
+                        pca_cols = [f"pca_{i}" for i in range(ncomp)]
+                        Xs = pd.DataFrame(Xs_pca, columns=pca_cols)
+                        print(f"[INFO] PCA applied. New X shape: {Xs.shape}")
+                    else:
+                        print("[WARN] PCA object does not have a transform() method — skipping PCA")
+                except Exception as e:
+                    print(f"[WARN] Failed to apply PCA: {e}. Continuing without PCA")
+            else:
+                print("[INFO] No PCA provided or file not found; skipping PCA")
 
             # Align y_test labels to training encoding for classification OR prepare y_df for multi-target evaluation
             y_original = None
@@ -671,6 +699,8 @@ implementation:
       - {inputPath: preprocessor}
       - --feature_selector
       - {inputPath: feature_selector}
+      - --pca
+      - {inputPath: pca}
       - --model_pickle
       - {inputPath: model_pickle}
       - --model_type
