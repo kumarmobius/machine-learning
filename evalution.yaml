@@ -1,4 +1,4 @@
-name: Evaluate Model v8
+name: Evaluate Model v9
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -365,91 +365,103 @@ implementation:
                 print("[INFO] PCA provided — attempting to load and apply PCA transform")
                 try:
                     pca_obj = load_pickle_any(pca_path)
-                    if hasattr(pca_obj, "transform"):
+            
+                    # If the loaded object is a Pipeline, try to get the last transformer
+                    try:
+                        from sklearn.pipeline import Pipeline
+                        if isinstance(pca_obj, Pipeline):
+                            # use the last step that has transform
+                            for nm, step in reversed(pca_obj.steps):
+                                if hasattr(step, "transform"):
+                                    pca_transformer = step
+                                    break
+                            else:
+                                pca_transformer = pca_obj
+                        else:
+                            pca_transformer = pca_obj
+                    except Exception:
+                        pca_transformer = pca_obj
+            
+                    if not hasattr(pca_transformer, "transform"):
+                        print("[WARN] PCA object does not have a transform() method — skipping PCA")
+                    else:
                         # ensure numpy array for transform
                         Xs_arr = Xs.values if isinstance(Xs, (pd.DataFrame, pd.Series)) else np.asarray(Xs)
-                        Xs_pca = pca_obj.transform(Xs_arr)
+                        Xs_pca = pca_transformer.transform(Xs_arr)
+            
                         # fix shape if 1D
                         if Xs_pca.ndim == 1:
                             Xs_pca = Xs_pca.reshape(-1, 1)
                         ncomp = Xs_pca.shape[1]
-                        pca_cols = [f"pca_{i}" for i in range(ncomp)]
-                        Xs = pd.DataFrame(Xs_pca, columns=pca_cols)
-                        print(f"[INFO] PCA applied. New X shape: {Xs.shape}")
-                    else:
-                        print("[WARN] PCA object does not have a transform() method — skipping PCA")
+            
+                        # Try to recover original PCA output / component names (many libraries store them differently)
+                        pca_cols = None
+                        # 1) common sklearn APIs
+                        try:
+                            # get_feature_names_out may be a method (callable) or attribute
+                            get_names = getattr(pca_transformer, "get_feature_names_out", None)
+                            if callable(get_names):
+                                out_names = list(get_names())
+                                if len(out_names) == ncomp:
+                                    pca_cols = out_names
+                            elif hasattr(pca_transformer, "feature_names_out_"):
+                                out_names = list(getattr(pca_transformer, "feature_names_out_"))
+                                if len(out_names) == ncomp:
+                                    pca_cols = out_names
+                        except Exception:
+                            pass
+            
+                        # 2) some custom savers/store custom attr names
+                        if pca_cols is None:
+                            for attr in ("pca_feature_names", "component_names_", "columns_", "feature_names_"):
+                                try:
+                                    val = getattr(pca_transformer, attr, None)
+                                    if val is not None:
+                                        cand = list(val)
+                                        if len(cand) == ncomp:
+                                            pca_cols = cand
+                                            break
+                                except Exception:
+                                    continue
+            
+                        # 3) if transformer exposes n_components_ but not names, adopt "PC1..PCn" (1-based) — matches your trained names
+                        if pca_cols is None:
+                            try:
+                                if hasattr(pca_transformer, "n_components_"):
+                                    n_components_ = int(getattr(pca_transformer, "n_components_"))
+                                    # prefer 'PC1' naming if that matches training naming in your logs
+                                    pca_cols = [f"PC{i+1}" for i in range(min(n_components_, ncomp))]
+                                    if len(pca_cols) != ncomp:
+                                        # if counts differ, regenerate with exact ncomp
+                                        pca_cols = [f"PC{i+1}" for i in range(ncomp)]
+                                else:
+                                    # default fallback naming that many pipelines produce
+                                    pca_cols = [f"PC{i+1}" for i in range(ncomp)]
+                            except Exception:
+                                pca_cols = None
+            
+                        # 4) final fallback to pca_*
+                        if pca_cols is None:
+                            pca_cols = [f"pca_{i}" for i in range(ncomp)]
+                            print("[WARN] Could not infer PCA output names from object; falling back to 'pca_i' names")
+            
+                        # If we have a mismatch in length, force a safe naming of exact ncomp
+                        if len(pca_cols) != ncomp:
+                            print(f"[WARN] Inferred PCA column count {len(pca_cols)} != actual {ncomp}; regenerating names for exact count")
+                            # try to keep existing prefix if any (e.g., 'PC' vs 'pca_')
+                            prefix = "PC" if any(str(name).upper().startswith("PC") for name in pca_cols) else "pca_"
+                            if prefix == "PC":
+                                pca_cols = [f"PC{i+1}" for i in range(ncomp)]
+                            else:
+                                pca_cols = [f"pca_{i}" for i in range(ncomp)]
+            
+                        # Apply names to DataFrame
+                        Xs = pd.DataFrame(Xs_pca, columns=list(pca_cols))
+                        print(f"[INFO] PCA applied. New X shape: {Xs.shape}. PCA columns: {list(Xs.columns)[:10]}{'...' if len(Xs.columns)>10 else ''}")
                 except Exception as e:
                     print(f"[WARN] Failed to apply PCA: {e}. Continuing without PCA")
             else:
                 print("[INFO] No PCA provided or file not found; skipping PCA")
-
-            # Align y_test labels to training encoding for classification OR prepare y_df for multi-target evaluation
-            y_original = None
-            if isinstance(y_df, pd.DataFrame) and (target_col == "" and y_raw is None):
-                # multi-target truth provided
-                y_multi_df = y_df.copy().reset_index(drop=True)
-                y_original = y_multi_df.copy()
-                print(f"[INFO] Multi-target ground truth detected with columns: {list(y_multi_df.columns)}")
-            else:
-                # single target path
-                if y_raw is None:
-                    # Check if we have a multi-column y_df that should be treated as multi-target
-                    if isinstance(y_df, pd.DataFrame) and y_df.shape[1] > 1:
-                        # This is a multi-target scenario - treat it as such
-                        y_multi_df = y_df.copy().reset_index(drop=True)
-                        y_original = y_multi_df.copy()
-                        print(f"[INFO] Multi-target ground truth detected with columns: {list(y_multi_df.columns)}")
-                        y = None  # Signal to skip single-target processing
-                    else:
-                        raise ValueError("Could not determine single target column from y_test; provide --target_column or supply a single-column y_test.")
-                else:
-                    y_original = y_raw.reset_index(drop=True)
-                
-                # Only process single-target label mapping if we have a single target
-                if y_raw is not None and task != "regression" and label_mapping is not None:
-                    print("[INFO] Applying label mapping to single-target y_test")
-                    y_str = y_original.astype(str)
-                    y_encoded = y_str.map(lambda val: label_mapping.get(val, None))
-                    unmapped_mask = y_encoded.isna()
-                    if unmapped_mask.any():
-                        unmapped_count = int(unmapped_mask.sum())
-                        unmapped_values = y_str[unmapped_mask].unique().tolist()
-                        print(f"[WARN] Found {unmapped_count} unmapped labels in y_test: {unmapped_values}")
-                        print(f"[WARN] These rows will be excluded from evaluation")
-                        keep_mask = ~unmapped_mask
-                        Xs = Xs.iloc[keep_mask.values].reset_index(drop=True)
-                        y = y_encoded[keep_mask].astype(int).reset_index(drop=True)
-                        y_original = y_original[keep_mask].reset_index(drop=True)
-                    else:
-                        y = y_encoded.astype(int).reset_index(drop=True)
-                elif task == "regression":
-                    # Check if y_original is a DataFrame (multi-target) or Series (single-target)
-                    if isinstance(y_original, pd.DataFrame):
-                        # Multi-target regression: handle each column
-                        print("[INFO] Multi-target regression detected, skipping single-target numeric conversion")
-                        y = y_original.copy()  # Keep as DataFrame
-                    else:
-                        # Single-target regression
-                        y = pd.to_numeric(y_original, errors="coerce").reset_index(drop=True)
-                        valid_mask = y.notna()
-                        if not valid_mask.all():
-                            invalid_count = (~valid_mask).sum()
-                            print(f"[WARN] Dropping {invalid_count} rows with non-numeric targets")
-                            Xs = Xs.iloc[valid_mask.values].reset_index(drop=True)
-                            y = y[valid_mask].reset_index(drop=True)
-                            y_original = y_original[valid_mask].reset_index(drop=True)
-                else:
-                    # no mapping available; assume encoded
-                    y = y_original.copy()
-
-            # Final length check
-            if 'y' in locals() and y is not None and isinstance(y, (pd.Series, pd.DataFrame)):
-                if len(Xs) != len(y):
-                    raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y)}")
-            elif 'y_multi_df' in locals():
-                if len(Xs) != len(y_multi_df):
-                    raise ValueError(f"Length mismatch after preprocessing: X={len(Xs)} vs y={len(y_multi_df)}")
-            print(f"[INFO] Final evaluation set size: {len(Xs)} samples")
 
             # -------------------------
             # Robust multi-target prediction & metrics
