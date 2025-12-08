@@ -1,4 +1,4 @@
-name: Stacking and Voting V4
+name: Stacking and Voting V5
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -6,7 +6,7 @@ inputs:
   - {name: ensemble_type, type: String, description: "none | stacking | voting", optional: true, default: "stacking"}
   - {name: n_ensemble_models, type: Integer, description: "If >1 and model_names not provided, randomly pick this many models from default pool", optional: true, default: "0"}
   - {name: model_names, type: String, description: "Optional comma-separated list of model names to use verbatim (overrides n_ensemble_models)", optional: true, default: ""}
-  - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking", optional: true, default: ""}
+  - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking (e.g. 'lightgbm' or 'logistic'). If absent, prefer LightGBM/XGBoost when available, else fallback.", optional: true, default: ""}
   - {name: stacking_cv, type: Integer, default: "5"}
   - {name: random_state, type: Integer, optional: true, default: "50"}
 outputs:
@@ -23,11 +23,6 @@ implementation:
       - -c
       - |
         import argparse, json, os, sys, traceback, random, warnings
-        
-        # Suppress ALL warnings at the very beginning
-        warnings.filterwarnings('ignore')
-        os.environ['PYTHONWARNINGS'] = 'ignore'
-        
         import pandas as pd, numpy as np, joblib
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
@@ -42,42 +37,37 @@ implementation:
         )
         from sklearn.linear_model import (
             LogisticRegression, LinearRegression, SGDClassifier, SGDRegressor,
-            Ridge, RidgeClassifier, Lasso, ElasticNet, 
-            BayesianRidge, HuberRegressor, PassiveAggressiveClassifier, PassiveAggressiveRegressor
+            Ridge, RidgeClassifier, Lasso, ElasticNet, BayesianRidge,
+            PassiveAggressiveClassifier, PassiveAggressiveRegressor
         )
         from sklearn.naive_bayes import GaussianNB, BernoulliNB, MultinomialNB
         from sklearn.neural_network import MLPClassifier, MLPRegressor
+        from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis, LinearDiscriminantAnalysis
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
         from sklearn.utils.class_weight import compute_sample_weight
         from sklearn.model_selection import cross_val_score
         from sklearn.svm import SVC, LinearSVC, NuSVC, SVR, LinearSVR, NuSVR
-        from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis, LinearDiscriminantAnalysis
         from scipy import stats
+        
+        # Suppress convergence warnings
+        warnings.filterwarnings('ignore', category=UserWarning)
+        warnings.filterwarnings('ignore', module='sklearn')
       
         try:
             from lightgbm import LGBMClassifier, LGBMRegressor
-            LIGHTGBM_AVAILABLE = True
         except Exception:
             LGBMClassifier = None
             LGBMRegressor = None
-            LIGHTGBM_AVAILABLE = False
         try:
             from xgboost import XGBClassifier, XGBRegressor
-            XGBOOST_AVAILABLE = True
         except Exception:
             XGBClassifier = None
             XGBRegressor = None
-            XGBOOST_AVAILABLE = False
         try:
             from catboost import CatBoostClassifier, CatBoostRegressor
-            CATBOOST_AVAILABLE = True
         except Exception:
             CatBoostClassifier = None
             CatBoostRegressor = None
-            CATBOOST_AVAILABLE = False
-        
-        # Print library availability once
-        print(f"[INFO] Library availability - XGBoost: {XGBOOST_AVAILABLE}, LightGBM: {LIGHTGBM_AVAILABLE}, CatBoost: {CATBOOST_AVAILABLE}")
       
         def load_parquet_df(path):
             return pd.read_parquet(path, engine="auto")
@@ -106,78 +96,91 @@ implementation:
             random.seed(int(args.random_state))
             np.random.seed(int(args.random_state))
       
+            # Enhanced hyperparameters
             STATIC = {
-                "n_estimators": 300,
-                "min_samples_leaf": 1,
-                "max_depth_tree": 8,
-                "knn_k": 7,
-                "svm_C": 1.0,
+                # Tree-based
+                "n_estimators": 500,
+                "n_estimators_boost": 300,
+                "min_samples_leaf": 2,
+                "min_samples_split": 5,
+                "max_depth_tree": 12,
+                "max_depth_boost": 8,
+                "max_features": "sqrt",
+                "learning_rate": 0.1,
+                
+                # KNN
+                "knn_k": 9,
+                "knn_weights": "distance",
+                "knn_algorithm": "auto",
+                
+                # SVM
+                "svm_C": 10.0,
                 "svm_gamma": "scale",
-                "nu_default": 0.5,
-                "meta_lgbm_n_estimators": 200,
-                "meta_xgb_n_estimators": 200,
-                "meta_cat_n_estimators": 200,
-                "mlp_hidden_layer_sizes": (256,128),
-                "sgd_max_iter": 2000,
+                "svm_kernel": "rbf",
+                "svm_max_iter": 50000,
+                "nu_default": 0.6,
+                
+                # Linear models
                 "ridge_alpha": 1.0,
                 "lasso_alpha": 0.1,
                 "elasticnet_alpha": 0.1,
                 "elasticnet_l1_ratio": 0.5,
-                "huber_epsilon": 1.35,
-                "linearsvr_max_iter": 50000,
-                "linearsvr_tol": 1e-4,
+                
+                # Neural networks
+                "mlp_hidden_layer_sizes": (512, 256, 128),
+                "mlp_activation": "relu",
+                "mlp_alpha": 0.0001,
+                "mlp_learning_rate": "adaptive",
+                "mlp_max_iter": 1000,
+                
+                # SGD
+                "sgd_max_iter": 5000,
+                "sgd_tol": 1e-4,
+                "sgd_learning_rate": "optimal",
+                "sgd_alpha": 0.0001,
+                
+                # Boosting libraries
+                "meta_lgbm_n_estimators": 300,
+                "meta_lgbm_learning_rate": 0.05,
+                "meta_lgbm_max_depth": 10,
+                "meta_lgbm_num_leaves": 63,
+                
+                "meta_xgb_n_estimators": 300,
+                "meta_xgb_learning_rate": 0.05,
+                "meta_xgb_max_depth": 10,
+                
+                "meta_cat_n_estimators": 300,
+                "meta_cat_learning_rate": 0.05,
+                "meta_cat_depth": 10,
+                
+                # Ensemble settings
                 "STACKING_CV": int(args.stacking_cv or 5),
                 "TRIAL_FIT_SVM": True
             }
       
-            # EXPANDED ALGORITHM POOLS
+            # Extended algorithm pools
             DEFAULT_POOL_CLASSIF = [
-                # Tree-based
-                "extratrees", "randomforest", "decisiontree", "gradientboosting", "histgradientboosting",
-                # Boosting
-                "adaboost",
-                # Ensemble
-                "bagging",
-                # SVM
-                "svc", "nusvc", "linearsvc",
-                # Neighbors
-                "knn",
-                # Linear
-                "logistic", "ridge_classifier", "sgd", "passive_aggressive",
-                # Naive Bayes
-                "gaussiannb", "bernoullinb",
-                # Discriminant Analysis
-                "lda", "qda",
-                # Neural Network
-                "mlp",
-                # Gradient Boosting Libraries
-                "xgboost", "lightgbm", "catboost"
+                "extratrees", "randomforest", "decisiontree", "adaboost", 
+                "gradientboosting", "histgradientboosting", "bagging",
+                "svc", "nusvc", "linearsvc", "knn", "logistic", "ridge_classifier",
+                "sgd", "passive_aggressive", "gaussiannb", "bernoullinb", 
+                "mlp", "lda", "qda", "xgboost", "lightgbm", "catboost"
             ]
-            
             DEFAULT_POOL_REGR = [
-                # Tree-based
-                "extratrees", "randomforest", "decisiontree", "gradientboosting", "histgradientboosting",
-                # Boosting
-                "adaboost",
-                # Ensemble
-                "bagging",
-                # Neighbors
-                "knn",
-                # Linear
-                "linearreg", "ridge", "lasso", "elasticnet", "bayesianridge", "huber", "sgd", "passive_aggressive",
-                # SVM
-                "svr", "nusvr", "linearsvr",
-                # Neural Network
-                "mlp",
-                # Gradient Boosting Libraries
-                "xgboost", "lightgbm", "catboost"
+                "extratrees", "randomforest", "decisiontree", "adaboost",
+                "gradientboosting", "histgradientboosting", "bagging",
+                "knn", "linearreg", "ridge", "lasso", "elasticnet", 
+                "bayesian_ridge", "svr", "nusvr", "linearsvr", "sgd", 
+                "passive_aggressive", "mlp", "xgboost", "lightgbm", "catboost"
             ]
       
             X = load_parquet_df(args.X_data)
             y_df = load_parquet_df(args.y_data)
+            # Normalize y into DataFrame always
             if isinstance(y_df, pd.DataFrame):
                 y_df = y_df.copy()
             else:
+                # if single series/1d, make single-column DataFrame
                 y_df = pd.DataFrame({"target": pd.Series(y_df).copy()})
       
             print(f"[INFO] X shape: {X.shape}, y shape: {y_df.shape}")
@@ -189,6 +192,7 @@ implementation:
             meta_name = (args.meta_model_name or "").strip().lower()
             stacking_cv = int(args.stacking_cv or STATIC["STACKING_CV"])
       
+            # prepare selected_model_names function
             def choose_pool(task, n_pick, model_names_input):
                 if model_names_input:
                     selected_model_names = [m.strip().lower() for m in model_names_input.split(",") if m.strip()]
@@ -217,150 +221,338 @@ implementation:
       
             selected_model_names = choose_pool(task, n_pick, model_names_input)
       
+            # Enhanced factory functions with better hyperparameters
             def make_base_estimator(name, task):
                 n = name.strip().lower()
                 rs = args.random_state
                 
                 if task == "classification":
-                    # Tree-based
-                    if n == "extratrees":
-                        return ExtraTreesClassifier(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=rs, class_weight='balanced')
-                    if n == "randomforest":
-                        return RandomForestClassifier(n_estimators=STATIC["n_estimators"], max_depth=STATIC["max_depth_tree"], n_jobs=-1, random_state=rs, class_weight='balanced')
-                    if n == "decisiontree":
-                        return DecisionTreeClassifier(max_depth=STATIC["max_depth_tree"], class_weight='balanced', random_state=rs)
-                    if n == "gradientboosting":
-                        return GradientBoostingClassifier(n_estimators=int(STATIC["n_estimators"]/2), max_depth=6, random_state=rs)
-                    if n == "histgradientboosting":
-                        return HistGradientBoostingClassifier(max_iter=200, max_depth=8, random_state=rs)
-                    
-                    # Boosting
-                    if n == "adaboost":
-                        return AdaBoostClassifier(n_estimators=STATIC["n_estimators"], random_state=rs)
-                    
-                    # Ensemble
-                    if n == "bagging":
-                        return BaggingClassifier(n_estimators=100, n_jobs=-1, random_state=rs)
-                    
-                    # SVM
-                    if n == "svc":
-                        return SVC(C=STATIC["svm_C"], gamma=STATIC["svm_gamma"], probability=True, class_weight='balanced', random_state=rs)
-                    if n == "nusvc":
-                        return NuSVC(nu=STATIC["nu_default"], probability=True, class_weight='balanced', random_state=rs)
-                    if n == "linearsvc":
-                        return LinearSVC(C=STATIC["svm_C"], max_iter=STATIC["linearsvr_max_iter"], tol=STATIC["linearsvr_tol"], dual=False)
-                    
-                    # Neighbors
                     if n == "knn":
-                        return KNeighborsClassifier(n_neighbors=STATIC["knn_k"], n_jobs=-1)
-                    
-                    # Linear
+                        return KNeighborsClassifier(
+                            n_neighbors=STATIC["knn_k"], 
+                            weights=STATIC["knn_weights"],
+                            algorithm=STATIC["knn_algorithm"],
+                            n_jobs=-1
+                        )
+                    if n == "decisiontree":
+                        return DecisionTreeClassifier(
+                            max_depth=STATIC["max_depth_tree"],
+                            min_samples_split=STATIC["min_samples_split"],
+                            min_samples_leaf=STATIC["min_samples_leaf"],
+                            class_weight='balanced',
+                            random_state=rs
+                        )
+                    if n == "extratrees":
+                        return ExtraTreesClassifier(
+                            n_estimators=STATIC["n_estimators"],
+                            max_depth=STATIC["max_depth_tree"],
+                            min_samples_leaf=STATIC["min_samples_leaf"],
+                            min_samples_split=STATIC["min_samples_split"],
+                            max_features=STATIC["max_features"],
+                            class_weight='balanced',
+                            n_jobs=-1,
+                            random_state=rs
+                        )
+                    if n == "randomforest":
+                        return RandomForestClassifier(
+                            n_estimators=STATIC["n_estimators"],
+                            max_depth=STATIC["max_depth_tree"],
+                            min_samples_split=STATIC["min_samples_split"],
+                            min_samples_leaf=STATIC["min_samples_leaf"],
+                            max_features=STATIC["max_features"],
+                            class_weight='balanced',
+                            n_jobs=-1,
+                            random_state=rs
+                        )
+                    if n == "adaboost":
+                        return AdaBoostClassifier(
+                            n_estimators=STATIC["n_estimators_boost"],
+                            learning_rate=STATIC["learning_rate"],
+                            random_state=rs
+                        )
+                    if n == "gradientboosting":
+                        return GradientBoostingClassifier(
+                            n_estimators=STATIC["n_estimators_boost"],
+                            max_depth=STATIC["max_depth_boost"],
+                            learning_rate=STATIC["learning_rate"],
+                            subsample=0.8,
+                            random_state=rs
+                        )
+                    if n == "histgradientboosting":
+                        return HistGradientBoostingClassifier(
+                            max_iter=STATIC["n_estimators_boost"],
+                            max_depth=STATIC["max_depth_boost"],
+                            learning_rate=STATIC["learning_rate"],
+                            random_state=rs
+                        )
+                    if n == "bagging":
+                        return BaggingClassifier(
+                            n_estimators=150,
+                            max_samples=0.8,
+                            max_features=0.8,
+                            n_jobs=-1,
+                            random_state=rs
+                        )
+                    if n == "svc":
+                        return SVC(
+                            C=STATIC["svm_C"],
+                            gamma=STATIC["svm_gamma"],
+                            kernel=STATIC["svm_kernel"],
+                            probability=True,
+                            class_weight='balanced',
+                            max_iter=STATIC["svm_max_iter"],
+                            random_state=rs
+                        )
+                    if n == "nusvc":
+                        return NuSVC(
+                            nu=STATIC["nu_default"],
+                            gamma=STATIC["svm_gamma"],
+                            probability=True,
+                            class_weight='balanced',
+                            max_iter=STATIC["svm_max_iter"],
+                            random_state=rs
+                        )
+                    if n == "linearsvc":
+                        return LinearSVC(
+                            C=STATIC["svm_C"],
+                            max_iter=STATIC["svm_max_iter"],
+                            dual=False,
+                            tol=1e-4,
+                            random_state=rs
+                        )
                     if n == "logistic":
-                        return LogisticRegression(max_iter=2000, n_jobs=-1, random_state=rs)
+                        return LogisticRegression(
+                            max_iter=3000,
+                            solver='lbfgs',
+                            C=1.0,
+                            n_jobs=-1,
+                            random_state=rs
+                        )
                     if n == "ridge_classifier":
-                        return RidgeClassifier(alpha=STATIC["ridge_alpha"], random_state=rs)
+                        return RidgeClassifier(
+                            alpha=STATIC["ridge_alpha"],
+                            random_state=rs
+                        )
                     if n == "sgd":
-                        return SGDClassifier(max_iter=STATIC["sgd_max_iter"], tol=1e-3, random_state=rs, n_jobs=-1)
+                        return SGDClassifier(
+                            max_iter=STATIC["sgd_max_iter"],
+                            tol=STATIC["sgd_tol"],
+                            learning_rate=STATIC["sgd_learning_rate"],
+                            alpha=STATIC["sgd_alpha"],
+                            random_state=rs
+                        )
                     if n == "passive_aggressive":
-                        return PassiveAggressiveClassifier(max_iter=1000, random_state=rs)
-                    
-                    # Naive Bayes
+                        return PassiveAggressiveClassifier(
+                            max_iter=STATIC["sgd_max_iter"],
+                            tol=STATIC["sgd_tol"],
+                            random_state=rs
+                        )
                     if n == "gaussiannb":
                         return GaussianNB()
                     if n == "bernoullinb":
                         return BernoulliNB()
-                    
-                    # Discriminant Analysis
+                    if n == "mlp":
+                        return MLPClassifier(
+                            hidden_layer_sizes=STATIC["mlp_hidden_layer_sizes"],
+                            activation=STATIC["mlp_activation"],
+                            alpha=STATIC["mlp_alpha"],
+                            learning_rate=STATIC["mlp_learning_rate"],
+                            max_iter=STATIC["mlp_max_iter"],
+                            random_state=rs
+                        )
                     if n == "lda":
                         return LinearDiscriminantAnalysis()
                     if n == "qda":
                         return QuadraticDiscriminantAnalysis()
-                    
-                    # Neural Network
-                    if n == "mlp":
-                        return MLPClassifier(hidden_layer_sizes=STATIC["mlp_hidden_layer_sizes"], max_iter=500, random_state=rs)
-                    
-                    # Gradient Boosting Libraries
-                    if n == "xgboost" and XGBOOST_AVAILABLE:
-                        return XGBClassifier(n_estimators=STATIC["meta_xgb_n_estimators"], use_label_encoder=False, eval_metric='logloss', random_state=rs)
-                    if n == "lightgbm" and LIGHTGBM_AVAILABLE:
-                        return LGBMClassifier(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=rs, verbose=-1)
-                    if n == "catboost" and CATBOOST_AVAILABLE:
-                        return CatBoostClassifier(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=rs)
-                    
-                    if n in ["xgboost", "lightgbm", "catboost"]:
-                        # Silently skip unavailable libraries - already logged at startup
-                        raise ValueError(f"Library not available: {name}")
-                    
+                    if n == "xgboost" and XGBClassifier is not None:
+                        return XGBClassifier(
+                            n_estimators=STATIC["meta_xgb_n_estimators"],
+                            max_depth=STATIC["meta_xgb_max_depth"],
+                            learning_rate=STATIC["meta_xgb_learning_rate"],
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            use_label_encoder=False,
+                            eval_metric='logloss',
+                            random_state=rs
+                        )
+                    if n == "lightgbm" and LGBMClassifier is not None:
+                        return LGBMClassifier(
+                            n_estimators=STATIC["meta_lgbm_n_estimators"],
+                            max_depth=STATIC["meta_lgbm_max_depth"],
+                            learning_rate=STATIC["meta_lgbm_learning_rate"],
+                            num_leaves=STATIC["meta_lgbm_num_leaves"],
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=rs
+                        )
+                    if n == "catboost" and CatBoostClassifier is not None:
+                        return CatBoostClassifier(
+                            iterations=STATIC["meta_cat_n_estimators"],
+                            depth=STATIC["meta_cat_depth"],
+                            learning_rate=STATIC["meta_cat_learning_rate"],
+                            verbose=0,
+                            random_state=rs
+                        )
                     raise ValueError(f"Unsupported classifier name: {name}")
                 
-                else:  # regression
-                    # Tree-based
-                    if n == "extratrees":
-                        return ExtraTreesRegressor(n_estimators=STATIC["n_estimators"], min_samples_leaf=STATIC["min_samples_leaf"], n_jobs=-1, random_state=rs)
-                    if n == "randomforest":
-                        return RandomForestRegressor(n_estimators=STATIC["n_estimators"], max_depth=STATIC["max_depth_tree"], n_jobs=-1, random_state=rs)
-                    if n == "decisiontree":
-                        return DecisionTreeRegressor(max_depth=STATIC["max_depth_tree"], random_state=rs)
-                    if n == "gradientboosting":
-                        return GradientBoostingRegressor(n_estimators=int(STATIC["n_estimators"]/2), max_depth=6, random_state=rs)
-                    if n == "histgradientboosting":
-                        return HistGradientBoostingRegressor(max_iter=200, max_depth=8, random_state=rs)
-                    
-                    # Boosting
-                    if n == "adaboost":
-                        return AdaBoostRegressor(n_estimators=STATIC["n_estimators"], random_state=rs)
-                    
-                    # Ensemble
-                    if n == "bagging":
-                        return BaggingRegressor(n_estimators=100, n_jobs=-1, random_state=rs)
-                    
-                    # Neighbors
+                else:  # Regression
                     if n == "knn":
-                        return KNeighborsRegressor(n_neighbors=STATIC["knn_k"], n_jobs=-1)
-                    
-                    # Linear
+                        return KNeighborsRegressor(
+                            n_neighbors=STATIC["knn_k"],
+                            weights=STATIC["knn_weights"],
+                            algorithm=STATIC["knn_algorithm"],
+                            n_jobs=-1
+                        )
+                    if n == "decisiontree":
+                        return DecisionTreeRegressor(
+                            max_depth=STATIC["max_depth_tree"],
+                            min_samples_split=STATIC["min_samples_split"],
+                            min_samples_leaf=STATIC["min_samples_leaf"],
+                            random_state=rs
+                        )
+                    if n == "extratrees":
+                        return ExtraTreesRegressor(
+                            n_estimators=STATIC["n_estimators"],
+                            max_depth=STATIC["max_depth_tree"],
+                            min_samples_leaf=STATIC["min_samples_leaf"],
+                            min_samples_split=STATIC["min_samples_split"],
+                            max_features=STATIC["max_features"],
+                            n_jobs=-1,
+                            random_state=rs
+                        )
+                    if n == "randomforest":
+                        return RandomForestRegressor(
+                            n_estimators=STATIC["n_estimators"],
+                            max_depth=STATIC["max_depth_tree"],
+                            min_samples_split=STATIC["min_samples_split"],
+                            min_samples_leaf=STATIC["min_samples_leaf"],
+                            max_features=STATIC["max_features"],
+                            n_jobs=-1,
+                            random_state=rs
+                        )
+                    if n == "adaboost":
+                        return AdaBoostRegressor(
+                            n_estimators=STATIC["n_estimators_boost"],
+                            learning_rate=STATIC["learning_rate"],
+                            random_state=rs
+                        )
+                    if n == "gradientboosting":
+                        return GradientBoostingRegressor(
+                            n_estimators=STATIC["n_estimators_boost"],
+                            max_depth=STATIC["max_depth_boost"],
+                            learning_rate=STATIC["learning_rate"],
+                            subsample=0.8,
+                            random_state=rs
+                        )
+                    if n == "histgradientboosting":
+                        return HistGradientBoostingRegressor(
+                            max_iter=STATIC["n_estimators_boost"],
+                            max_depth=STATIC["max_depth_boost"],
+                            learning_rate=STATIC["learning_rate"],
+                            random_state=rs
+                        )
+                    if n == "bagging":
+                        return BaggingRegressor(
+                            n_estimators=150,
+                            max_samples=0.8,
+                            max_features=0.8,
+                            n_jobs=-1,
+                            random_state=rs
+                        )
+                    if n == "svr":
+                        return SVR(
+                            C=STATIC["svm_C"],
+                            gamma=STATIC["svm_gamma"],
+                            kernel=STATIC["svm_kernel"],
+                            max_iter=STATIC["svm_max_iter"]
+                        )
+                    if n == "nusvr":
+                        return NuSVR(
+                            nu=STATIC["nu_default"],
+                            C=STATIC["svm_C"],
+                            gamma=STATIC["svm_gamma"],
+                            max_iter=STATIC["svm_max_iter"]
+                        )
+                    if n == "linearsvr":
+                        return LinearSVR(
+                            C=STATIC["svm_C"],
+                            max_iter=STATIC["svm_max_iter"],
+                            dual=False,
+                            tol=1e-4,
+                            random_state=rs
+                        )
                     if n in ("linearreg", "linear"):
                         return LinearRegression(n_jobs=-1)
                     if n == "ridge":
-                        return Ridge(alpha=STATIC["ridge_alpha"], random_state=rs)
+                        return Ridge(
+                            alpha=STATIC["ridge_alpha"],
+                            random_state=rs
+                        )
                     if n == "lasso":
-                        return Lasso(alpha=STATIC["lasso_alpha"], max_iter=2000, random_state=rs)
+                        return Lasso(
+                            alpha=STATIC["lasso_alpha"],
+                            max_iter=5000,
+                            random_state=rs
+                        )
                     if n == "elasticnet":
-                        return ElasticNet(alpha=STATIC["elasticnet_alpha"], l1_ratio=STATIC["elasticnet_l1_ratio"], max_iter=2000, random_state=rs)
-                    if n == "bayesianridge":
+                        return ElasticNet(
+                            alpha=STATIC["elasticnet_alpha"],
+                            l1_ratio=STATIC["elasticnet_l1_ratio"],
+                            max_iter=5000,
+                            random_state=rs
+                        )
+                    if n == "bayesian_ridge":
                         return BayesianRidge()
-                    if n == "huber":
-                        return HuberRegressor(epsilon=STATIC["huber_epsilon"], max_iter=200)
                     if n == "sgd":
-                        return SGDRegressor(max_iter=STATIC["sgd_max_iter"], tol=1e-3, random_state=rs)
+                        return SGDRegressor(
+                            max_iter=STATIC["sgd_max_iter"],
+                            tol=STATIC["sgd_tol"],
+                            learning_rate=STATIC["sgd_learning_rate"],
+                            alpha=STATIC["sgd_alpha"],
+                            random_state=rs
+                        )
                     if n == "passive_aggressive":
-                        return PassiveAggressiveRegressor(max_iter=1000, random_state=rs)
-                    
-                    # SVM
-                    if n == "svr":
-                        return SVR(C=STATIC["svm_C"], gamma=STATIC["svm_gamma"])
-                    if n == "nusvr":
-                        return NuSVR(nu=STATIC["nu_default"], C=STATIC["svm_C"], gamma=STATIC["svm_gamma"])
-                    if n == "linearsvr":
-                        return LinearSVR(C=STATIC["svm_C"], max_iter=STATIC["linearsvr_max_iter"], tol=STATIC["linearsvr_tol"], dual=False)
-                    
-                    # Neural Network
+                        return PassiveAggressiveRegressor(
+                            max_iter=STATIC["sgd_max_iter"],
+                            tol=STATIC["sgd_tol"],
+                            random_state=rs
+                        )
                     if n == "mlp":
-                        return MLPRegressor(hidden_layer_sizes=STATIC["mlp_hidden_layer_sizes"], max_iter=500, random_state=rs)
-                    
-                    # Gradient Boosting Libraries
-                    if n == "xgboost" and XGBOOST_AVAILABLE:
-                        return XGBRegressor(n_estimators=STATIC["meta_xgb_n_estimators"], random_state=rs)
-                    if n == "lightgbm" and LIGHTGBM_AVAILABLE:
-                        return LGBMRegressor(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=rs, verbose=-1)
-                    if n == "catboost" and CATBOOST_AVAILABLE:
-                        return CatBoostRegressor(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=rs)
-                    
-                    if n in ["xgboost", "lightgbm", "catboost"]:
-                        # Silently skip unavailable libraries - already logged at startup
-                        raise ValueError(f"Library not available: {name}")
-                    
+                        return MLPRegressor(
+                            hidden_layer_sizes=STATIC["mlp_hidden_layer_sizes"],
+                            activation=STATIC["mlp_activation"],
+                            alpha=STATIC["mlp_alpha"],
+                            learning_rate=STATIC["mlp_learning_rate"],
+                            max_iter=STATIC["mlp_max_iter"],
+                            random_state=rs
+                        )
+                    if n == "xgboost" and XGBRegressor is not None:
+                        return XGBRegressor(
+                            n_estimators=STATIC["meta_xgb_n_estimators"],
+                            max_depth=STATIC["meta_xgb_max_depth"],
+                            learning_rate=STATIC["meta_xgb_learning_rate"],
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=rs
+                        )
+                    if n == "lightgbm" and LGBMRegressor is not None:
+                        return LGBMRegressor(
+                            n_estimators=STATIC["meta_lgbm_n_estimators"],
+                            max_depth=STATIC["meta_lgbm_max_depth"],
+                            learning_rate=STATIC["meta_lgbm_learning_rate"],
+                            num_leaves=STATIC["meta_lgbm_num_leaves"],
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=rs
+                        )
+                    if n == "catboost" and CatBoostRegressor is not None:
+                        return CatBoostRegressor(
+                            iterations=STATIC["meta_cat_n_estimators"],
+                            depth=STATIC["meta_cat_depth"],
+                            learning_rate=STATIC["meta_cat_learning_rate"],
+                            verbose=0,
+                            random_state=rs
+                        )
                     raise ValueError(f"Unsupported regressor name: {name}")
       
             def make_meta_estimator(name, task):
@@ -368,28 +560,62 @@ implementation:
                 rs = args.random_state
                 
                 if n in ("", "lightgbm", "lgbm", "lgb"):
-                    if task == "classification" and LIGHTGBM_AVAILABLE:
-                        return LGBMClassifier(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=rs, verbose=-1)
-                    if task == "regression" and LIGHTGBM_AVAILABLE:
-                        return LGBMRegressor(n_estimators=STATIC["meta_lgbm_n_estimators"], random_state=rs, verbose=-1)
-                
+                    if task == "classification" and LGBMClassifier is not None:
+                        return LGBMClassifier(
+                            n_estimators=STATIC["meta_lgbm_n_estimators"],
+                            max_depth=STATIC["meta_lgbm_max_depth"],
+                            learning_rate=STATIC["meta_lgbm_learning_rate"],
+                            num_leaves=STATIC["meta_lgbm_num_leaves"],
+                            random_state=rs
+                        )
+                    if task == "regression" and LGBMRegressor is not None:
+                        return LGBMRegressor(
+                            n_estimators=STATIC["meta_lgbm_n_estimators"],
+                            max_depth=STATIC["meta_lgbm_max_depth"],
+                            learning_rate=STATIC["meta_lgbm_learning_rate"],
+                            num_leaves=STATIC["meta_lgbm_num_leaves"],
+                            random_state=rs
+                        )
                 if n in ("xgboost", "xgb"):
-                    if task == "classification" and XGBOOST_AVAILABLE:
-                        return XGBClassifier(n_estimators=STATIC["meta_xgb_n_estimators"], use_label_encoder=False, eval_metric='logloss', random_state=rs)
-                    if task == "regression" and XGBOOST_AVAILABLE:
-                        return XGBRegressor(n_estimators=STATIC["meta_xgb_n_estimators"], random_state=rs)
-                
+                    if task == "classification" and XGBClassifier is not None:
+                        return XGBClassifier(
+                            n_estimators=STATIC["meta_xgb_n_estimators"],
+                            max_depth=STATIC["meta_xgb_max_depth"],
+                            learning_rate=STATIC["meta_xgb_learning_rate"],
+                            use_label_encoder=False,
+                            eval_metric='logloss',
+                            random_state=rs
+                        )
+                    if task == "regression" and XGBRegressor is not None:
+                        return XGBRegressor(
+                            n_estimators=STATIC["meta_xgb_n_estimators"],
+                            max_depth=STATIC["meta_xgb_max_depth"],
+                            learning_rate=STATIC["meta_xgb_learning_rate"],
+                            random_state=rs
+                        )
                 if n in ("catboost", "cat"):
-                    if task == "classification" and CATBOOST_AVAILABLE:
-                        return CatBoostClassifier(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=rs)
-                    if task == "regression" and CATBOOST_AVAILABLE:
-                        return CatBoostRegressor(iterations=STATIC["meta_cat_n_estimators"], verbose=0, random_state=rs)
-                
+                    if task == "classification" and CatBoostClassifier is not None:
+                        return CatBoostClassifier(
+                            iterations=STATIC["meta_cat_n_estimators"],
+                            depth=STATIC["meta_cat_depth"],
+                            learning_rate=STATIC["meta_cat_learning_rate"],
+                            verbose=0,
+                            random_state=rs
+                        )
+                    if task == "regression" and CatBoostRegressor is not None:
+                        return CatBoostRegressor(
+                            iterations=STATIC["meta_cat_n_estimators"],
+                            depth=STATIC["meta_cat_depth"],
+                            learning_rate=STATIC["meta_cat_learning_rate"],
+                            verbose=0,
+                            random_state=rs
+                        )
                 if task == "classification":
-                    return LogisticRegression(max_iter=2000, random_state=rs)
+                    return LogisticRegression(max_iter=3000, random_state=rs)
                 else:
                     return Ridge(alpha=1.0, random_state=rs)
       
+            # Core training function that reuses your ensemble logic for a single 1d target
             def train_single_target(X, y_series, target_name):
                 print(f"[INFO] Training target: {target_name} (n_samples={len(y_series)})")
                 trained_object = None
@@ -397,7 +623,7 @@ implementation:
                 trained_base_info = []
                 model_to_train = None
       
-                if ensemble_type not in ("stacking", "voting"):
+                if ensemble_type not in ("stacking","voting"):
                     if selected_model_names:
                         model_to_train = selected_model_names[0]
                     else:
@@ -430,10 +656,8 @@ implementation:
                             estimators.append((f"{nm}_{i}", est))
                         except Exception as e:
                             print(f"[WARN] Skipping model {nm}: {e}")
-                    
                     if not estimators:
                         raise ValueError("No valid base estimators available for ensemble after filtering.")
-                    
                     min_class_count = None
                     if task == "classification":
                         try:
@@ -443,28 +667,28 @@ implementation:
                         except Exception as e:
                             print(f"[WARN] Could not compute class counts: {e}")
                             min_class_count = None
-                    
                     filtered_estimators = []
                     for name, est in estimators:
                         nm = name.split("_")[0]
                         if nm == "nusvc" and (min_class_count is not None and min_class_count < 2):
                             print(f"[WARN] Skipping {name} because min_class_count={min_class_count} makes NuSVC infeasible")
                             continue
-                        if nm in ("svc", "linearsvc") and (min_class_count is not None and min_class_count < 1):
+                        if nm in ("svc","linearsvc") and (min_class_count is not None and min_class_count < 1):
                             print(f"[WARN] Skipping {name} because data too small for SVM")
                             continue
                         filtered_estimators.append((name, est))
       
                     if not filtered_estimators:
                         raise ValueError("All base estimators were filtered out due to data constraints")
-                    
                     safe_estimators = []
                     for name, est in filtered_estimators:
                         nm = name.split("_")[0]
-                        if nm in ("svc", "nusvc", "linearsvc", "svr", "nusvr", "linearsvr") and STATIC["TRIAL_FIT_SVM"]:
+                        if nm in ("svc","nusvc","linearsvc","svr","nusvr","linearsvr") and STATIC["TRIAL_FIT_SVM"]:
                             try:
                                 print(f"[INFO] Trial-fitting fragile estimator {name} to check feasibility...")
-                                est.fit(X, y_series)
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore")
+                                    est.fit(X, y_series)
                                 safe_estimators.append((name, est))
                             except Exception as e:
                                 print(f"[WARN] Trial-fit failed for {name}: {e}. Skipping this estimator.")
@@ -473,11 +697,12 @@ implementation:
       
                     if not safe_estimators:
                         raise ValueError("No base estimators passed trial-fit. Reduce model list or check data.")
-                    
                     if len(safe_estimators) == 1:
                         name0, est0 = safe_estimators[0]
                         print(f"[INFO] Only one valid estimator ({name0}) -> training single model")
-                        est0.fit(X, y_series)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            est0.fit(X, y_series)
                         trained_estimators = [(name0, est0)]
                         trained_object = est0
                     else:
@@ -486,23 +711,31 @@ implementation:
                                 if task == "classification":
                                     try:
                                         vote = VotingClassifier(estimators=safe_estimators, voting="soft", n_jobs=-1)
-                                        vote.fit(X, y_series)
+                                        with warnings.catch_warnings():
+                                            warnings.simplefilter("ignore")
+                                            vote.fit(X, y_series)
                                     except Exception:
                                         vote = VotingClassifier(estimators=safe_estimators, voting="hard", n_jobs=-1)
-                                        vote.fit(X, y_series)
+                                        with warnings.catch_warnings():
+                                            warnings.simplefilter("ignore")
+                                            vote.fit(X, y_series)
                                     trained_object = vote
-                                    trained_base_info = [nm for nm, _ in safe_estimators]
+                                    trained_base_info = [nm for nm,_ in safe_estimators]
                                 else:
                                     vote = VotingRegressor(estimators=safe_estimators, n_jobs=-1)
-                                    vote.fit(X, y_series)
+                                    with warnings.catch_warnings():
+                                        warnings.simplefilter("ignore")
+                                        vote.fit(X, y_series)
                                     trained_object = vote
-                                    trained_base_info = [nm for nm, _ in safe_estimators]
+                                    trained_base_info = [nm for nm,_ in safe_estimators]
                             except Exception as e:
                                 print(f"[WARN] Voting ensemble failed: {e}. Training base estimators individually as fallback.")
                                 trained_estimators = []
                                 for nm, est in safe_estimators:
                                     try:
-                                        est.fit(X, y_series)
+                                        with warnings.catch_warnings():
+                                            warnings.simplefilter("ignore")
+                                            est.fit(X, y_series)
                                         trained_estimators.append((nm, est))
                                     except Exception as e2:
                                         print(f"[WARN] Base estimator {nm} failed in fallback fit: {e2}")
@@ -514,35 +747,54 @@ implementation:
                                     stack = StackingClassifier(estimators=safe_estimators, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
                                 else:
                                     stack = StackingRegressor(estimators=safe_estimators, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
-                                stack.fit(X, y_series)
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore")
+                                    stack.fit(X, y_series)
                                 trained_object = stack
-                                trained_base_info = [nm for nm, _ in safe_estimators]
+                                trained_base_info = [nm for nm,_ in safe_estimators]
                             except Exception as e:
                                 print(f"[WARN] Initial stacking.fit failed: {e}. Attempting to identify and remove failing base estimators and retry once.")
                                 surviving = []
                                 for nm, est in safe_estimators:
                                     try:
                                         print(f"[INFO] Trial-fitting estimator {nm} separately...")
-                                        est.fit(X, y_series)
+                                        with warnings.catch_warnings():
+                                            warnings.simplefilter("ignore")
+                                            est.fit(X, y_series)
                                         surviving.append((nm, est))
                                     except Exception as e2:
                                         print(f"[WARN] Estimator {nm} failed trial-fit: {e2}. Removing it from ensemble.")
-                                
                                 if len(surviving) >= 2:
                                     try:
                                         if task == "classification":
                                             stack2 = StackingClassifier(estimators=surviving, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
                                         else:
                                             stack2 = StackingRegressor(estimators=surviving, final_estimator=final_est, n_jobs=-1, passthrough=False, cv=stacking_cv)
-                                        stack2.fit(X, y_series)
+                                        with warnings.catch_warnings():
+                                            warnings.simplefilter("ignore")
+                                            stack2.fit(X, y_series)
                                         trained_object = stack2
-                                        trained_base_info = [nm for nm, _ in surviving]
+                                        trained_base_info = [nm for nm,_ in surviving]
                                     except Exception as e3:
                                         print(f"[WARN] Retry stacking.fit also failed: {e3}. Falling back to training base estimators individually.")
                                         trained_estimators = []
+                                        for nm, est in surviving:
+                                            try:
+                                                with warnings.catch_warnings():
+                                                    warnings.simplefilter("ignore")
+                                                    est.fit(X, y_series)
+                                                trained_estimators.append((nm, est))
+                                            except Exception as e4:
+                                                print(f"[WARN] Base estimator {nm} failed in fallback fit: {e4}")
+                                        trained_object = None
+                                else:
+                                    print("[WARN] Not enough surviving base estimators for stacking after filtering. Training surviving estimators individually or single model fallback.")
+                                    trained_estimators = []
                                     for nm, est in surviving:
                                         try:
-                                            est.fit(X, y_series)
+                                            with warnings.catch_warnings():
+                                                warnings.simplefilter("ignore")
+                                                est.fit(X, y_series)
                                             trained_estimators.append((nm, est))
                                         except Exception as e5:
                                             print(f"[WARN] Base estimator {nm} failed in fallback fit: {e5}")
@@ -551,16 +803,8 @@ implementation:
                                     else:
                                         trained_object = None
       
-                metrics = {
-                    "task": task, 
-                    "samples": int(len(y_series)), 
-                    "features": int(X.shape[1]), 
-                    "ensemble_type": ensemble_type, 
-                    "models_used": selected_model_names or [model_to_train], 
-                    "stacking_cv": stacking_cv, 
-                    "target": str(target_name)
-                }
-                
+                # compute predictions & metrics for this single target
+                metrics = {"task": task, "samples": int(len(y_series)), "features": int(X.shape[1]), "ensemble_type": ensemble_type, "models_used": selected_model_names or [model_to_train], "stacking_cv": stacking_cv, "target": str(target_name)}
                 try:
                     predictor = trained_object if trained_object is not None else (None if not trained_estimators else None)
                     if predictor is not None:
@@ -580,7 +824,6 @@ implementation:
                                 y_pred = stats.mode(preds, axis=0).mode[0].ravel()
                         else:
                             raise ValueError("No predictor available to compute metrics.")
-                    
                     if task == "classification":
                         metrics.update({
                             "accuracy_train": float(accuracy_score(y_series, y_pred)),
@@ -596,7 +839,7 @@ implementation:
                         })
                 except Exception as e:
                     print(f"[WARN] Could not compute metrics for target {target_name}: {e}")
-                
+                # decide object to save for this target
                 save_obj = None
                 if trained_object is not None:
                     save_obj = trained_object
@@ -607,14 +850,16 @@ implementation:
       
                 return save_obj, metrics, trained_base_info
       
+            # Main multi/single target driver
             multi_output = (y_df.shape[1] > 1)
             models_saved = {}
             metrics_out = {}
             base_info_map = {}
       
             if not multi_output:
+                # single-target: use existing logic by calling train_single_target once
                 col = y_df.columns[0]
-                save_obj, met, info = train_single_target(X, y_df.iloc[:, 0], col)
+                save_obj, met, info = train_single_target(X, y_df.iloc[:,0], col)
                 models_saved[col] = save_obj
                 metrics_out[col] = met
                 base_info_map[col] = info
@@ -626,10 +871,13 @@ implementation:
                     metrics_out[col] = met
                     base_info_map[col] = info
       
+            # Save the models (one dict for all targets)
             ensure_dir_for(args.model_pickle)
             joblib.dump(models_saved, args.model_pickle)
       
+            # Build aggregated metrics
             aggregate = {"n_targets": len(metrics_out), "samples": int(len(X))}
+            # compute mean of numeric metrics across targets
             numeric_keys = {}
             for t, m in metrics_out.items():
                 for k, v in m.items():
@@ -648,29 +896,21 @@ implementation:
             model_config = {
                 "ensemble_type": ensemble_type,
                 "models_selected": selected_model_names,
-                "meta_model_name": meta_name or ("lightgbm" if LIGHTGBM_AVAILABLE else ("xgboost" if XGBOOST_AVAILABLE else "fallback")),
+                "meta_model_name": meta_name or ("lightgbm" if (LGBMClassifier or LGBMRegressor) else ("xgboost" if (XGBClassifier or XGBRegressor) else "fallback")),
                 "static_defaults": STATIC,
                 "stacking_cv": stacking_cv,
                 "random_state": int(args.random_state),
                 "multi_output": multi_output,
-                "targets": list(y_df.columns),
-                "libraries_available": {
-                    "lightgbm": LIGHTGBM_AVAILABLE,
-                    "xgboost": XGBOOST_AVAILABLE,
-                    "catboost": CATBOOST_AVAILABLE
-                }
+                "targets": list(y_df.columns)
             }
             ensure_dir_for(args.model_config)
             with open(args.model_config, "w", encoding="utf-8") as fh:
                 json.dump(model_config, fh, indent=2, ensure_ascii=False)
       
-            print("=" * 80)
+            print("="*80)
             print("SUCCESS: Training finished")
-            print(json.dumps({
-                "per_target_metrics_sample": {k: metrics_out[k] for k in list(metrics_out.keys())[:3]}, 
-                "aggregate": aggregate
-            }, indent=2))
-            print("=" * 80)
+            print(json.dumps({"per_target_metrics_sample": {k: metrics_out[k] for k in list(metrics_out.keys())[:3]}, "aggregate": aggregate}, indent=2))
+            print("="*80)
       
         except Exception as e:
             print("ERROR DURING TRAINING:", e, file=sys.stderr)
@@ -700,5 +940,4 @@ implementation:
       - --metrics_json
       - {outputPath: metrics_json}
       - --model_config
-      - {outputPath: model_config} []
-                                    trained_estimators =
+      - {outputPath: model_config}
