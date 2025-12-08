@@ -1,4 +1,4 @@
-name: Evaluate Model v10
+name: Evaluate Model v11
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -215,7 +215,11 @@ implementation:
 
             y_df = read_with_pandas(y_path)
 
-            # Extract target column (for single-target eval)
+            # Extract target column and define variables y, y_raw, y_multi_df
+            y_raw = None
+            y_multi_df = None
+            y = None
+            
             if isinstance(y_df, pd.DataFrame):
                 if target_col:
                     # Check if target_col is comma-separated list of columns
@@ -226,21 +230,36 @@ implementation:
                         if missing:
                             raise ValueError(f"Target columns {missing} not in y_test. Available columns: {list(y_df.columns)}")
                         # Extract only the specified columns
-                        y_raw = None  # Signal multi-target path
-                        y_df = y_df[target_cols].copy()  # Keep only requested targets
+                        y_multi_df = y_df[target_cols].copy()
+                        y = y_multi_df  # y is DataFrame with multiple targets
+                        print(f"[INFO] Multi-target mode: {len(target_cols)} targets: {target_cols}")
                     elif target_col not in y_df.columns:
                         raise ValueError(f"--target_column '{target_col}' not in y_test. Available columns: {list(y_df.columns)}")
                     else:
+                        # Single target specified
                         y_raw = y_df[target_col].copy()
+                        y = y_raw  # y is Series
+                        print(f"[INFO] Single-target mode: {target_col}")
                 elif y_df.shape[1] == 1:
+                    # Single column DataFrame
                     y_raw = y_df.iloc[:, 0].copy()
+                    y = y_raw  # y is Series
+                    print(f"[INFO] Single-target mode (auto-detected): {y_df.columns[0]}")
                 else:
-                    # keep full dataframe; multi-target evaluation will be handled later
-                    y_raw = None
+                    # Multi-column DataFrame, no target_col specified -> use all
+                    y_multi_df = y_df.copy()
+                    y = y_multi_df  # y is DataFrame
+                    print(f"[INFO] Multi-target mode (all columns): {list(y_df.columns)}")
             else:
+                # y_df is a Series
                 y_raw = pd.Series(y_df).copy()
+                y = y_raw  # y is Series
+                print(f"[INFO] Single-target mode (Series input)")
 
-            if y_raw is not None and len(y_raw) == 0:
+            # Store original y for output
+            y_original = y.copy() if y is not None else None
+
+            if y is not None and len(y) == 0:
                 raise ValueError("y_test has 0 rows. Check the input file.")
 
             # Load metadata and label mapping
@@ -284,22 +303,23 @@ implementation:
                 print(f"[WARN] Could not get target column from preprocessor: {e}")
                 print(f"[WARN] Using: {target_col_name}")
 
-            # If y_raw is None (multi-target input), try to attach one column if user specified target_col; else
+            # Reconstruct test_full for preprocessing
             test_full = X_raw.copy()
             if y_raw is not None:
+                # Single target case
                 test_full[target_col_name] = y_raw.values
+                print(f"[INFO] Added single target column '{target_col_name}' to test_full")
             else:
-                # For multi-target y_df (DataFrame with many columns), we won't add a single target column.
-                # Many preprocessors expect target column to exist; if preprocessor requires it and fails, user should pass single-target y.
-                print("[INFO] y_test appears multi-column; adding no single target column to test_full (preprocessor must handle this).")
+                # Multi-target case: don't add target columns
+                print("[INFO] Multi-target mode: not adding target columns to test_full (preprocessor must handle this)")
+            
             print(f"[INFO] X_raw shape: {X_raw.shape}")
             print(f"[INFO] Reconstructed test_full shape: {test_full.shape}")
             print("="*80)
 
             print("[INFO] Applying preprocessor to reconstructed test data...")
-            print("[INFO] Note: Target column added temporarily for structural consistency if present")
-
-            # Try both flavors for pre.transform -- some preprocessors accept transform(X), others transform(df, training_mode=...)
+            
+            # Try both flavors for pre.transform
             Xp_full = None
             try:
                 Xp_full = pre.transform(test_full, training_mode=False)
@@ -312,7 +332,8 @@ implementation:
                 raise RuntimeError(f"Preprocessor.transform failed: {e}")
 
             print(f"[INFO] X after preprocessing: {getattr(Xp_full, 'shape', None)}")
-            # If pre.transform returned array-like, convert to DataFrame with same columns if available
+            
+            # Convert to DataFrame if needed
             if isinstance(Xp_full, (pd.DataFrame, pd.Series)):
                 Xp_df = Xp_full.copy()
             else:
@@ -327,11 +348,12 @@ implementation:
 
             print(f"[INFO] Columns after preprocessing: {list(Xp_df.columns)[:20]} (total {len(Xp_df.columns)})")
 
+            # Remove target column if present
             if target_col_name in Xp_df.columns:
                 print(f"[INFO] Removing target column '{target_col_name}' from processed features")
                 Xp = Xp_df.drop(columns=[target_col_name])
             else:
-                print(f"[INFO] Target column not present in processed features (or multi-target scenario)")
+                print(f"[INFO] Target column not present in processed features")
                 Xp = Xp_df
 
             print(f"[INFO] Final Xp shape: {Xp.shape}")
@@ -358,19 +380,16 @@ implementation:
                 Xs = Xp
                 print("[INFO] No feature selection applied")
 
-            # -------------------------
-            # Apply PCA if provided (after preprocessing and feature selection)
-            # -------------------------
+            # Apply PCA if provided
             if pca_path and os.path.exists(pca_path):
-                print("[INFO] PCA provided — attempting to load and apply PCA transform")
+                print("[INFO] PCA provided — loading and applying PCA transform")
                 try:
                     pca_obj = load_pickle_any(pca_path)
             
-                    # If the loaded object is a Pipeline, try to get the last transformer
+                    # If the loaded object is a Pipeline, get the last transformer
                     try:
                         from sklearn.pipeline import Pipeline
                         if isinstance(pca_obj, Pipeline):
-                            # use the last step that has transform
                             for nm, step in reversed(pca_obj.steps):
                                 if hasattr(step, "transform"):
                                     pca_transformer = step
@@ -385,16 +404,16 @@ implementation:
                     if not hasattr(pca_transformer, "transform"):
                         print("[WARN] PCA object does not have a transform() method — skipping PCA")
                     else:
-                        # ensure numpy array for transform
+                        # Ensure numpy array for transform
                         Xs_arr = Xs.values if isinstance(Xs, (pd.DataFrame, pd.Series)) else np.asarray(Xs)
                         Xs_pca = pca_transformer.transform(Xs_arr)
             
-                        # fix shape if 1D
+                        # Fix shape if 1D
                         if Xs_pca.ndim == 1:
                             Xs_pca = Xs_pca.reshape(-1, 1)
                         ncomp = Xs_pca.shape[1]
             
-                        # FIXED: Consistently use PC1-based naming (1-indexed) to match training
+                        # Use consistent PC1-based naming (1-indexed) to match training
                         pca_cols = [f"PC{i+1}" for i in range(ncomp)]
                         
                         print(f"[INFO] Generated PCA column names: {pca_cols[:5]}{'...' if len(pca_cols) > 5 else ''}")
@@ -404,16 +423,13 @@ implementation:
                         print(f"[INFO] PCA applied. New X shape: {Xs.shape}. PCA columns: {list(Xs.columns)[:10]}{'...' if len(Xs.columns)>10 else ''}")
                 except Exception as e:
                     print(f"[WARN] Failed to apply PCA: {e}. Continuing without PCA")
-                    import traceback
                     traceback.print_exc()
             else:
                 print("[INFO] No PCA provided or file not found; skipping PCA")
 
-            # -------------------------
             # Robust multi-target prediction & metrics
-            # -------------------------
             print("="*80)
-            print("MAKING PREDICTIONS (robust multi-target aware)")
+            print("MAKING PREDICTIONS")
             print("="*80)
 
             def aggregate_preds_list(preds_stack, task):
@@ -422,7 +438,6 @@ implementation:
                     return np.mean(arr, axis=0)
                 else:
                     mode_res = stats.mode(arr, axis=0, keepdims=False)
-                    # stats.mode result differs across scipy versions: handle both patterns
                     if hasattr(mode_res, "mode"):
                         return mode_res.mode
                     return mode_res[0]
@@ -448,56 +463,61 @@ implementation:
             preds_df = None
             ytrue_df = None
 
-            # If we have multi-target truth DataFrame (y_multi_df), we will use it for per-target metrics when possible
-            multi_truth_df = None
-            if 'y_multi_df' in locals():
-                multi_truth_df = y_multi_df
-
             if is_model_dict:
-                # model saved as dict {target_name: estimator_or_dict}
+                # Model saved as dict {target_name: estimator_or_dict}
                 target_names = list(models_loaded.keys())
                 print(f"[INFO] Loaded model is a dict with targets: {target_names}")
                 all_preds = {}
                 all_ytrue_cols = {}
+                
                 for tgt in target_names:
                     print(f"[INFO] Predicting target: {tgt}")
                     obj = models_loaded[tgt]
                     yhat = predict_for_obj(obj, Xs, task)
                     all_preds[tgt] = yhat
-                    # determine ground truth column for tgt
-                    if multi_truth_df is not None and tgt in multi_truth_df.columns:
-                        all_ytrue_cols[tgt] = multi_truth_df[tgt].values
+                    
+                    # Determine ground truth column for tgt
+                    if y_multi_df is not None and tgt in y_multi_df.columns:
+                        all_ytrue_cols[tgt] = y_multi_df[tgt].values
                     elif isinstance(y, pd.Series):
                         all_ytrue_cols[tgt] = y.values
+                    elif isinstance(y, pd.DataFrame) and tgt in y.columns:
+                        all_ytrue_cols[tgt] = y[tgt].values
                     else:
-                        # unknown mapping; fill NaNs
+                        print(f"[WARN] No ground truth found for target {tgt}")
                         all_ytrue_cols[tgt] = np.full(len(yhat), np.nan)
+                
                 preds_df = pd.DataFrame({f"y_pred_{t}": all_preds[t] for t in target_names})
                 ytrue_df = pd.DataFrame({f"y_true_{t}": all_ytrue_cols[t] for t in target_names})
+                
             else:
-                # single model object
+                # Single model object
                 print(f"[INFO] Loaded model object type: {type(models_loaded)}")
                 try:
                     raw_pred = models_loaded.predict(Xs)
                 except Exception as e:
                     raise RuntimeError(f"Model.predict failed: {e}")
+                    
                 raw_pred = np.asarray(raw_pred)
+                
                 if raw_pred.ndim == 1:
+                    # Single output
                     preds_df = pd.DataFrame({"y_pred": raw_pred})
-                    if isinstance(y, pd.Series) or isinstance(y, pd.DataFrame):
-                        if isinstance(y, pd.Series):
-                            ytrue_df = pd.DataFrame({"y_true": y.values})
+                    if isinstance(y, pd.Series):
+                        ytrue_df = pd.DataFrame({"y_true": y.values})
+                    elif isinstance(y, pd.DataFrame):
+                        if y.shape[1] == 1:
+                            ytrue_df = pd.DataFrame({"y_true": y.iloc[:,0].values})
                         else:
-                            # if y is df with single col
-                            if y.shape[1] == 1:
-                                ytrue_df = pd.DataFrame({"y_true": y.iloc[:,0].values})
-                            else:
-                                raise ValueError("Model produced single output but y_test has multiple columns; provide --target_column")
+                            raise ValueError("Model produced single output but y_test has multiple columns")
                     else:
                         ytrue_df = pd.DataFrame({"y_true": np.full(len(raw_pred), np.nan)})
+                        
                 elif raw_pred.ndim == 2:
+                    # Multiple outputs
                     n_targets = raw_pred.shape[1]
-                    # try to get names
+                    
+                    # Try to get target names
                     try:
                         tgt_names = getattr(models_loaded, "target_names", None) or getattr(models_loaded, "targets", None)
                         if tgt_names and len(tgt_names) == n_targets:
@@ -506,10 +526,14 @@ implementation:
                             col_names = [f"target_{i}" for i in range(n_targets)]
                     except Exception:
                         col_names = [f"target_{i}" for i in range(n_targets)]
+                    
                     preds_df = pd.DataFrame({f"y_pred_{col_names[i]}": raw_pred[:, i] for i in range(n_targets)})
-                    # Map y_true if possible
-                    if multi_truth_df is not None and multi_truth_df.shape[1] == n_targets:
-                        ytrue_df = pd.DataFrame({f"y_true_{col_names[i]}": multi_truth_df.iloc[:, i].values for i in range(n_targets)})
+                    
+                    # Map y_true
+                    if y_multi_df is not None and y_multi_df.shape[1] == n_targets:
+                        ytrue_df = pd.DataFrame({f"y_true_{col_names[i]}": y_multi_df.iloc[:, i].values for i in range(n_targets)})
+                    elif isinstance(y, pd.DataFrame) and y.shape[1] == n_targets:
+                        ytrue_df = pd.DataFrame({f"y_true_{col_names[i]}": y.iloc[:, i].values for i in range(n_targets)})
                     elif isinstance(y, pd.Series) and n_targets == 1:
                         ytrue_df = pd.DataFrame({f"y_true_{col_names[0]}": y.values})
                     else:
@@ -531,12 +555,13 @@ implementation:
                 tname = pcol.replace("y_pred_", "")
                 ypred_vals = preds_df[pcol].values
                 ytrue_col = f"y_true_{tname}"
+                
                 if ytrue_col not in ytrue_df.columns:
-                    # fallback: if single y_true column exists
+                    # Fallback: if single y_true column exists
                     if "y_true" in ytrue_df.columns and preds_df.shape[1] == 1:
                         ytrue_vals = ytrue_df["y_true"].values
                     else:
-                        print(f"[WARN] No ground truth column for prediction {pcol} — skipping metrics for this target")
+                        print(f"[WARN] No ground truth column for prediction {pcol} — skipping metrics")
                         continue
                 else:
                     ytrue_vals = ytrue_df[ytrue_col].values
@@ -545,7 +570,7 @@ implementation:
                     ytrue_num = pd.to_numeric(ytrue_vals, errors="coerce")
                     valid_mask = ~np.isnan(ytrue_num)
                     if not valid_mask.all():
-                        print(f"[WARN] Dropping {np.sum(~valid_mask)} rows with NaN y_true for target {tname}")
+                        print(f"[WARN] Dropping {np.sum(~valid_mask)} rows with NaN y_true for {tname}")
                     if valid_mask.sum() == 0:
                         print(f"[WARN] No valid ground truth for {tname}; skipping")
                         continue
@@ -554,14 +579,21 @@ implementation:
                     mse_val = float(mean_squared_error(ytrue_f, ypred_f))
                     rmse_val = float(np.sqrt(mse_val))
                     r2_val = float(r2_score(ytrue_f, ypred_f))
-                    per_target_metrics[tname] = {"rmse": round(rmse_val,6), "mse": round(mse_val,6), "r2": round(r2_val,6)}
+                    mae_val = float(mean_absolute_error(ytrue_f, ypred_f))
+                    per_target_metrics[tname] = {
+                        "rmse": round(rmse_val, 6),
+                        "mse": round(mse_val, 6),
+                        "mae": round(mae_val, 6),
+                        "r2": round(r2_val, 6)
+                    }
                     agg_numeric.setdefault("rmse", []).append(rmse_val)
                     agg_numeric.setdefault("mse", []).append(mse_val)
+                    agg_numeric.setdefault("mae", []).append(mae_val)
                     agg_numeric.setdefault("r2", []).append(r2_val)
                 else:
                     ytrue_c = ytrue_vals
                     ypred_c = ypred_vals
-                    # try to align types
+                    # Try to align types
                     try:
                         if pd.api.types.is_numeric_dtype(pd.Series(ytrue_c)) and not pd.api.types.is_numeric_dtype(pd.Series(ypred_c)):
                             ypred_c = pd.Series(ypred_c).astype(pd.Series(ytrue_c).dtype).values
@@ -581,24 +613,30 @@ implementation:
                     precision_w = float(precision_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
                     recall_w = float(recall_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
                     f1_w = float(f1_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
-                    per_target_metrics[tname] = {"accuracy": round(acc,6), "precision": round(precision_w,6), "recall": round(recall_w,6), "f1": round(f1_w,6)}
+                    per_target_metrics[tname] = {
+                        "accuracy": round(acc, 6),
+                        "precision": round(precision_w, 6),
+                        "recall": round(recall_w, 6),
+                        "f1": round(f1_w, 6)
+                    }
                     agg_numeric.setdefault("accuracy", []).append(acc)
                     agg_numeric.setdefault("precision", []).append(precision_w)
                     agg_numeric.setdefault("recall", []).append(recall_w)
                     agg_numeric.setdefault("f1", []).append(f1_w)
                     if loss_val is not None:
                         try:
-                            per_target_metrics[tname]["loss"] = float(round(loss_val,6))
+                            per_target_metrics[tname]["loss"] = float(round(loss_val, 6))
                         except Exception:
                             pass
 
-            # Build minimal_metrics: include per-target metrics and aggregates
+            # Build minimal_metrics
             minimal_metrics["per_target"] = per_target_metrics
-            # aggregates
+            
+            # Aggregates
             aggregates = {}
             for k, vals in agg_numeric.items():
                 try:
-                    aggregates[f"{k}_mean"] = round(float(np.mean(vals)),6)
+                    aggregates[f"{k}_mean"] = round(float(np.mean(vals)), 6)
                 except Exception:
                     pass
             minimal_metrics["aggregate"] = aggregates
@@ -609,22 +647,15 @@ implementation:
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(minimal_metrics, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] Metrics saved successfully: keys = {list(minimal_metrics.keys())}")
+            print(f"[INFO] Metrics saved successfully")
 
             # Prepare predictions output table
             print(f"[INFO] Saving predictions to: {preds_path}")
             ensure_dir_for(preds_path)
 
-            # merge ytrue_df and preds_df side-by-side (columns may overlap names)
+            # Merge ytrue_df and preds_df side-by-side
             out_df = pd.concat([ytrue_df.reset_index(drop=True), preds_df.reset_index(drop=True)], axis=1)
-            # also include original y if available (single-target case)
-            if isinstance(y_original, (pd.Series, pd.DataFrame)):
-                try:
-                    out_df["y_true_original"] = (y_original.reset_index(drop=True) if isinstance(y_original, pd.Series) else json.dumps(y_original.iloc[0].to_dict()))
-                except Exception:
-                    # best-effort: skip if mismatch
-                    pass
-
+            
             out_df.to_parquet(preds_path, index=False)
             print(f"[INFO] Predictions saved successfully")
             print(f"[INFO] Predictions dataframe shape: {out_df.shape}")
