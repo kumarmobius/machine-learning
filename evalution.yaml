@@ -1,4 +1,4 @@
-name: Evaluate Model v9
+name: Evaluate Model v10
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -394,72 +394,18 @@ implementation:
                             Xs_pca = Xs_pca.reshape(-1, 1)
                         ncomp = Xs_pca.shape[1]
             
-                        # Try to recover original PCA output / component names (many libraries store them differently)
-                        pca_cols = None
-                        # 1) common sklearn APIs
-                        try:
-                            # get_feature_names_out may be a method (callable) or attribute
-                            get_names = getattr(pca_transformer, "get_feature_names_out", None)
-                            if callable(get_names):
-                                out_names = list(get_names())
-                                if len(out_names) == ncomp:
-                                    pca_cols = out_names
-                            elif hasattr(pca_transformer, "feature_names_out_"):
-                                out_names = list(getattr(pca_transformer, "feature_names_out_"))
-                                if len(out_names) == ncomp:
-                                    pca_cols = out_names
-                        except Exception:
-                            pass
-            
-                        # 2) some custom savers/store custom attr names
-                        if pca_cols is None:
-                            for attr in ("pca_feature_names", "component_names_", "columns_", "feature_names_"):
-                                try:
-                                    val = getattr(pca_transformer, attr, None)
-                                    if val is not None:
-                                        cand = list(val)
-                                        if len(cand) == ncomp:
-                                            pca_cols = cand
-                                            break
-                                except Exception:
-                                    continue
-            
-                        # 3) if transformer exposes n_components_ but not names, adopt "PC1..PCn" (1-based) — matches your trained names
-                        if pca_cols is None:
-                            try:
-                                if hasattr(pca_transformer, "n_components_"):
-                                    n_components_ = int(getattr(pca_transformer, "n_components_"))
-                                    # prefer 'PC1' naming if that matches training naming in your logs
-                                    pca_cols = [f"PC{i+1}" for i in range(min(n_components_, ncomp))]
-                                    if len(pca_cols) != ncomp:
-                                        # if counts differ, regenerate with exact ncomp
-                                        pca_cols = [f"PC{i+1}" for i in range(ncomp)]
-                                else:
-                                    # default fallback naming that many pipelines produce
-                                    pca_cols = [f"PC{i+1}" for i in range(ncomp)]
-                            except Exception:
-                                pca_cols = None
-            
-                        # 4) final fallback to pca_*
-                        if pca_cols is None:
-                            pca_cols = [f"pca_{i}" for i in range(ncomp)]
-                            print("[WARN] Could not infer PCA output names from object; falling back to 'pca_i' names")
-            
-                        # If we have a mismatch in length, force a safe naming of exact ncomp
-                        if len(pca_cols) != ncomp:
-                            print(f"[WARN] Inferred PCA column count {len(pca_cols)} != actual {ncomp}; regenerating names for exact count")
-                            # try to keep existing prefix if any (e.g., 'PC' vs 'pca_')
-                            prefix = "PC" if any(str(name).upper().startswith("PC") for name in pca_cols) else "pca_"
-                            if prefix == "PC":
-                                pca_cols = [f"PC{i+1}" for i in range(ncomp)]
-                            else:
-                                pca_cols = [f"pca_{i}" for i in range(ncomp)]
+                        # FIXED: Consistently use PC1-based naming (1-indexed) to match training
+                        pca_cols = [f"PC{i+1}" for i in range(ncomp)]
+                        
+                        print(f"[INFO] Generated PCA column names: {pca_cols[:5]}{'...' if len(pca_cols) > 5 else ''}")
             
                         # Apply names to DataFrame
                         Xs = pd.DataFrame(Xs_pca, columns=list(pca_cols))
                         print(f"[INFO] PCA applied. New X shape: {Xs.shape}. PCA columns: {list(Xs.columns)[:10]}{'...' if len(Xs.columns)>10 else ''}")
                 except Exception as e:
                     print(f"[WARN] Failed to apply PCA: {e}. Continuing without PCA")
+                    import traceback
+                    traceback.print_exc()
             else:
                 print("[INFO] No PCA provided or file not found; skipping PCA")
 
