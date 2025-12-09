@@ -1,22 +1,15 @@
-name: Data loader + artifacts from CDN v1
+name: Artifacts downloader from CDN v1
 inputs:
-  - {name: cdn_url, type: String, description: 'CDN URL to download dataset file (CSV, JSON, or Parquet)'}
-  - {name: split_size, type: Integer, default: "15", description: 'Test split size as percent (default 15) or fraction (0.2)'}
-  - {name: target_column, type: String, description: 'Name of target column or comma-separated list of target columns (e.g. "c1,c2,c3")'}
-  - {name: model_type, type: String, default: "classification", description: 'Type of model (classification or regression)'}
-  - {name: preprocessor_cdn, type: String, description: 'CDN URL to download preprocessor artifact (optional)', optional: true, default: ""}
-  - {name: feature_selector_cdn, type: String, description: 'CDN URL to download feature selector artifact (optional)', optional: true, default: ""}
-  - {name: pca_cdn, type: String, description: 'CDN URL to download PCA artifact (optional)', optional: true, default: ""}
-  - {name: model_pickle_cdn, type: String, description: 'CDN URL to download model pickle/joblib artifact (optional)', optional: true, default: ""}
-  - {name: bearer_token, type: String, description: 'Optional path to file holding bearer token for authenticated downloads', optional: true, default: ""}
+  - {name: preprocessor_cdn, type: String, description: "CDN URL to download preprocessor artifact (cloudpickle/joblib). Optional", optional: true, default: ""}
+  - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact (optional).", optional: true, default: ""}
+  - {name: pca_cdn, type: String, description: "CDN URL to download PCA artifact (optional).", optional: true, default: ""}
+  - {name: model_pickle_cdn, type: String, description: "CDN URL to download model pickle/joblib artifact (optional).", optional: true, default: ""}
+  - {name: bearer_token, type: string, description: "Optional path to file containing bearer token for authenticated downloads", optional: true, default: ""}
 outputs:
-  - {name: train_set, type: Dataset}
-  - {name: test_x, type: Dataset}
-  - {name: test_y, type: Dataset}
-  - {name: preprocessor_local, type: String, description: "Local path (file or directory) where preprocessor artifact was saved. Null if not provided."}
-  - {name: feature_selector_local, type: String, description: "Local path for feature selector artifact or null."}
-  - {name: pca_local, type: String, description: "Local path for PCA artifact or null."}
-  - {name: model_pickle_local, type: String, description: "Local path for model pickle artifact or null."}
+  - {name: preprocessor_local, type: Data, description: "Local file or directory path for downloaded preprocessor (or empty)"}
+  - {name: feature_selector_local, type: Data, description: "Local file or directory path for downloaded feature selector (or empty)"}
+  - {name: pca_local, type: Data, description: "Local file or directory path for downloaded PCA (or empty)"}
+  - {name: model_pickle_local, type: Model, description: "Local file or directory path for downloaded model pickle (or empty)"}
 implementation:
   container:
     image: kumar2004/ml-base:v1
@@ -25,29 +18,21 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, tempfile, logging, json, shutil, zipfile
-        import pandas as pd, numpy as np, requests
+        import argparse, os, sys, tempfile, json, shutil, zipfile, logging
+        import numpy as np
+        import requests
         from requests.adapters import HTTPAdapter
         try:
             from urllib3.util import Retry
         except Exception:
             from urllib3 import Retry
-        from sklearn.model_selection import train_test_split
 
-        # ---------- CLI ----------
         parser = argparse.ArgumentParser()
-        parser.add_argument('--cdn_url', type=str, required=True)
-        parser.add_argument('--split_size', type=float, default=15)
-        parser.add_argument('--target_column', type=str, required=True)
-        parser.add_argument('--model_type', type=str, default="classification")
         parser.add_argument('--preprocessor_cdn', type=str, default="")
         parser.add_argument('--feature_selector_cdn', type=str, default="")
         parser.add_argument('--pca_cdn', type=str, default="")
         parser.add_argument('--model_pickle_cdn', type=str, default="")
         parser.add_argument('--bearer_token', type=str, default="")
-        parser.add_argument('--train_set', type=str, required=True)
-        parser.add_argument('--test_x', type=str, required=True)
-        parser.add_argument('--test_y', type=str, required=True)
         parser.add_argument('--preprocessor_local', type=str, required=True)
         parser.add_argument('--feature_selector_local', type=str, required=True)
         parser.add_argument('--pca_local', type=str, required=True)
@@ -55,280 +40,114 @@ implementation:
         args = parser.parse_args()
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-        logger = logging.getLogger("cdn_artifacts_loader")
+        logger = logging.getLogger("artifacts_downloader")
 
-        # --------- HTTP session with retries ----------
+        # HTTP session with retry
         session = requests.Session()
         try:
-            retry_strategy = Retry(total=5, backoff_factor=1,
-                                   status_forcelist=[500,502,503,504],
-                                   allowed_methods=frozenset(["GET","HEAD"]))
+            retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], allowed_methods=frozenset(["GET","HEAD"]))
         except TypeError:
-            retry_strategy = Retry(total=5, backoff_factor=1,
-                                   status_forcelist=[500,502,503,504],
-                                   method_whitelist=frozenset(["GET","HEAD"]))
+            retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], method_whitelist=frozenset(["GET","HEAD"]))
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
 
-        # Optional auth header
         headers = {}
         if args.bearer_token and os.path.exists(args.bearer_token):
             try:
-                with open(args.bearer_token, "r", encoding="utf-8") as f:
-                    token = f.read().strip()
+                with open(args.bearer_token, "r", encoding="utf-8") as fh:
+                    token = fh.read().strip()
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-                    logger.info("Using bearer token from provided file for artifact downloads")
+                    logger.info("Using bearer token for authenticated downloads")
             except Exception:
-                logger.warning("Could not read bearer token file; proceeding without Authorization header")
+                logger.warning("Could not read bearer token file; continuing without Authorization header")
 
-        def download_to_path(url, dest_path):
-            logger.info("Downloading %s -> %s", url, dest_path)
-            os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        def download_to_temp(url):
+            if not url or not str(url).strip():
+                raise ValueError("Empty URL")
+            fd, tmp = tempfile.mkstemp(suffix=".download")
+            os.close(fd)
+            logger.info("Downloading %s -> %s", url, tmp)
             try:
                 r = session.get(url, headers=headers, timeout=60)
                 r.raise_for_status()
             except Exception as e:
-                logger.exception("Failed to download %s: %s", url, e)
-                raise
-            with open(dest_path, "wb") as fh:
-                fh.write(r.content)
-            return dest_path
-
-        def download_and_extract_if_zip(url, out_target_dir):
-            tmp_fd, tmp_file = tempfile.mkstemp(suffix=".download")
-            os.close(tmp_fd)
-            try:
-                download_to_path(url, tmp_file)
-                # Try to check if zip
-                is_zip = False
+                logger.exception("Download failed for %s: %s", url, e)
                 try:
-                    with zipfile.ZipFile(tmp_file, "r") as z:
-                        is_zip = True
-                except zipfile.BadZipFile:
-                    is_zip = False
-                if is_zip:
-                    # extract to target dir
-                    os.makedirs(out_target_dir, exist_ok=True)
-                    with zipfile.ZipFile(tmp_file, "r") as z:
-                        z.extractall(out_target_dir)
-                    logger.info("Extracted zip to %s", out_target_dir)
-                    return out_target_dir
-                else:
-                    # move file into target location (ensure parent exists)
-                    os.makedirs(os.path.dirname(out_target_dir) or ".", exist_ok=True)
-                    # if out_target_dir is a directory path (endswith /) then place file inside
-                    if out_target_dir.endswith(os.sep) or out_target_dir == "/":
-                        fname = os.path.basename(url.split("?")[0]) or f"artifact_{np.random.randint(1e6)}"
-                        dest = os.path.join(out_target_dir, fname)
-                        os.makedirs(out_target_dir, exist_ok=True)
-                    else:
-                        dest = out_target_dir
-                    shutil.move(tmp_file, dest)
-                    logger.info("Saved artifact file to %s", dest)
-                    return dest
-            finally:
-                try:
-                    if os.path.exists(tmp_file):
-                        os.remove(tmp_file)
+                    os.remove(tmp)
                 except Exception:
                     pass
-
-        # ---------- Download dataset ----------
-        logger.info("Downloading dataset from %s", args.cdn_url)
-        try:
-            r = session.get(args.cdn_url, headers=headers, timeout=60)
-            r.raise_for_status()
-        except Exception as e:
-            logger.exception("Failed to download dataset: %s", e)
-            raise
-
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".download")
-        os.close(tmp_fd)
-        with open(tmp_path, "wb") as f:
-            f.write(r.content)
-
-        # detect format by url or content-type
-        lower_url = args.cdn_url.lower()
-        fmt = None
-        if lower_url.endswith(".parquet") or ".parquet" in r.headers.get("Content-Type","").lower():
-            fmt = "parquet"
-        elif lower_url.endswith(".csv") or "csv" in r.headers.get("Content-Type","").lower():
-            fmt = "csv"
-        elif lower_url.endswith(".json") or "json" in r.headers.get("Content-Type","").lower():
-            fmt = "json"
-
-        # parse dataset similarly to your v3.1
-        try:
-            if fmt == "parquet":
-                df = pd.read_parquet(tmp_path)
-            elif fmt == "csv":
-                df = pd.read_csv(tmp_path)
-            elif fmt == "json":
-                with open(tmp_path,"r", encoding="utf-8") as fh:
-                    raw = json.load(fh)
-                if isinstance(raw, dict):
-                    for k in ("data","items","results","records"):
-                        if k in raw:
-                            raw = raw[k]
-                            break
-                if isinstance(raw, list):
-                    df = pd.json_normalize(raw)
-                else:
-                    df = pd.json_normalize([raw])
-            else:
-                # fallback attempts like v3.1
-                try:
-                    with open(tmp_path,"r", encoding="utf-8") as fh:
-                        raw = json.load(fh)
-                    if isinstance(raw, dict):
-                        for k in ("data","items","results","records"):
-                            if k in raw:
-                                raw = raw[k]; break
-                    if isinstance(raw, list):
-                        df = pd.json_normalize(raw)
-                    else:
-                        df = pd.json_normalize([raw])
-                except Exception:
-                    try:
-                        df = pd.read_csv(tmp_path)
-                    except Exception:
-                        try:
-                            df = pd.read_parquet(tmp_path)
-                        except Exception as e:
-                            logger.exception("Failed to parse downloaded dataset: %s", e)
-                            raise ValueError("Unsupported or corrupt dataset format")
-        finally:
-            try: os.remove(tmp_path)
-            except Exception: pass
-
-        # === run same diagnostics and splitting logic as v3.1 ===
-        logger.info("Loaded dataset shape=%s columns=%s", df.shape, df.columns.tolist())
-        logger.info("DF head: %s", df.head(3).to_string())
-
-        target_cols = [c.strip() for c in args.target_column.split(",") if c.strip()]
-        if not target_cols:
-            raise ValueError("No target columns provided")
-        missing = [c for c in target_cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"Target columns not found in dataframe: {missing}")
-        target_df = df[target_cols].copy()
-
-        if args.model_type.lower() == "classification":
-            for col in target_cols:
-                logger.info("Target '%s' distribution: %s", col, target_df[col].value_counts(dropna=False).to_string())
-
-        # stratify logic only for single-target classification
-        if args.model_type.lower() == "classification" and len(target_cols) == 1:
-            vals = target_df[target_cols[0]]
-            if vals.nunique() > 1:
-                counts = vals.value_counts(dropna=False)
-                if (counts < 2).any():
-                    stratify_param = None
-                    logger.warning("Some classes have <2 samples; disabling stratify")
-                else:
-                    stratify_param = vals
-            else:
-                stratify_param = None
-                logger.warning("Single class in target; stratify disabled")
-        else:
-            stratify_param = None
-
-        split_size_input = float(args.split_size)
-        test_size = split_size_input / 100.0 if split_size_input >= 1.0 else split_size_input
-        if not (0.0 < test_size < 1.0):
-            raise ValueError("split_size must be between 0 and 1 or 1–99 (percent)")
-
-        try:
-            train_df, test_df, train_y, test_y = train_test_split(df, target_df, test_size=test_size, random_state=42, stratify=stratify_param)
-        except ValueError as e:
-            logger.warning("Stratified split failed (%s). Retrying without stratify", e)
-            train_df, test_df, train_y, test_y = train_test_split(df, target_df, test_size=test_size, random_state=42, stratify=None)
-
-        train_df = train_df.reset_index(drop=True)
-        test_df = test_df.reset_index(drop=True)
-        if isinstance(train_y, pd.Series):
-            train_y_df = pd.DataFrame({target_cols[0]: train_y.reset_index(drop=True)})
-            test_y_df = pd.DataFrame({target_cols[0]: test_y.reset_index(drop=True)})
-        else:
-            train_y_df = train_y.reset_index(drop=True)
-            test_y_df = test_y.reset_index(drop=True)
-
-        # Save splits to outputs (parquet, fallback to csv)
-        def safe_save(dfobj, path):
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                raise
+            with open(tmp, "wb") as fh:
+                fh.write(r.content)
+            return tmp
+            is_zip = False
             try:
-                dfobj.to_parquet(path, index=False)
-            except Exception:
-                logger.exception("Parquet write failed for %s; falling back to CSV", path)
-                dfobj.to_csv(path + ".csv", index=False)
-
-        safe_save(train_df, args.train_set)
-        safe_save(test_df.drop(columns=target_cols, errors="ignore"), args.test_x)
-        safe_save(test_y_df, args.test_y)
-
-        # ---------- Download artifacts (if provided) ----------
-        def handle_artifact(url, out_path):
-            if not url or not str(url).strip():
-                # write a small JSON saying null for consistency
-                open(out_path, "w").write(json.dumps({"artifact_local": None}))
-                return None
-            try:
-                # if out_path endswith os.sep treat as directory target
+                with zipfile.ZipFile(tmp_file, "r") as z:
+                    is_zip = True
+            except zipfile.BadZipFile:
+                is_zip = False
+            if is_zip:
+                # ensure out_path is treated as directory
+                os.makedirs(out_path, exist_ok=True)
+                with zipfile.ZipFile(tmp_file, "r") as z:
+                    z.extractall(out_path)
+                logger.info("Extracted zip to %s", out_path)
+                try: os.remove(tmp_file)
+                except Exception: pass
+                return out_path
+            else:
+                # if out_path ends with os.sep treat as directory, else file path
                 if out_path.endswith(os.sep) or out_path.endswith("/"):
                     os.makedirs(out_path, exist_ok=True)
-                    dest = out_path
+                    fname = os.path.basename(tmp_file) or f"artifact_{np.random.randint(1e6)}"
+                    dest = os.path.join(out_path, fname)
                 else:
-                    # prepare parent
                     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                     dest = out_path
-                result = download_and_extract_if_zip(url, dest)
-                # Write a small JSON file at out_path+'.meta.json' with actual returned path for pipeline consumption
-                meta = {"artifact_local": result}
-                with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
+                shutil.move(tmp_file, dest)
+                logger.info("Saved artifact file to %s", dest)
+                return dest
+
+        def write_meta_and_path(out_meta_path, path_val):
+            meta = {"artifact_local": None if path_val is None else str(path_val)}
+            try:
+                with open(out_meta_path + ".meta.json", "w", encoding="utf-8") as fh:
                     json.dump(meta, fh)
-                return result
+            except Exception:
+                logger.exception("Failed to write meta for %s", out_meta_path)
+            # Also write plain path for pipeline consumption
+            try:
+                with open(out_meta_path, "w", encoding="utf-8") as fh:
+                    fh.write("" if path_val is None else str(path_val))
+            except Exception:
+                logger.exception("Failed to write path file %s", out_meta_path)
+
+        def fetch_artifact(url, out_path):
+            if not url or not str(url).strip():
+                logger.info("No URL provided for target %s; writing null outputs", out_path)
+                write_meta_and_path(out_path, None)
+                return None
+            try:
+                tmp = download_to_temp(url)
+                placed = place_artifact(tmp, out_path)
+                write_meta_and_path(out_path, placed)
+                return placed
             except Exception as e:
-                logger.exception("Failed to download artifact %s: %s", url, e)
-                # write null meta so downstream doesn't fail on missing file
-                with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
-                    json.dump({"artifact_local": None, "error": str(e)}, fh)
+                logger.exception("Failed to fetch artifact from %s: %s", url, e)
+                write_meta_and_path(out_path, None)
                 return None
 
-        pre_local = handle_artifact(args.preprocessor_cdn, args.preprocessor_local)
-        feat_local = handle_artifact(args.feature_selector_cdn, args.feature_selector_local)
-        pca_local = handle_artifact(args.pca_cdn, args.pca_local)
-        model_pickle_local = handle_artifact(args.model_pickle_cdn, args.model_pickle_local)
+        # Fetch each artifact (will write <output>.meta.json and <output> path file)
+        pre_local = fetch_artifact(args.preprocessor_cdn, args.preprocessor_local)
+        feat_local = fetch_artifact(args.feature_selector_cdn, args.feature_selector_local)
+        pca_local = fetch_artifact(args.pca_cdn, args.pca_local)
+        model_local = fetch_artifact(args.model_pickle_cdn, args.model_pickle_local)
 
-        logger.info("Artifacts downloaded. preprocessor_local=%s feature_selector_local=%s pca_local=%s model_pickle_local=%s",
-                    pre_local, feat_local, pca_local, model_pickle_local)
-
-        # If outputs expect the path strings, ensure the pipeline captures the .meta.json contents.
-        # For compatibility with simple pipelines, also write plain text file with path.
-        def write_path_text(path_out, val):
-            try:
-                os.makedirs(os.path.dirname(path_out) or ".", exist_ok=True)
-                with open(path_out, "w", encoding="utf-8") as fh:
-                    fh.write("" if val is None else str(val))
-            except Exception:
-                pass
-
-        write_path_text(args.preprocessor_local, pre_local)
-        write_path_text(args.feature_selector_local, feat_local)
-        write_path_text(args.pca_local, pca_local)
-        write_path_text(args.model_pickle_local, model_pickle_local)
-
-        logger.info("Saved outputs and artifact metadata. Done.")
+        logger.info("Artifacts downloaded: preprocessor=%s feature_selector=%s pca=%s model_pickle=%s",
+                    pre_local, feat_local, pca_local, model_local)
     args:
-      - --cdn_url
-      - {inputValue: cdn_url}
-      - --split_size
-      - {inputValue: split_size}
-      - --target_column
-      - {inputValue: target_column}
-      - --model_type
-      - {inputValue: model_type}
       - --preprocessor_cdn
       - {inputValue: preprocessor_cdn}
       - --feature_selector_cdn
@@ -339,12 +158,6 @@ implementation:
       - {inputValue: model_pickle_cdn}
       - --bearer_token
       - {inputPath: bearer_token}
-      - --train_set
-      - {outputPath: train_set}
-      - --test_x
-      - {outputPath: test_x}
-      - --test_y
-      - {outputPath: test_y}
       - --preprocessor_local
       - {outputPath: preprocessor_local}
       - --feature_selector_local
