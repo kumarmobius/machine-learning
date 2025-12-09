@@ -388,7 +388,7 @@ implementation:
             sys.exit(1)
     args:
       - --input_data
-      - {inputPath: input_data}
+      - {inputValue: input_data}
       - --preprocessor
       - {inputPath: preprocessor}
       - --feature_selector
