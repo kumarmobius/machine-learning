@@ -6,7 +6,7 @@ inputs:
   - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
   - {name: pca, type: Data, description: "Path to saved PCA / dimensionality transformer (joblib/cloudpickle). Optional. If provided, PCA.transform will be applied AFTER preprocessing (and after feature selection if provided).", optional: true}
-  - {name: model_pickle, type: Data, description: "Path to saved model (joblib/pickle)"}
+  - {name: model_pickle, type: Model, description: "Path to saved model (joblib/pickle)"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time containing label_mapping for classification", optional: true}
 outputs:
