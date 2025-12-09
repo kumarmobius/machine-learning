@@ -1,4 +1,4 @@
-name: Stacking and Voting V6
+name: Stacking and Voting V7
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -874,7 +874,8 @@ implementation:
       
             # Save the models (one dict for all targets)
             ensure_dir_for(args.model_pickle)
-            cloudpickle.dump(models_saved, args.model_pickle)
+            with open(args.model_pickle, "wb") as fh:
+                cloudpickle.dump(models_saved, fh)
       
             # Build aggregated metrics
             aggregate = {"n_targets": len(metrics_out), "samples": int(len(X))}
