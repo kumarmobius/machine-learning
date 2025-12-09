@@ -1,6 +1,5 @@
 name: Multiple CDN uploader
 inputs:
-  - {name: model_pth, type: Model, description: "Path to model .pth or file to upload"}
   - {name: model_pickle, type: Model, description: "Optional: saved model pickle/joblib file to upload"}
   - {name: preprocessor, type: Data, description: "Path to saved preprocessor (cloudpickle/joblib). Can be file or directory (will be zipped)"}
   - {name: feature_selector, type: Data, description: "Optional: feature selector file (cloudpickle/joblib). Can be file or directory (zipped).", optional: true}
@@ -28,7 +27,6 @@ implementation:
         import argparse, subprocess, json, os, uuid, tempfile, shutil, zipfile, sys
 
         parser = argparse.ArgumentParser(description="Upload model and related artifacts to CDN.")
-        parser.add_argument('--model_pth', type=str, required=True)
         parser.add_argument('--model_pickle', type=str, required=False, default="")
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--feature_selector', type=str, required=False, default="")
@@ -118,10 +116,7 @@ implementation:
             return final_url
 
         def prepare_path_for_upload(input_path):
-            """
-            If input_path is a file, return it.
-            If it's a directory, zip it to a temp zip and return zip path.
-            """
+
             if not os.path.exists(input_path):
                 raise FileNotFoundError(f"Path not found: {input_path}")
             if os.path.isfile(input_path):
@@ -132,17 +127,6 @@ implementation:
             return tmpzip, tmpzip  # second value is the temp file to clean up
 
         try:
-            # Upload model_pth
-            model_tmp = None
-            try:
-                model_src = args.model_pth
-                model_prepared, model_tmp = prepare_path_for_upload(model_src)
-                model_url = upload_file_to_cdn(model_prepared, args.model_weights_cdn, "model_weights_cdn")
-            finally:
-                if model_tmp and os.path.exists(model_tmp):
-                    try: os.remove(model_tmp)
-                    except Exception: pass
-
             # Upload model_pickle (optional)
             model_pickle_url = None
             model_pickle_tmp = None
@@ -217,8 +201,6 @@ implementation:
             print("ERROR during CDN upload:", str(e), file=sys.stderr)
             raise
     args:
-      - --model_pth
-      - {inputPath: model_pth}
       - --model_pickle
       - {inputPath: model_pickle}
       - --preprocessor
