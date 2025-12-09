@@ -1,4 +1,4 @@
-name: Stacking and Voting V5
+name: Stacking and Voting V6
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -24,6 +24,7 @@ implementation:
       - |
         import argparse, json, os, sys, traceback, random, warnings
         import pandas as pd, numpy as np, joblib
+        import cloudpickle
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
         from sklearn.ensemble import (
@@ -873,7 +874,7 @@ implementation:
       
             # Save the models (one dict for all targets)
             ensure_dir_for(args.model_pickle)
-            joblib.dump(models_saved, args.model_pickle)
+            cloudpickle.dump(models_saved, args.model_pickle)
       
             # Build aggregated metrics
             aggregate = {"n_targets": len(metrics_out), "samples": int(len(X))}
