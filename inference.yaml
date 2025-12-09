@@ -1,6 +1,6 @@
 name: Inference Model v1
 inputs:
-  - {name: input_data, type: Dataset, description: "Path to input data. Supports CSV, JSONL/NDJSON, JSON array (e.g. [1,2,3] or [[1,2],[3,4]]), parquet, zip, gzip. If a JSON array of numbers is provided, it's treated as a single sample vector."}
+  - {name: input_data, type: String, description: "Path to input data. Supports CSV, JSONL/NDJSON, JSON array (e.g. [1,2,3] or [[1,2],[3,4]]), parquet, zip, gzip. If a JSON array of numbers is provided, it's treated as a single sample vector."}
   - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
   - {name: pca, type: Data, description: "Path to saved PCA / dimensionality transformer (joblib/cloudpickle). Optional", optional: true}
