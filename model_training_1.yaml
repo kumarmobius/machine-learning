@@ -10,7 +10,7 @@ inputs:
   - {name: stacking_cv, type: Integer, default: "5"}
   - {name: random_state, type: Integer, optional: true, default: "50"}
 outputs:
-  - {name: model_pickle, type: Data }
+  - {name: model_pickle, type: Model }
   - {name: metrics_json, type: Data }
   - {name: model_config, type: Data }
 
