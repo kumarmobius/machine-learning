@@ -1,0 +1,251 @@
+name: Multiple CDN uploader
+inputs:
+  - {name: model_pth, type: Model, description: "Path to model .pth or file to upload"}
+  - {name: model_pickle, type: Model, description: "Optional: saved model pickle/joblib file to upload"}
+  - {name: preprocessor, type: Data, description: "Path to saved preprocessor (cloudpickle/joblib). Can be file or directory (will be zipped)"}
+  - {name: feature_selector, type: Data, description: "Optional: feature selector file (cloudpickle/joblib). Can be file or directory (zipped).", optional: true}
+  - {name: pca, type: Data, description: "Optional: PCA / transformer artifact (joblib/cloudpickle). Can be file or directory (zipped).", optional: true}
+  - {name: config_string, type: String, description: "Config contents (string) to write to a temp file and upload"}
+  - {name: bearer_token, type: String, description: "Path to a file containing bearer token (will be read)", required: true}
+  - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
+  - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
+  - {name: name, type: String, description: "Optional friendly name to include in output JSON", optional: true}
+outputs:
+  - {name: model_weights_cdn, type: String, description: "JSON containing the model .pth CDN URL (and optional name)"}
+  - {name: model_pickle_cdn, type: String, description: "JSON containing the model pickle CDN URL (and optional name)"}
+  - {name: preprocessor_cdn, type: String, description: "JSON containing the preprocessor CDN URL (and optional name)"}
+  - {name: feature_selector_cdn, type: String, description: "JSON containing the feature selector CDN URL (and optional name). Created only if provided."}
+  - {name: pca_cdn, type: String, description: "JSON containing the PCA CDN URL (and optional name). Created only if provided."}
+  - {name: config_cdn_url, type: String, description: "JSON containing the config CDN URL (and optional name)"}
+implementation:
+  container:
+    image: python:3.8
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, subprocess, json, os, uuid, tempfile, shutil, zipfile, sys
+
+        parser = argparse.ArgumentParser(description="Upload model and related artifacts to CDN.")
+        parser.add_argument('--model_pth', type=str, required=True)
+        parser.add_argument('--model_pickle', type=str, required=False, default="")
+        parser.add_argument('--preprocessor', type=str, required=True)
+        parser.add_argument('--feature_selector', type=str, required=False, default="")
+        parser.add_argument('--pca', type=str, required=False, default="")
+        parser.add_argument('--config_string', type=str, required=True)
+        parser.add_argument('--model_weights_cdn', type=str, required=True)
+        parser.add_argument('--model_pickle_cdn', type=str, required=True)
+        parser.add_argument('--preprocessor_cdn', type=str, required=True)
+        parser.add_argument('--feature_selector_cdn', type=str, required=True)
+        parser.add_argument('--pca_cdn', type=str, required=True)
+        parser.add_argument('--config_cdn_url', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get_cdn', type=str, required=True)
+        parser.add_argument('--name', type=str, required=False, default="")
+        args = parser.parse_args()
+
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        def atomic_write_json(path, data):
+            ensure_parent_dir(path)
+            dirp = os.path.dirname(path) or "/tmp"
+            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
+
+        # Read bearer token from provided path
+        with open(args.bearer_token, 'r', encoding='utf-8') as f:
+            bearer_token = f.read().strip()
+
+        # Upload endpoint (same structure you used)
+        upload_url = f"{args.domain.rstrip('/')}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+
+        def build_output_dict(key, url):
+            out = {key: url}
+            if args.name and str(args.name).strip():
+                out['name'] = str(args.name)
+            return out
+
+        def run_curl_upload(file_path):
+            # Returns parsed JSON response from CDN service (expects JSON with 'cdnUrl')
+            curl_command = [
+                "curl",
+                "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{file_path}",
+                "--fail",
+                "--show-error"
+            ]
+            proc = subprocess.run(curl_command, capture_output=True)
+            stdout = proc.stdout.decode("utf-8", errors="ignore")
+            stderr = proc.stderr.decode("utf-8", errors="ignore")
+            if proc.returncode != 0:
+                print("[ERROR] curl failed. returncode:", proc.returncode)
+                print("[ERROR] curl stdout:", stdout)
+                print("[ERROR] curl stderr:", stderr)
+                raise subprocess.CalledProcessError(proc.returncode, curl_command, output=stdout.encode(), stderr=stderr.encode())
+            try:
+                resp = json.loads(stdout)
+            except Exception as e:
+                print("[ERROR] Failed to parse upload response as JSON:", e)
+                print("Raw response:", stdout)
+                raise
+            return resp
+
+        def upload_file_to_cdn(file_path, output_json_path, output_key):
+            print(f"[DEBUG] Uploading {file_path} -> output {output_json_path} key '{output_key}'")
+            resp = run_curl_upload(file_path)
+            relative_cdn_url = resp.get("cdnUrl")
+            if not relative_cdn_url:
+                raise ValueError("Missing 'cdnUrl' in CDN response")
+            final_url = f"{args.get_cdn.rstrip('/')}{relative_cdn_url}"
+            out_obj = build_output_dict(output_key, final_url)
+            atomic_write_json(output_json_path, out_obj)
+            print(f"[INFO] Wrote {output_key} -> {output_json_path}")
+            return final_url
+
+        def prepare_path_for_upload(input_path):
+            """
+            If input_path is a file, return it.
+            If it's a directory, zip it to a temp zip and return zip path.
+            """
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"Path not found: {input_path}")
+            if os.path.isfile(input_path):
+                return input_path, None
+            # it's a directory -> zip
+            tmpzip = os.path.join("/tmp", f"artifact_{uuid.uuid4().hex}.zip")
+            shutil.make_archive(tmpzip.replace(".zip", ""), 'zip', root_dir=input_path)
+            return tmpzip, tmpzip  # second value is the temp file to clean up
+
+        try:
+            # Upload model_pth
+            model_tmp = None
+            try:
+                model_src = args.model_pth
+                model_prepared, model_tmp = prepare_path_for_upload(model_src)
+                model_url = upload_file_to_cdn(model_prepared, args.model_weights_cdn, "model_weights_cdn")
+            finally:
+                if model_tmp and os.path.exists(model_tmp):
+                    try: os.remove(model_tmp)
+                    except Exception: pass
+
+            # Upload model_pickle (optional)
+            model_pickle_url = None
+            model_pickle_tmp = None
+            if args.model_pickle and str(args.model_pickle).strip():
+                try:
+                    mp_prepared, model_pickle_tmp = prepare_path_for_upload(args.model_pickle)
+                    model_pickle_url = upload_file_to_cdn(mp_prepared, args.model_pickle_cdn, "model_pickle_cdn")
+                finally:
+                    if model_pickle_tmp and os.path.exists(model_pickle_tmp):
+                        try: os.remove(model_pickle_tmp)
+                        except Exception: pass
+            else:
+                print("[INFO] No model_pickle provided; skipping upload and writing empty JSON")
+                atomic_write_json(args.model_pickle_cdn, {"model_pickle_cdn": None})
+
+            # Upload preprocessor (required)
+            pre_tmp = None
+            try:
+                prep_prepared, pre_tmp = prepare_path_for_upload(args.preprocessor)
+                pre_url = upload_file_to_cdn(prep_prepared, args.preprocessor_cdn, "preprocessor_cdn")
+            finally:
+                if pre_tmp and os.path.exists(pre_tmp):
+                    try: os.remove(pre_tmp)
+                    except Exception: pass
+
+            # Upload feature_selector (optional)
+            feat_tmp = None
+            if args.feature_selector and str(args.feature_selector).strip() and os.path.exists(args.feature_selector):
+                try:
+                    feat_prepared, feat_tmp = prepare_path_for_upload(args.feature_selector)
+                    feat_url = upload_file_to_cdn(feat_prepared, args.feature_selector_cdn, "feature_selector_cdn")
+                finally:
+                    if feat_tmp and os.path.exists(feat_tmp):
+                        try: os.remove(feat_tmp)
+                        except Exception: pass
+            else:
+                print("[INFO] No feature_selector provided or path missing; writing null output")
+                atomic_write_json(args.feature_selector_cdn, {"feature_selector_cdn": None})
+
+            # Upload pca (optional)
+            pca_tmp = None
+            if args.pca and str(args.pca).strip() and os.path.exists(args.pca):
+                try:
+                    pca_prepared, pca_tmp = prepare_path_for_upload(args.pca)
+                    pca_url = upload_file_to_cdn(pca_prepared, args.pca_cdn, "pca_cdn")
+                finally:
+                    if pca_tmp and os.path.exists(pca_tmp):
+                        try: os.remove(pca_tmp)
+                        except Exception: pass
+            else:
+                print("[INFO] No pca provided or path missing; writing null output")
+                atomic_write_json(args.pca_cdn, {"pca_cdn": None})
+
+            # Prepare and upload config_string as a JSON file
+            cfg_tmp = os.path.join("/tmp", f"config_{uuid.uuid4().hex}.json")
+            try:
+                with open(cfg_tmp, "w", encoding="utf-8") as f:
+                    f.write(args.config_string)
+                config_url = upload_file_to_cdn(cfg_tmp, args.config_cdn_url, "config_cdn_url")
+            finally:
+                try: os.remove(cfg_tmp)
+                except Exception: pass
+
+            print("[INFO] Uploads complete.")
+            print("Model CDN URL:", model_url)
+            if model_pickle_url:
+                print("Model pickle CDN URL:", model_pickle_url)
+            print("Preprocessor CDN URL:", pre_url)
+            print("Config CDN URL:", config_url)
+
+        except Exception as e:
+            print("ERROR during CDN upload:", str(e), file=sys.stderr)
+            raise
+    args:
+      - --model_pth
+      - {inputPath: model_pth}
+      - --model_pickle
+      - {inputPath: model_pickle}
+      - --preprocessor
+      - {inputPath: preprocessor}
+      - --feature_selector
+      - {inputPath: feature_selector}
+      - --pca
+      - {inputPath: pca}
+      - --config_string
+      - {inputValue: config_string}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --name
+      - {inputValue: name}
+      - --model_weights_cdn
+      - {outputPath: model_weights_cdn}
+      - --model_pickle_cdn
+      - {outputPath: model_pickle_cdn}
+      - --preprocessor_cdn
+      - {outputPath: preprocessor_cdn}
+      - --feature_selector_cdn
+      - {outputPath: feature_selector_cdn}
+      - --pca_cdn
+      - {outputPath: pca_cdn}
+      - --config_cdn_url
+      - {outputPath: config_cdn_url}
