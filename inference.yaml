@@ -1,0 +1,407 @@
+name: Inference Model v1
+inputs:
+  - {name: input_data, type: Dataset, description: "Path to input data. Supports CSV, JSONL/NDJSON, JSON array (e.g. [1,2,3] or [[1,2],[3,4]]), parquet, zip, gzip. If a JSON array of numbers is provided, it's treated as a single sample vector."}
+  - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
+  - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
+  - {name: pca, type: Data, description: "Path to saved PCA / dimensionality transformer (joblib/cloudpickle). Optional", optional: true}
+  - {name: model_pickle, type: Model, description: "Path to saved model (joblib/pickle)"}
+  - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
+  - {name: include_proba, type: String, description: "whether to attempt predict_proba for classification (true|false)", optional: true, default: "true"}
+  - {name: input_id_column, type: String, description: "If present, use this column as id in output; otherwise an index column will be added", optional: true, default: ""}
+outputs:
+  - {name: predictions, type: String, description: "Parquet containing original inputs (if tabular), y_pred, and proba columns (if available)"}
+implementation:
+  container:
+    image: kumar2004/ml-base:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, io, gzip, zipfile, traceback
+        import pandas as pd, numpy as np, joblib, cloudpickle
+        from scipy import stats
+
+        def is_likely_json(sample_bytes):
+            if not sample_bytes: return False
+            try: txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
+            except Exception: return False
+            if not txt: return False
+            if txt[0] in ("{","["): return True
+            if "{" in txt or "[" in txt: return True
+            return False
+
+        def read_with_pandas(path):
+            import io, zipfile
+            if os.path.isdir(path):
+                entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
+                files=[p for p in entries if os.path.isfile(p)]
+                if not files: raise ValueError("No files in dir: "+path)
+                path = max(files, key=lambda p: os.path.getsize(p))
+                print("[INFO] Directory input. Picked file: " + path)
+            ext=os.path.splitext(path)[1].lower()
+            if ext==".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
+                try:
+                    with gzip.open(path,"rt",encoding="utf-8",errors="ignore") as fh:
+                        sample=fh.read(8192); fh.seek(0)
+                        if is_likely_json(sample.encode() if isinstance(sample,str) else sample):
+                            fh.seek(0)
+                            try: return pd.read_json(fh, lines=True)
+                            except Exception: fh.seek(0); return pd.read_csv(fh)
+                        fh.seek(0); return pd.read_csv(fh)
+                except Exception: pass
+            if ext==".zip":
+                with zipfile.ZipFile(path,"r") as z:
+                    members=[n for n in z.namelist() if not n.endswith("/")]
+                    member=max(members, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
+                    with z.open(member) as fh:
+                        sample=fh.read(8192)
+                        if is_likely_json(sample):
+                            with z.open(member) as fh2:
+                                return pd.read_json(io.TextIOWrapper(fh2,encoding="utf-8"), lines=True)
+                        else:
+                            with z.open(member) as fh2:
+                                return pd.read_csv(io.TextIOWrapper(fh2,encoding="utf-8"))
+            try:
+                if ext==".csv": return pd.read_csv(path)
+                if ext in (".tsv",".tab"): return pd.read_csv(path, sep="\t")
+                if ext in (".json",".ndjson",".jsonl"):
+                    try: return pd.read_json(path, lines=True)
+                    except ValueError: return pd.read_json(path)
+                if ext in (".xls",".xlsx"): return pd.read_excel(path)
+                if ext in (".parquet",".pq"): return pd.read_parquet(path, engine="auto")
+                if ext==".feather": return pd.read_feather(path)
+                if ext==".orc": return pd.read_orc(path)
+            except Exception: pass
+            try: return pd.read_parquet(path, engine="auto")
+            except Exception: pass
+            try: return pd.read_csv(path)
+            except Exception: pass
+            # If path is '-' read stdin
+            if path == "-":
+                txt = sys.stdin.read()
+                try:
+                    return pd.read_json(io.StringIO(txt), lines=True)
+                except Exception:
+                    try: return pd.read_json(io.StringIO(txt))
+                    except Exception:
+                        try: return pd.read_csv(io.StringIO(txt))
+                        except Exception: pass
+            # If nothing worked, raise to let caller fallback to raw-json parser
+            raise ValueError("Pandas read failed for: " + str(path))
+
+        def ensure_dir_for(p):
+            d=os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def load_pickle_any(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"File not found: {path}")
+            # Try gzipped cloudpickle first
+            try:
+                with gzip.open(path, "rb") as f:
+                    return cloudpickle.load(f)
+            except Exception:
+                pass
+            # Try regular cloudpickle
+            try:
+                with open(path, "rb") as f:
+                    return cloudpickle.load(f)
+            except Exception:
+                pass
+            # Try joblib as fallback
+            try:
+                return joblib.load(path)
+            except Exception as e:
+                raise ValueError(f"Could not load pickle from {path}: {e}")
+
+        def try_parse_raw_json_list(path):
+            # read file as text and try json.loads
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read().strip()
+            if not txt:
+                raise ValueError("Empty input file")
+            # sometimes input may contain trailing commas/newlines; try to normalize
+            try:
+                obj = json.loads(txt)
+            except Exception:
+                # try lines
+                try:
+                    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+                    if not lines:
+                        raise
+                    if len(lines) == 1:
+                        obj = json.loads(lines[0])
+                    else:
+                        # try to parse each line as JSON and collect
+                        parsed = []
+                        for ln in lines:
+                            parsed.append(json.loads(ln))
+                        obj = parsed
+                except Exception as e:
+                    raise ValueError(f"Raw JSON parse failed: {e}")
+            # Now obj can be list of numbers, list of lists, list of dicts, dict etc.
+            if isinstance(obj, dict):
+                # single record object -> DataFrame with one row
+                return pd.DataFrame([obj])
+            if isinstance(obj, list):
+                if len(obj) == 0:
+                    raise ValueError("Empty JSON array")
+                # list of numbers -> single-row vector
+                if all(isinstance(x, (int, float, type(None))) or (isinstance(x, bool)) for x in obj):
+                    cols = [f"f{i}" for i in range(len(obj))]
+                    return pd.DataFrame([obj], columns=cols)
+                # list of lists -> matrix
+                if all(isinstance(x, (list, tuple)) for x in obj):
+                    # ensure all rows have same length
+                    maxlen = max(len(r) for r in obj)
+                    normalized = [list(r) + [None]*(maxlen - len(r)) for r in obj]
+                    cols = [f"f{i}" for i in range(maxlen)]
+                    return pd.DataFrame(normalized, columns=cols)
+                # list of dicts -> tabular
+                if all(isinstance(x, dict) for x in obj):
+                    return pd.DataFrame(obj)
+                # mixed types -> try DataFrame directly (pandas will attempt)
+                try:
+                    return pd.DataFrame(obj)
+                except Exception as e:
+                    raise ValueError(f"Unsupported JSON list structure: {e}")
+            # fallback
+            raise ValueError("Unsupported raw JSON content")
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--input_data", type=str, required=True)
+        parser.add_argument("--preprocessor", type=str, required=True)
+        parser.add_argument("--feature_selector", type=str, default="")
+        parser.add_argument("--pca", type=str, default="")
+        parser.add_argument("--model_pickle", type=str, required=True)
+        parser.add_argument("--model_type", type=str, default="classification")
+        parser.add_argument("--include_proba", type=str, default="true")
+        parser.add_argument("--predictions", type=str, required=True)
+        parser.add_argument("--input_id_column", type=str, default="")
+        args = parser.parse_args()
+
+        try:
+            print("="*80)
+            print("INFERENCE STARTED")
+            print("="*80)
+            inp_path = args.input_data
+            pre_path = args.preprocessor
+            fs_path = args.feature_selector or ""
+            pca_path = args.pca or ""
+            model_path = args.model_pickle
+            preds_path = args.predictions
+            task = str(args.model_type).strip().lower()
+            include_proba = str(args.include_proba).strip().lower() in ("1","true","yes","y")
+            input_id_col = str(args.input_id_column).strip() or None
+
+            print(f"[INFO] Task: {task}")
+            print(f"[INFO] Input path: {inp_path}")
+            print(f"[INFO] Loading preprocessor from: {pre_path}")
+
+            pre = load_pickle_any(pre_path)
+            print("[INFO] Preprocessor loaded")
+
+            fs = None
+            if fs_path and os.path.exists(fs_path):
+                fs = load_pickle_any(fs_path)
+                print("[INFO] Feature selector loaded")
+            else:
+                print("[INFO] No feature selector provided")
+
+            print("[INFO] Loading model...")
+            try:
+                model = joblib.load(model_path)
+            except Exception:
+                model = load_pickle_any(model_path)
+            print("[INFO] Model loaded successfully")
+            model_name = getattr(model, "name", None) or getattr(model, "model_name", None) or model.__class__.__name__
+
+            # Read input data (try pandas first, else raw-json fallback)
+            print("[INFO] Reading input data (pandas first, then raw JSON-list fallback)...")
+            try:
+                df_in = read_with_pandas(inp_path)
+                print("[INFO] Read with pandas succeeded")
+            except Exception as e:
+                print(f"[WARN] pandas read failed: {e}. Trying raw JSON list parser...")
+                df_in = try_parse_raw_json_list(inp_path)
+                print("[INFO] Raw JSON parsed to DataFrame")
+
+            print(f"[INFO] Input DataFrame shape: {getattr(df_in,'shape',None)}")
+            # Keep a copy of original inputs for output
+            original_inputs = df_in.reset_index(drop=True).copy()
+
+            # If input is a single column that actually contains a list string (rare), try to normalize
+            # But we already handled JSON arrays above.
+
+            # Reconstruct test_full as in evaluation brick (we don't have y here)
+            test_full = df_in.copy()
+
+            # Apply preprocessor
+            print("[INFO] Applying preprocessor.transform(...)")
+            try:
+                Xp_full = pre.transform(test_full, training_mode=False)
+            except TypeError:
+                try:
+                    Xp_full = pre.transform(test_full)
+                except Exception as e:
+                    raise RuntimeError(f"Preprocessor.transform failed: {e}")
+            except Exception as e:
+                raise RuntimeError(f"Preprocessor.transform failed: {e}")
+
+            if isinstance(Xp_full, (pd.DataFrame, pd.Series)):
+                Xp_df = Xp_full.copy()
+            else:
+                try:
+                    cols = getattr(pre, "feature_names_out", None) or getattr(pre, "output_columns", None)
+                    if cols is None:
+                        cols = [f"f{i}" for i in range(Xp_full.shape[1])]
+                    Xp_df = pd.DataFrame(Xp_full, columns=list(cols))
+                except Exception:
+                    Xp_df = pd.DataFrame(Xp_full)
+
+            # Apply feature selector
+            if fs is not None:
+                print("[INFO] Applying feature selector")
+                if hasattr(fs, "selected_features"):
+                    want_cols = list(fs.selected_features)
+                    missing_cols = set(want_cols) - set(Xp_df.columns)
+                    if missing_cols:
+                        print(f"[WARN] Missing features after preprocessing: {missing_cols}. Filling with zeros.")
+                    Xs = Xp_df.reindex(columns=want_cols, fill_value=0.0)
+                else:
+                    try:
+                        Xs = fs.transform(Xp_df)
+                        if not isinstance(Xs, pd.DataFrame):
+                            Xs = pd.DataFrame(Xs, columns=[f"f{i}" for i in range(Xs.shape[1])])
+                    except Exception as e:
+                        raise RuntimeError(f"Feature selector transform failed: {e}")
+            else:
+                Xs = Xp_df
+
+            # Apply PCA if provided (same logic as eval brick)
+            if pca_path and os.path.exists(pca_path):
+                try:
+                    pca_obj = load_pickle_any(pca_path)
+                    from sklearn.pipeline import Pipeline
+                    if isinstance(pca_obj, Pipeline):
+                        for nm, step in reversed(pca_obj.steps):
+                            if hasattr(step, "transform"):
+                                pca_transformer = step
+                                break
+                        else:
+                            pca_transformer = pca_obj
+                    else:
+                        pca_transformer = pca_obj
+                    if hasattr(pca_transformer, "transform"):
+                        Xs_arr = Xs.values if isinstance(Xs, (pd.DataFrame, pd.Series)) else np.asarray(Xs)
+                        Xs_pca = pca_transformer.transform(Xs_arr)
+                        if Xs_pca.ndim == 1:
+                            Xs_pca = Xs_pca.reshape(-1, 1)
+                        pca_cols = [f"PC{i+1}" for i in range(Xs_pca.shape[1])]
+                        Xs = pd.DataFrame(Xs_pca, columns=pca_cols)
+                        print(f"[INFO] PCA applied. New shape: {Xs.shape}")
+                    else:
+                        print("[WARN] PCA object has no transform(), skipping PCA")
+                except Exception as e:
+                    print(f"[WARN] Failed to apply PCA: {e}. Continuing without PCA")
+
+            # Make predictions
+            print("[INFO] Making predictions")
+            try:
+                y_pred = model.predict(Xs)
+            except Exception as e:
+                raise RuntimeError(f"Model.predict failed: {e}")
+            y_pred = np.asarray(y_pred)
+            # Normalize predictions into columns
+            pred_df = None
+            if y_pred.ndim == 1:
+                pred_df = pd.DataFrame({"y_pred": y_pred})
+            elif y_pred.ndim == 2:
+                # multioutput
+                n = y_pred.shape[1]
+                names = [f"y_pred_{i}" for i in range(n)]
+                pred_df = pd.DataFrame(y_pred, columns=names)
+            else:
+                raise ValueError("Unsupported prediction shape")
+
+            # Attempt predict_proba if asked and model supports it
+            proba_df = None
+            if include_proba and task != "regression":
+                if hasattr(model, "predict_proba"):
+                    try:
+                        proba = model.predict_proba(Xs)
+                        # For binary, scikit returns (n_samples, 2); for multi-class it's (n_samples, n_classes)
+                        if proba.ndim == 2:
+                            # name classes if possible
+                            cls = None
+                            try:
+                                cls = list(getattr(model, "classes_", []))
+                            except Exception:
+                                cls = None
+                            if cls and len(cls) == proba.shape[1]:
+                                proba_cols = [f"proba_{c}" for c in cls]
+                            else:
+                                proba_cols = [f"proba_{i}" for i in range(proba.shape[1])]
+                            proba_df = pd.DataFrame(proba, columns=proba_cols)
+                        else:
+                            proba_df = pd.DataFrame(proba)
+                    except Exception as e:
+                        print(f"[WARN] predict_proba failed: {e}")
+                else:
+                    print("[INFO] Model has no predict_proba()")
+
+            # Compose final output: original inputs, predictions, probabilities (if any)
+            out_df = original_inputs.reset_index(drop=True).copy()
+            # ensure no column name clash
+            for c in pred_df.columns:
+                if c in out_df.columns:
+                    out_df.rename(columns={c: f"orig_{c}"}, inplace=True)
+            out_df = pd.concat([out_df.reset_index(drop=True), pred_df.reset_index(drop=True)], axis=1)
+            if proba_df is not None:
+                for c in proba_df.columns:
+                    if c in out_df.columns:
+                        out_df.rename(columns={c: f"orig_{c}"}, inplace=True)
+                out_df = pd.concat([out_df.reset_index(drop=True), proba_df.reset_index(drop=True)], axis=1)
+
+            # Add id column if requested
+            if input_id_col and input_id_col in out_df.columns:
+                pass
+            else:
+                out_df.insert(0, "_input_index", np.arange(len(out_df)))
+
+            # Save parquet
+            print(f"[INFO] Saving predictions to: {preds_path}")
+            ensure_dir_for(preds_path)
+            out_df.to_parquet(preds_path, index=False)
+            print("[INFO] Saved predictions. Columns:", list(out_df.columns))
+            print("="*80)
+            print("INFERENCE SUCCESS")
+            print("="*80)
+        except Exception as e:
+            print("="*80, file=sys.stderr)
+            print("ERROR DURING INFERENCE", file=sys.stderr)
+            print("="*80, file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --input_data
+      - {inputPath: input_data}
+      - --preprocessor
+      - {inputPath: preprocessor}
+      - --feature_selector
+      - {inputPath: feature_selector}
+      - --pca
+      - {inputPath: pca}
+      - --model_pickle
+      - {inputPath: model_pickle}
+      - --model_type
+      - {inputValue: model_type}
+      - --include_proba
+      - {inputValue: include_proba}
+      - --predictions
+      - {outputPath: predictions}
+      - --input_id_column
+      - {inputValue: input_id_column}
