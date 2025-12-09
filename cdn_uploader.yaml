@@ -5,7 +5,7 @@ inputs:
   - {name: feature_selector, type: Data, description: "Optional: feature selector file (cloudpickle/joblib). Can be file or directory (zipped).", optional: true}
   - {name: pca, type: Data, description: "Optional: PCA / transformer artifact (joblib/cloudpickle). Can be file or directory (zipped).", optional: true}
   - {name: config_string, type: String, description: "Config contents (string) to write to a temp file and upload"}
-  - {name: bearer_token, type: String, description: "Path to a file containing bearer token (will be read)"}
+  - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
   - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
   - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
   - {name: name, type: String, description: "Optional friendly name to include in output JSON", optional: true}
