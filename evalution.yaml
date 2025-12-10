@@ -1,4 +1,4 @@
-name: Evaluate Model v11
+name: Evaluate Model v12
 inputs:
   - {name: X_test, type: Dataset, description: "Path to test feature file or directory (raw, not preprocessed)"}
   - {name: y_test, type: Dataset, description: "Path to test target file (single-column file or multi-column with target_column)"}
@@ -542,115 +542,193 @@ implementation:
                     raise ValueError("Unsupported prediction output shape from model.predict")
 
             # Compute metrics
+            # -------------------------
+            # BUILD final metrics JSON LIST (one row per target)
+            # -------------------------
             print("[INFO] Computing metrics for predictions...")
-            minimal_metrics = {}
-            minimal_metrics["model_name"] = model_name_str
-            minimal_metrics["model_type"] = "classification" if task != "regression" else "regression"
-            loss_val = extract_loss(model)
 
-            per_target_metrics = {}
-            agg_numeric = {}
+            from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+            from sklearn.metrics import roc_auc_score as sk_roc_auc_score
+
+            metrics_rows = []
+
+            # Helper to fetch y_true for a given target name
+            def get_ytrue_for_target(tname):
+                ycol = f"y_true_{tname}"
+                # fallback to single y_true if present
+                if ycol in ytrue_df.columns:
+                    return ytrue_df[ycol].values
+                if "y_true" in ytrue_df.columns and preds_df.shape[1] == 1:
+                    return ytrue_df["y_true"].values
+                # if multiple preds but no matching y_true, return None
+                return None
 
             for pcol in preds_df.columns:
-                tname = pcol.replace("y_pred_", "")
+                # compute tname more robustly
+                if pcol == "y_pred" and preds_df.shape[1] == 1:
+                    # single-output: no appended target
+                    tname = ""
+                else:
+                    tname = pcol.replace("y_pred_", "")
+                # build model_name value (skip colon if tname empty)
+                model_name_val = f"{model_name_str}:{tname}" if tname else model_name_str
                 ypred_vals = preds_df[pcol].values
-                ytrue_col = f"y_true_{tname}"
-                
-                if ytrue_col not in ytrue_df.columns:
-                    # Fallback: if single y_true column exists
-                    if "y_true" in ytrue_df.columns and preds_df.shape[1] == 1:
-                        ytrue_vals = ytrue_df["y_true"].values
-                    else:
-                        print(f"[WARN] No ground truth column for prediction {pcol} — skipping metrics")
-                        continue
-                else:
-                    ytrue_vals = ytrue_df[ytrue_col].values
+                ytrue_vals = get_ytrue_for_target(tname)
 
+                # build a base row with model_name and model_type
+                row = {
+                    "model_name": model_name_val,
+                    "model_type": "regression" if task == "regression" else "classification"
+                }
+
+                # If regression: numeric metrics
                 if task == "regression":
-                    ytrue_num = pd.to_numeric(ytrue_vals, errors="coerce")
-                    valid_mask = ~np.isnan(ytrue_num)
-                    if not valid_mask.all():
-                        print(f"[WARN] Dropping {np.sum(~valid_mask)} rows with NaN y_true for {tname}")
-                    if valid_mask.sum() == 0:
-                        print(f"[WARN] No valid ground truth for {tname}; skipping")
-                        continue
-                    ytrue_f = ytrue_num[valid_mask]
-                    ypred_f = np.asarray(ypred_vals)[valid_mask]
-                    mse_val = float(mean_squared_error(ytrue_f, ypred_f))
-                    rmse_val = float(np.sqrt(mse_val))
-                    r2_val = float(r2_score(ytrue_f, ypred_f))
-                    mae_val = float(mean_absolute_error(ytrue_f, ypred_f))
-                    per_target_metrics[tname] = {
-                        "rmse": round(rmse_val, 6),
-                        "mse": round(mse_val, 6),
-                        "mae": round(mae_val, 6),
-                        "r2": round(r2_val, 6)
-                    }
-                    agg_numeric.setdefault("rmse", []).append(rmse_val)
-                    agg_numeric.setdefault("mse", []).append(mse_val)
-                    agg_numeric.setdefault("mae", []).append(mae_val)
-                    agg_numeric.setdefault("r2", []).append(r2_val)
-                else:
-                    ytrue_c = ytrue_vals
-                    ypred_c = ypred_vals
-                    # Try to align types
-                    try:
-                        if pd.api.types.is_numeric_dtype(pd.Series(ytrue_c)) and not pd.api.types.is_numeric_dtype(pd.Series(ypred_c)):
-                            ypred_c = pd.Series(ypred_c).astype(pd.Series(ytrue_c).dtype).values
-                        elif not pd.api.types.is_numeric_dtype(pd.Series(ytrue_c)) and pd.api.types.is_numeric_dtype(pd.Series(ypred_c)):
-                            ytrue_c = pd.Series(ytrue_c).astype(str).values
-                            ypred_c = pd.Series(ypred_c).astype(str).values
-                    except Exception:
-                        pass
-                    mask_valid = pd.notna(ytrue_c)
-                    if not mask_valid.all():
-                        ytrue_c = ytrue_c[mask_valid]
-                        ypred_c = np.asarray(ypred_c)[mask_valid]
-                    if len(ytrue_c) == 0:
-                        print(f"[WARN] No valid ground truth for {tname}; skipping")
-                        continue
-                    acc = float(accuracy_score(ytrue_c, ypred_c))
-                    precision_w = float(precision_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
-                    recall_w = float(recall_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
-                    f1_w = float(f1_score(ytrue_c, ypred_c, average="weighted", zero_division=0))
-                    per_target_metrics[tname] = {
-                        "accuracy": round(acc, 6),
-                        "precision": round(precision_w, 6),
-                        "recall": round(recall_w, 6),
-                        "f1": round(f1_w, 6)
-                    }
-                    agg_numeric.setdefault("accuracy", []).append(acc)
-                    agg_numeric.setdefault("precision", []).append(precision_w)
-                    agg_numeric.setdefault("recall", []).append(recall_w)
-                    agg_numeric.setdefault("f1", []).append(f1_w)
-                    if loss_val is not None:
+                    if ytrue_vals is None:
+                        # cannot compute regression metrics without ground truth
+                        row.update({"r2_score": None, "mse": None, "rmse_score": None})
+                    else:
                         try:
-                            per_target_metrics[tname]["loss"] = float(round(loss_val, 6))
+                            ytrue_num = pd.to_numeric(ytrue_vals, errors="coerce")
+                            valid_mask = ~np.isnan(ytrue_num)
+                            if valid_mask.sum() == 0:
+                                row.update({"r2_score": None, "mse": None, "rmse_score": None})
+                            else:
+                                ytrue_f = ytrue_num[valid_mask]
+                                ypred_f = np.asarray(ypred_vals)[valid_mask].astype(float)
+                                mse_val = float(mean_squared_error(ytrue_f, ypred_f))
+                                rmse_val = float(np.sqrt(mse_val))
+                                r2_val = float(r2_score(ytrue_f, ypred_f))
+                                row.update({
+                                    "r2_score": round(r2_val, 6),
+                                    "mse": round(mse_val, 6),
+                                    "rmse_score": round(rmse_val, 6)
+                                })
                         except Exception:
+                            row.update({"r2_score": None, "mse": None, "rmse_score": None})
+
+                # If classification: classification metrics
+                else:
+                    # Default placeholders
+                    row.update({
+                        "accuracy": None,
+                        "precision_score": None,
+                        "recall": None,
+                        "f1_score": None,
+                        "roc_auc": None,
+                        "loss": None,
+                        "confusion_matrix": []
+                    })
+
+                    # Try to use computed per_target_metrics values if present
+                    if tname in per_target_metrics:
+                        m = per_target_metrics[tname]
+                        # map keys if present
+                        row["accuracy"] = m.get("accuracy", None)
+                        row["precision_score"] = m.get("precision", None)
+                        row["recall"] = m.get("recall", None)
+                        row["f1_score"] = m.get("f1", None)
+                        # loss may exist in per_target_metrics
+                        if "loss" in m:
+                            try:
+                                row["loss"] = str(m.get("loss"))
+                            except Exception:
+                                row["loss"] = None
+
+                    # If ground truth available, recompute confusion_matrix and possibly roc_auc
+                    if ytrue_vals is not None:
+                        try:
+                            # Ensure arrays are aligned length-wise
+                            ytrue_arr = np.asarray(ytrue_vals)
+                            ypred_arr = np.asarray(ypred_vals)
+
+                            # trim to same length if needed
+                            n = min(len(ytrue_arr), len(ypred_arr))
+                            ytrue_arr = ytrue_arr[:n]
+                            ypred_arr = ypred_arr[:n]
+
+                            # confusion matrix (convert to list-of-lists for JSON)
+                            try:
+                                cm = sk_confusion_matrix(ytrue_arr, ypred_arr)
+                                # convert numpy array to nested lists
+                                row["confusion_matrix"] = cm.tolist()
+                            except Exception:
+                                # fallback: empty list
+                                row["confusion_matrix"] = []
+
+                            # Try ROC AUC (only for binary or if probability preds available)
+                            roc_val = None
+                            try:
+                                # attempt to find a proba column in preds_df (common name: same pcol + "_proba" or "proba_<tname>")
+                                proba_candidates = []
+                                cand1 = pcol + "_proba"
+                                cand2 = f"proba_{tname}"
+                                if cand1 in preds_df.columns:
+                                    proba_candidates.append(cand1)
+                                if cand2 in preds_df.columns:
+                                    proba_candidates.append(cand2)
+                                if proba_candidates:
+                                    proba_arr = preds_df[proba_candidates[0]].values
+                                    try:
+                                        par = np.asarray(proba_arr)
+                                        if par.ndim == 2:
+                                            # assume positive class at index 1
+                                            scores = par[:, 1]
+                                        else:
+                                            scores = par
+                                        roc_val = float(sk_roc_auc_score(ytrue_arr[:len(scores)], scores))
+                                    except Exception:
+                                        roc_val = None
+                                else:
+                                    # As a last resort, if ypred_arr is numeric scores (not class labels), try AUC
+                                    try:
+                                        ypred_num = pd.to_numeric(ypred_arr, errors="coerce")
+                                        if not np.isnan(ypred_num).all():
+                                            roc_val = float(sk_roc_auc_score(ytrue_arr, ypred_num))
+                                    except Exception:
+                                        roc_val = None
+                            except Exception:
+                                roc_val = None
+
+                            if roc_val is not None:
+                                row["roc_auc"] = round(float(roc_val), 6)
+                        except Exception:
+                            # any failure keep defaults
                             pass
 
-            # Build minimal_metrics
-            minimal_metrics["per_target"] = per_target_metrics
-            
-            # Aggregates
-            aggregates = {}
-            for k, vals in agg_numeric.items():
-                try:
-                    aggregates[f"{k}_mean"] = round(float(np.mean(vals)), 6)
-                except Exception:
-                    pass
-            minimal_metrics["aggregate"] = aggregates
-            minimal_metrics["model_loss_extracted"] = extract_loss(model)
+                    # If some metrics still None, try to compute basic ones from ytrue/pred
+                    if (row["accuracy"] is None or row["precision_score"] is None or
+                        row["recall"] is None or row["f1_score"] is None):
+                        if ytrue_vals is not None:
+                            try:
+                                ytrue_arr = np.asarray(ytrue_vals)
+                                ypred_arr = np.asarray(ypred_vals)
+                                n = min(len(ytrue_arr), len(ypred_arr))
+                                ytrue_arr = ytrue_arr[:n]
+                                ypred_arr = ypred_arr[:n]
 
-            # Save minimal metrics
-            print(f"[INFO] Saving minimal metrics to: {metrics_path}")
+                                row["accuracy"] = round(float(accuracy_score(ytrue_arr, ypred_arr)), 6)
+                                row["precision_score"] = round(float(precision_score(ytrue_arr, ypred_arr, average="weighted", zero_division=0)), 6)
+                                row["recall"] = round(float(recall_score(ytrue_arr, ypred_arr, average="weighted", zero_division=0)), 6)
+                                row["f1_score"] = round(float(f1_score(ytrue_arr, ypred_arr, average="weighted", zero_division=0)), 6)
+                            except Exception:
+                                pass
+
+                # append the built row
+                metrics_rows.append(row)
+
+            # Save metrics_rows (this is the multiple_rows_json you will pass to UpdateSchema)
+            print("[INFO] Final metrics rows (to be used as multiple_rows_json):")
+            try:
+                print(json.dumps(metrics_rows, indent=2, ensure_ascii=False))
+            except Exception:
+                print(str(metrics_rows))
+
+            print(f"[INFO] Saving metrics JSON to: {metrics_path}")
             ensure_dir_for(metrics_path)
             with open(metrics_path, "w", encoding="utf-8") as f:
-                json.dump(minimal_metrics, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] Metrics saved successfully")
+                json.dump(metrics_rows, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] Metrics JSON saved successfully: {metrics_path}")
 
-            # Prepare predictions output table
-            print(f"[INFO] Saving predictions to: {preds_path}")
             ensure_dir_for(preds_path)
 
             # Merge ytrue_df and preds_df side-by-side
