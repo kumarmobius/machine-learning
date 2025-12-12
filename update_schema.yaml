@@ -1,6 +1,5 @@
-name: Update Schema Row v3
+name: Update Schema Row v4
 description: Updates a row in a schema based on a mapping between column names and a JSON object.
-
 inputs:
   - { name: schema_id, type: String }
   - { name: update_data_json, type: String }
@@ -13,7 +12,6 @@ inputs:
   - { name: multiple_rows_json, type: String }
   - { name: bearer_auth_token, type: string }
   - { name: domain, type: String }
-  - { name: float_keys_json, type: String }
 
 implementation:
   container:
@@ -39,31 +37,43 @@ implementation:
         parser.add_argument('--schema_id', type=str, required=True)
         parser.add_argument('--update_data_json', type=str, required=True)
         parser.add_argument('--mapping_json', type=str, required=True)
-        parser.add_argument('--model_id', type=lambda v: v if (isinstance(v, str) and v.strip() == "-1") else (int(v) if v.lstrip('-').isdigit() else (float(v) if _is_float_like(v) else v)), required=True)
-        parser.add_argument('--execution_id', type=lambda v: v if (isinstance(v, str) and v.strip() == "-1") else (int(v) if v.lstrip('-').isdigit() else (float(v) if _is_float_like(v) else v)), required=True)
+        # Keep model_id as string input but convert to int if it's an integer-like string
+        parser.add_argument('--model_id', type=str, required=True)
+        # execution_id MUST be integer per your request
+        parser.add_argument('--execution_id', type=int, required=True)
         parser.add_argument('--tenant_id', type=str, required=True)
-        parser.add_argument('--project_id', type=lambda v: v if (isinstance(v, str) and v.strip() == "-1") else (int(v) if v.lstrip('-').isdigit() else (float(v) if _is_float_like(v) else v)), required=True)
+        parser.add_argument('--project_id', type=str, required=True)
         parser.add_argument('--architecture_type', type=str, required=True)
         parser.add_argument('--multiple_rows_json', type=str, required=True)
         parser.add_argument('--bearer_auth_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
-        parser.add_argument('--float_keys_json', type=str, required=False, default='-1')
-
-        # Helper used in inline argparse type lambdas
-        def _is_float_like(s):
-            try:
-                float(s)
-                return True
-            except:
-                return False
 
         args = parser.parse_args()
 
-        execution_id = args.execution_id
-        model_id = args.model_id
-        project_id_val = args.project_id
+        # Convert model_id / project_id to integer only if the original input is an integer string.
+        # Keep strings otherwise. Do not use any helper named _parse_numeric per request.
+        def _maybe_int_from_str(s):
+            if s is None:
+                return s
+            if isinstance(s, (int, float)):
+                return s
+            try:
+                s_str = s.strip()
+            except:
+                return s
+            # allow negative integers as well
+            if s_str.lstrip('-').isdigit():
+                try:
+                    return int(s_str)
+                except:
+                    return s
+            return s
 
-        # READ FILES
+        model_id = _maybe_int_from_str(args.model_id)
+        project_id_val = _maybe_int_from_str(args.project_id)
+        execution_id = args.execution_id  # guaranteed int from argparse
+
+        # READ FILES (support passing file path for tenant_id and bearer token)
         def read_file_if_path(path):
             if path and path != '-1':
                 if os.path.exists(path):
@@ -77,28 +87,16 @@ implementation:
         bearer_auth_token = read_file_if_path(args.bearer_auth_token)
         tenant_id_file_value = read_file_if_path(args.tenant_id)
 
+        # Parse JSON inputs (tolerate '-1' sentinel)
         try:
-            update_data = json.loads(args.update_data_json)
-            mapping = json.loads(args.mapping_json)
+            update_data = json.loads(args.update_data_json) if args.update_data_json and args.update_data_json != '-1' else {}
+            mapping = json.loads(args.mapping_json) if args.mapping_json and args.mapping_json != '-1' else {}
         except Exception as e:
-            print("Invalid JSON:", e, file=sys.stderr)
+            print("Invalid JSON for update_data_json or mapping_json:", e, file=sys.stderr)
             sys.exit(1)
 
-        float_keys = []
-        if args.float_keys_json != "-1":
-            try:
-                fk = json.loads(args.float_keys_json)
-                if isinstance(fk, list):
-                    float_keys = fk
-            except:
-                print("Warning: invalid float_keys_json", file=sys.stderr)
-
+        # coerce_if_needed now a no-op because float_keys_json has been removed
         def coerce_if_needed(key, value):
-            if key in float_keys:
-                try:
-                    return float(value)
-                except:
-                    return value
             return value
 
         headers = {
@@ -122,18 +120,26 @@ implementation:
             try:
                 rows = json.loads(args.multiple_rows_json)
                 if not isinstance(rows, list):
-                    raise Exception("multiple_rows_json must be list")
+                    raise Exception("multiple_rows_json must be a JSON list")
             except Exception as e:
                 print("Error in multiple_rows_json:", e, file=sys.stderr)
                 sys.exit(1)
 
             for row in rows:
+                # Inject tenant_id if provided via file/input
                 if args.tenant_id != "-1" and tenant_id_file_value:
                     row["tenant_id"] = tenant_id_file_value
+                # Inject projectId if provided (and parsed)
                 if args.project_id != "-1":
                     row["projectId"] = project_id_val
+                # Inject architecture_type if provided
                 if args.architecture_type != "-1":
                     row["architecture_type"] = args.architecture_type
+                # Inject model_id if provided and not already present
+                # Use the original string check to preserve '-1' sentinel behavior when needed
+                if args.model_id != "-1" and "model_id" not in row:
+                    row["model_id"] = model_id
+                # Ensure execution_id exists on each row (keep integer type)
                 if "execution_id" not in row:
                     row["execution_id"] = execution_id
 
@@ -242,5 +248,3 @@ implementation:
       - {inputPath: bearer_auth_token}
       - --domain
       - {inputValue: domain}
-      - --float_keys_json
-      - {inputValue: float_keys_json}
