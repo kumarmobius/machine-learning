@@ -1,4 +1,4 @@
-name: Update Schema Row v2
+name: Update Schema Row v3
 description: Updates a row in a schema based on a mapping between column names and a JSON object.
 
 inputs:
@@ -39,41 +39,29 @@ implementation:
         parser.add_argument('--schema_id', type=str, required=True)
         parser.add_argument('--update_data_json', type=str, required=True)
         parser.add_argument('--mapping_json', type=str, required=True)
-        parser.add_argument('--model_id', type=str, required=True)
-        parser.add_argument('--execution_id', type=str, required=True)
+        parser.add_argument('--model_id', type=lambda v: v if (isinstance(v, str) and v.strip() == "-1") else (int(v) if v.lstrip('-').isdigit() else (float(v) if _is_float_like(v) else v)), required=True)
+        parser.add_argument('--execution_id', type=lambda v: v if (isinstance(v, str) and v.strip() == "-1") else (int(v) if v.lstrip('-').isdigit() else (float(v) if _is_float_like(v) else v)), required=True)
         parser.add_argument('--tenant_id', type=str, required=True)
-        parser.add_argument('--project_id', type=str, required=True)
+        parser.add_argument('--project_id', type=lambda v: v if (isinstance(v, str) and v.strip() == "-1") else (int(v) if v.lstrip('-').isdigit() else (float(v) if _is_float_like(v) else v)), required=True)
         parser.add_argument('--architecture_type', type=str, required=True)
         parser.add_argument('--multiple_rows_json', type=str, required=True)
         parser.add_argument('--bearer_auth_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
         parser.add_argument('--float_keys_json', type=str, required=False, default='-1')
+
+        # Helper used in inline argparse type lambdas
+        def _is_float_like(s):
+            try:
+                float(s)
+                return True
+            except:
+                return False
+
         args = parser.parse_args()
 
-        # ----------------------------
-        # NUMERIC FIX FOR execution_id
-        # ----------------------------
-        def _smart_numeric_parse(v):
-            if v is None:
-                return v
-            if isinstance(v, str) and v.strip() == "-1":
-                return v
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, (int, float)):
-                    return parsed
-            except:
-                pass
-            try:
-                if "." in v:
-                    return float(v)
-                return int(v)
-            except:
-                return v
-
-        execution_id = _smart_numeric_parse(args.execution_id)
-        model_id = _smart_numeric_parse(args.model_id)
-        project_id_val = _smart_numeric_parse(args.project_id)
+        execution_id = args.execution_id
+        model_id = args.model_id
+        project_id_val = args.project_id
 
         # READ FILES
         def read_file_if_path(path):
