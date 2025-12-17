@@ -1,14 +1,15 @@
 name: Data loader v4
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
-  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
+  - {name: access_token, type: String, description: 'Bearer access token for API auth'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
   - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
   - {name: model_type, type: String, default: "classification", description: 'Type of model (classification or regression)'}
+
 outputs:
   - {name: train_set, type: Dataset}
-  - {name: test_x, type: Dataset}
-  - {name: test_y, type: Dataset}
+  - {name: test_data, type: Dataset}
+
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v38-gpu
@@ -34,8 +35,7 @@ implementation:
         parser.add_argument('--target_column', type=str, required=True)
         parser.add_argument('--model_type', type=str, default="classification")
         parser.add_argument('--train_set', type=str, required=True)
-        parser.add_argument('--test_x', type=str, required=True)
-        parser.add_argument('--test_y', type=str, required=True)
+        parser.add_argument('--test_data', type=str, required=True)
         args = parser.parse_args()
 
         # Read access token
@@ -45,70 +45,71 @@ implementation:
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger("api_retry")
 
-        # Setup HTTP session with retry
         session = requests.Session()
-        retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["POST"])
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
         adapter = HTTPAdapter(max_retries=retries)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
 
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-        payload = {"dbType": "TIDB", "entityId": "", "entityIds": [], "ownedOnly": False, "projections": [], "filter": {}, "startTime": 0, "endTime": 0}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}"
+        }
+
+        payload = {
+            "dbType": "TIDB",
+            "entityId": "",
+            "entityIds": [],
+            "ownedOnly": False,
+            "projections": [],
+            "filter": {},
+            "startTime": 0,
+            "endTime": 0
+        }
 
         try:
-            logger.info(" Sending request to API with retries enabled")
+            logger.info("Sending request to API with retries enabled")
             resp = session.post(args.api_url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
             raw_data = resp.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f" API request failed after retries: {e}")
+            logger.error(f"API request failed after retries: {e}")
             raise
 
-        # Create DataFrame
         df = pd.DataFrame(raw_data)
-        drop_cols = ["piMetadata", "execution_timestamp", "pipelineid", "component_id", "projectid"]
-        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-        # === DataFrame Diagnostics ===
-        print("===== FULL DATAFRAME SUMMARY =====")
-        print("Shape:", df.shape)
-        print("DF_HEAD:")
-        print(df.head().to_string())
-        print("DF_INFO:")
-        df.info()
-        print("DF_DTYPES:")
-        print(df.dtypes.to_string())
-        print("DF_NULL_COUNTS:")
-        print(df.isnull().sum().to_string())
+        drop_cols = [
+            "piMetadata",
+            "execution_timestamp",
+            "pipelineid",
+            "component_id",
+            "projectid"
+        ]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
         # === Prepare target ===
         if args.target_column in df.columns:
             target_values = df[args.target_column].copy()
         else:
-            logger.warning(f" Target column '{args.target_column}' not found. Creating zero target values.")
-            target_values = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index, name=args.target_column)
-        
-        # === Print target variable distribution if classification ===
-        if args.model_type.lower() == "classification":
-            print("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
-            print(target_values.value_counts(dropna=False).to_string())
-            print("Unique classes:", target_values.nunique())
-            print("Class distribution percentages:")
-            print((target_values.value_counts(dropna=False, normalize=True) * 100).to_string())
+            logger.warning(
+                f"Target column '{args.target_column}' not found. Creating zero target values."
+            )
+            target_values = pd.Series(
+                np.zeros(len(df), dtype=np.int32),
+                index=df.index,
+                name=args.target_column
+            )
+
+        # === Stratification logic ===
+        if args.model_type.lower() == "classification" and target_values.nunique() > 1:
+            stratify_param = target_values
         else:
-            print("Model type is regression — skipping target distribution summary.")
-        
-        # CRITICAL FIX: Stratify by actual target values (not binary mask!)
-        # This ensures train/test have the same class distribution
-        if args.model_type.lower() == "classification":
-            if target_values.nunique() > 1:
-                stratify_param = target_values  # ← FIXED: Use actual target (3 classes)
-                print(f"[INFO] Using stratified split by target (stratify={target_values.nunique()} classes)")
-            else:
-                stratify_param = None
-                print("[WARN] Only one class in target, stratification disabled")
-        else:
-            stratify_param = None  # No stratification for regression
+            stratify_param = None
 
         # === Convert split size ===
         split_size_input = float(args.split_size)
@@ -116,70 +117,30 @@ implementation:
         if not (0.0 < test_size < 1.0):
             raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
 
-        # === Perform train-test split ===
-        train_df, test_df, train_y, test_y = train_test_split(
-            df, target_values, test_size=test_size, random_state=42, stratify=stratify_param
+        # === Train-test split ===
+        train_df, test_df = train_test_split(
+            df,
+            test_size=test_size,
+            random_state=42,
+            stratify=stratify_param
         )
-        if args.model_type.lower() == "classification":
-            print("="*80)
-            print("CLASS DISTRIBUTION VERIFICATION")
-            print("="*80)
-            
-            print("TRAIN SET CLASS DISTRIBUTION:")
-            train_dist = train_y.value_counts(dropna=False).sort_index()
-            for cls, count in train_dist.items():
-                pct = (count / len(train_y)) * 100
-                print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
-            
-            print("TEST SET CLASS DISTRIBUTION:")
-            test_dist = test_y.value_counts(dropna=False).sort_index()
-            for cls, count in test_dist.items():
-                pct = (count / len(test_y)) * 100
-                print(f"  Class {cls}: {count:,} samples ({pct:.2f}%)")
-            
-            # Calculate distribution difference
-            print("DISTRIBUTION MATCH CHECK:")
-            train_pct = train_y.value_counts(normalize=True, dropna=False).sort_index()
-            test_pct = test_y.value_counts(normalize=True, dropna=False).sort_index()
-            max_diff = (train_pct - test_pct).abs().max() * 100
-            print(f"  Maximum class distribution difference: {max_diff:.2f}%")
-            
-            if max_diff > 5.0:
-                print("  [WARN] Large distribution mismatch detected! This may cause poor test performance.")
-            else:
-                print("  [OK] Train/test distributions are well matched.")
-            
-            print("="*80)
 
-        # === Create outputs ===
-        test_x_df = test_df.drop(columns=[args.target_column], errors="ignore")
-        train_set_df = train_df.copy()
-        test_y_df = pd.DataFrame({args.target_column: test_y})
-
-        # === Diagnostics for splits ===
+        # === Diagnostics ===
         print("===== TRAIN SET =====")
-        print("Shape:", train_set_df.shape)
-        print("Columns:", train_set_df.columns.tolist())
-        print(train_set_df.head(3).to_string())
+        print("Shape:", train_df.shape)
+        print(train_df.head(3).to_string())
 
-        print("===== TEST X (features only) =====")
-        print("Shape:", test_x_df.shape)
-        print("Columns:", test_x_df.columns.tolist())
-        print(test_x_df.head(3).to_string())
+        print("===== TEST DATA =====")
+        print("Shape:", test_df.shape)
+        print(test_df.head(3).to_string())
 
-        print("===== TEST Y (target only) =====")
-        print("Shape:", test_y_df.shape)
-        print(test_y_df.head(10).to_string(index=False))
 
-        # === Save Parquet Outputs ===
         os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
-        train_set_df.to_parquet(args.train_set, index=False)
+        train_df.to_parquet(args.train_set, index=False)
 
-        os.makedirs(os.path.dirname(args.test_x) or ".", exist_ok=True)
-        test_x_df.to_parquet(args.test_x, index=False)
+        os.makedirs(os.path.dirname(args.test_data) or ".", exist_ok=True)
+        test_df.to_parquet(args.test_data, index=False)
 
-        os.makedirs(os.path.dirname(args.test_y) or ".", exist_ok=True)
-        test_y_df.to_parquet(args.test_y, index=False)
     args:
       - --api_url
       - {inputValue: api_url}
@@ -193,7 +154,5 @@ implementation:
       - {inputValue: model_type}
       - --train_set
       - {outputPath: train_set}
-      - --test_x
-      - {outputPath: test_x}
-      - --test_y
-      - {outputPath: test_y}
+      - --test_data
+      - {outputPath: test_data}
