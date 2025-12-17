@@ -1,0 +1,150 @@
+name: Upload to CDN
+description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs along with a schema JSON containing an epoch timestamp.
+inputs:
+  - {name: test_data, type: Dataset, description: "Test dataset file"}
+  - {name: train_x, type: Dataset, description: "Training features dataset"}
+  - {name: train_y, type: Dataset, description: "Training labels dataset"}
+  - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
+  - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
+  - {name: feature_selector, type: Data, description: "Feature selector pickle"}
+  - {name: bearer_token, type: String, description: "Bearer token for CDN authentication"}
+  - {name: domain, type: String, description: "Upload service base domain"}
+  - {name: get_cdn, type: String, description: "Public CDN base domain"}
+
+outputs:
+  - {name: train_x_cdn_url, type: String}
+  - {name: train_y_cdn_url, type: String}
+  - {name: preprocesser_pickle_cdn_url, type: String}
+  - {name: preprocesser_metadata_cdn_url, type: String}
+  - {name: feature_selector_cdn_url, type: String}
+  - {name: test_data_cdn_url, type: String}
+  - {name: schema_json, type: Data}
+
+implementation:
+  container:
+    image: python:3.8-slim
+    command:
+      - sh
+      - -ec
+      - |
+        if ! command -v curl >/dev/null 2>&1; then
+          apt-get update >/dev/null && apt-get install -y curl >/dev/null
+        fi
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+        import time
+
+        parser = argparse.ArgumentParser()
+
+        parser.add_argument('--test_data', required=True)
+        parser.add_argument('--train_x', required=True)
+        parser.add_argument('--train_y', required=True)
+        parser.add_argument('--preprocesser_pickle', required=True)
+        parser.add_argument('--preprocesser_metadata', required=True)
+        parser.add_argument('--feature_selector', required=True)
+
+        parser.add_argument('--bearer_token', required=True)
+        parser.add_argument('--domain', required=True)
+        parser.add_argument('--get_cdn', required=True)
+
+        parser.add_argument('--test_data_cdn_url', required=True)
+        parser.add_argument('--train_x_cdn_url', required=True)
+        parser.add_argument('--train_y_cdn_url', required=True)
+        parser.add_argument('--preprocesser_pickle_cdn_url', required=True)
+        parser.add_argument('--preprocesser_metadata_cdn_url', required=True)
+        parser.add_argument('--feature_selector_cdn_url', required=True)
+        parser.add_argument('--schema_json', required=True)
+
+        args = parser.parse_args()
+
+        with open(args.bearer_token, "r") as f:
+            bearer_token = f.read().strip()
+
+        upload_url = (
+            f"{args.domain}"
+            "/mobius-content-service/v1.0/content/upload"
+            "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+        )
+
+        def upload(file_path, output_path):
+            cmd = [
+                "curl",
+                "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{file_path}",
+                "--fail",
+                "--show-error"
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, check=True)
+            response = json.loads(result.stdout.decode())
+
+            relative_url = response.get("cdnUrl")
+            if not relative_url:
+                raise RuntimeError(f"cdnUrl missing in response: {response}")
+
+            full_url = f"{args.get_cdn}{relative_url}"
+
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "w") as f:
+                f.write(full_url)
+
+            return full_url
+
+        cdn_map = {}
+        cdn_map["train_x_cdn"] = upload(args.train_x, args.train_x_cdn_url)
+        cdn_map["train_y_cdn"] = upload(args.train_y, args.train_y_cdn_url)
+        cdn_map["preprocessor_cdn"] = upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url)
+        cdn_map["preprocessor_metadata_cdn"] = upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url)
+        cdn_map["feature_selector_cdn"] = upload(args.feature_selector, args.feature_selector_cdn_url)
+        cdn_map["test_data_cdn"] = upload(args.test_data, args.test_data_cdn_url)
+
+        schema = {
+            "schema_timestamp_epoch": int(time.time()),
+            **cdn_map
+        }
+
+        os.makedirs(os.path.dirname(args.schema_json), exist_ok=True)
+        with open(args.schema_json, "w") as f:
+            json.dump(schema, f, indent=2)
+
+    args:
+      - --test_data
+      - {inputPath: test_data}
+      - --train_x
+      - {inputPath: train_x}
+      - --train_y
+      - {inputPath: train_y}
+      - --preprocesser_pickle
+      - {inputPath: preprocesser_pickle}
+      - --preprocesser_metadata
+      - {inputPath: preprocesser_metadata}
+      - --feature_selector
+      - {inputPath: feature_selector}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --train_x_cdn_url
+      - {outputPath: train_x_cdn_url}
+      - --train_y_cdn_url
+      - {outputPath: train_y_cdn_url}
+      - --preprocesser_pickle_cdn_url
+      - {outputPath: preprocesser_pickle_cdn_url}
+      - --preprocesser_metadata_cdn_url
+      - {outputPath: preprocesser_metadata_cdn_url}
+      - --feature_selector_cdn_url
+      - {outputPath: feature_selector_cdn_url}
+      - --test_data_cdn_url
+      - {outputPath: test_data_cdn_url}
+      - --schema_json
+      - {outputPath: schema_json}
