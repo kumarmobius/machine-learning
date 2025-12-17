@@ -107,7 +107,7 @@ implementation:
         cdn_map["test_data_cdn"] = upload(args.test_data, args.test_data_cdn_url)
 
         schema = {
-            "schema_timestamp_epoch": int(time.time()),
+            "timestamp": int(time.time()),
             **cdn_map
         }
 
