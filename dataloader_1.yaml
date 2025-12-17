@@ -11,7 +11,7 @@ outputs:
   - {name: test_y, type: Dataset}
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: gurpreetgandhi/nesy-factory:v38-gpu
     command:
       - python3
       - -u
