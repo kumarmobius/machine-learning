@@ -7,7 +7,7 @@ inputs:
   - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
   - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
   - {name: feature_selector, type: Data, description: "Feature selector pickle"}
-  - {name: bearer_token, type: String, description: "Bearer token for CDN authentication"}
+  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
   - {name: domain, type: String, description: "Upload service base domain"}
   - {name: get_cdn, type: String, description: "Public CDN base domain"}
 
