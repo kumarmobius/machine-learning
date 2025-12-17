@@ -4,7 +4,7 @@ inputs:
   - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from Brick 1"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
-  - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none", optional: true, default: "drop_iqr"}
+  - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none", optional: true, default: "none"}
   - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
   - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer", optional: true, default: "5000"}
   - {name: rare_threshold, type: Float, description: "Rare label threshold", optional: true, default: "0.01"}
