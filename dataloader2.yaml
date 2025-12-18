@@ -1,4 +1,4 @@
-name: Data loader v4 with Pagination
+name: Data loader v5 with Pagination
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
@@ -221,11 +221,11 @@ implementation:
         print(f"Total records fetched: {len(all_records)}")
         print(f"Final dataset shape: {df.shape}")
         
-        print("\n===== TRAIN SET =====")
+        print("===== TRAIN SET =====")
         print("Shape:", train_df.shape)
         print(train_df.head(3).to_string())
 
-        print("\n===== TEST DATA =====")
+        print("===== TEST DATA =====")
         print("Shape:", test_df.shape)
         print(test_df.head(3).to_string())
 
