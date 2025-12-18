@@ -1,6 +1,7 @@
-name: PCA Transformer v1.3
+name: PCA Transformer v2
 inputs:
   - {name: input_data, type: Dataset, description: "Input dataset (CSV, Parquet, or JSONL)"}
+  - {name: enable_pca, type: Boolean, description: "Enable/disable PCA transformation", optional: true, default: false}
   - {name: pca_variant, type: String, description: "PCA variant: pca, kernel, incremental, sparse, fa, ica", optional: true, default: "pca"}
   - {name: n_components, type: String, description: "Number of components or 'auto'", optional: true, default: "auto"}
   - {name: variance_threshold, type: Float, description: "Explained variance threshold for auto components in standard PCA (0–1)", optional: true, default: "0.95"}
@@ -196,6 +197,7 @@ implementation:
         # ---------------------------------------------------------------------
         parser = argparse.ArgumentParser()
         parser.add_argument("--input_data", type=str, required=True)
+        parser.add_argument("--enable_pca", type=str, default="false")
         parser.add_argument("--pca_variant", type=str, default="pca")
         parser.add_argument("--n_components", type=str, default="auto")
         parser.add_argument("--variance_threshold", type=str, default="0.95")
@@ -206,9 +208,13 @@ implementation:
         args = parser.parse_args()
 
         try:
+            # Parse enable_pca boolean
+            enable_pca = str(args.enable_pca).strip().lower() in ("true", "1", "yes")
+
             print("=" * 80)
             print("PCA TRANSFORMATION BRICK")
             print("=" * 80)
+            print(f"[INFO] PCA Enabled: {enable_pca}")
 
             print("[STEP 1/6] Loading dataset...")
             df_raw = pd.read_parquet(args.input_data)
@@ -218,94 +224,133 @@ implementation:
             df_num = clean_and_select_numeric(df_raw)
             print(f"[INFO] Numeric shape: {df_num.shape[0]} rows x {df_num.shape[1]} columns")
 
-            p = df_num.shape[1]
-            variance_threshold = float(args.variance_threshold)
-            print("[STEP 3/6] Resolving PCA configuration...")
-            n_comp, auto_info = parse_n_components(
-                args.n_components,
-                args.pca_variant,
-                p,
-                variance_threshold,
-                df_num
-            )
+            if not enable_pca:
+                # PCA is disabled - pass through the numeric data unchanged
+                print("[INFO] PCA is DISABLED. Passing through numeric data without transformation.")
+                
+                X_output = df_num.values
+                feature_names = list(df_num.columns)
+                output_columns = feature_names
+                
+                metadata = {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "pca_enabled": False,
+                    "original_shape": {
+                        "rows": int(df_raw.shape[0]),
+                        "cols": int(df_raw.shape[1]),
+                    },
+                    "numeric_shape": {
+                        "rows": int(df_num.shape[0]),
+                        "cols": int(df_num.shape[1]),
+                    },
+                    "transformed_shape": {
+                        "rows": int(X_output.shape[0]),
+                        "cols": int(X_output.shape[1]),
+                    },
+                    "feature_names": feature_names,
+                    "note": "PCA transformation was disabled. Output is the numeric subset of input data."
+                }
+                
+                # Save a dummy model (None) since no PCA was performed
+                model_to_save = None
+                
+            else:
+                # PCA is enabled - perform transformation
+                print("[INFO] PCA is ENABLED. Performing transformation...")
+                
+                p = df_num.shape[1]
+                variance_threshold = float(args.variance_threshold)
+                print("[STEP 3/6] Resolving PCA configuration...")
+                n_comp, auto_info = parse_n_components(
+                    args.n_components,
+                    args.pca_variant,
+                    p,
+                    variance_threshold,
+                    df_num
+                )
 
-            print(f"[INFO] PCA variant: {args.pca_variant}")
-            print(f"[INFO] n_components (resolved): {n_comp}")
-            if auto_info.get("auto_mode") != "manual":
-                print(f"[INFO] Auto mode: {auto_info.get('auto_mode')}")
+                print(f"[INFO] PCA variant: {args.pca_variant}")
+                print(f"[INFO] n_components (resolved): {n_comp}")
+                if auto_info.get("auto_mode") != "manual":
+                    print(f"[INFO] Auto mode: {auto_info.get('auto_mode')}")
 
-            print("[STEP 4/6] Building and fitting PCA model...")
-            model = build_pca_model(args.pca_variant, n_comp, args.kernel)
-            X_num = df_num.values
-            X_trans = model.fit_transform(X_num)
-            print(f"[INFO] Transformed shape: {X_trans.shape[0]} rows x {X_trans.shape[1]} components")
+                print("[STEP 4/6] Building and fitting PCA model...")
+                model = build_pca_model(args.pca_variant, n_comp, args.kernel)
+                X_num = df_num.values
+                X_output = model.fit_transform(X_num)
+                print(f"[INFO] Transformed shape: {X_output.shape[0]} rows x {X_output.shape[1]} components")
 
-            print("[STEP 5/6] Generating metadata...")
-            variance_stats = extract_variance_stats(model, args.pca_variant)
-            feature_names = list(df_num.columns)
-            top_loadings = compute_top_loadings(model, feature_names, top_n=10)
+                print("[STEP 5/6] Generating metadata...")
+                variance_stats = extract_variance_stats(model, args.pca_variant)
+                feature_names = list(df_num.columns)
+                top_loadings = compute_top_loadings(model, feature_names, top_n=10)
 
-            pc_names = [f"PC{i+1}" for i in range(X_trans.shape[1])]
+                output_columns = [f"PC{i+1}" for i in range(X_output.shape[1])]
 
-            metadata = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "pca_variant": str(args.pca_variant),
-                "kernel": str(args.kernel) if str(args.pca_variant).lower() in ("kernel", "kernel_pca", "kpca") else None,
-                "n_components_input": str(args.n_components),
-                "n_components_resolved": int(X_trans.shape[1]),
-                "variance_threshold": variance_threshold if str(args.n_components).strip().lower() == "auto" and str(args.pca_variant).strip().lower() in ("pca", "standard", "standard_pca") else None,
-                "auto_info": auto_info,
-                "original_shape": {
-                    "rows": int(df_raw.shape[0]),
-                    "cols": int(df_raw.shape[1]),
-                },
-                "numeric_shape": {
-                    "rows": int(df_num.shape[0]),
-                    "cols": int(df_num.shape[1]),
-                },
-                "transformed_shape": {
-                    "rows": int(X_trans.shape[0]),
-                    "cols": int(X_trans.shape[1]),
-                },
-                "feature_names": feature_names,
-                "component_names": pc_names,
-                "variance": variance_stats,
-                "top_contributing_features_per_component": top_loadings,
-            }
+                metadata = {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "pca_enabled": True,
+                    "pca_variant": str(args.pca_variant),
+                    "kernel": str(args.kernel) if str(args.pca_variant).lower() in ("kernel", "kernel_pca", "kpca") else None,
+                    "n_components_input": str(args.n_components),
+                    "n_components_resolved": int(X_output.shape[1]),
+                    "variance_threshold": variance_threshold if str(args.n_components).strip().lower() == "auto" and str(args.pca_variant).strip().lower() in ("pca", "standard", "standard_pca") else None,
+                    "auto_info": auto_info,
+                    "original_shape": {
+                        "rows": int(df_raw.shape[0]),
+                        "cols": int(df_raw.shape[1]),
+                    },
+                    "numeric_shape": {
+                        "rows": int(df_num.shape[0]),
+                        "cols": int(df_num.shape[1]),
+                    },
+                    "transformed_shape": {
+                        "rows": int(X_output.shape[0]),
+                        "cols": int(X_output.shape[1]),
+                    },
+                    "feature_names": feature_names,
+                    "component_names": output_columns,
+                    "variance": variance_stats,
+                    "top_contributing_features_per_component": top_loadings,
+                }
+                
+                model_to_save = model
 
             print("[STEP 6/6] Saving outputs...")
-            # Save transformed data
+            # Save output data
             ensure_dir_for(args.output_data)
-            df_pc = pd.DataFrame(X_trans, columns=pc_names)
-            df_pc.to_parquet(args.output_data, index=False)
-            print(f"[INFO] Saved transformed data to: {args.output_data}")
+            df_output = pd.DataFrame(X_output, columns=output_columns)
+            df_output.to_parquet(args.output_data, index=False)
+            print(f"[INFO] Saved output data to: {args.output_data}")
 
             # Save model (cloudpickle)
             ensure_dir_for(args.model_out)
             with open(args.model_out, "wb") as f:
-                cloudpickle.dump(model, f)
-            print(f"[INFO] Saved PCA model to: {args.model_out}")
+                cloudpickle.dump(model_to_save, f)
+            print(f"[INFO] Saved model to: {args.model_out}")
 
             # Save metadata JSON
             ensure_dir_for(args.metadata_out)
             with open(args.metadata_out, "w") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] Saved PCA metadata to: {args.metadata_out}")
+            print(f"[INFO] Saved metadata to: {args.metadata_out}")
 
             print("=" * 80)
             print("PCA BRICK COMPLETE - SUMMARY")
             print("=" * 80)
+            print(f"PCA Enabled:    {enable_pca}")
             print(f"Original shape: {df_raw.shape[0]} rows x {df_raw.shape[1]} columns")
             print(f"Numeric shape:  {df_num.shape[0]} rows x {df_num.shape[1]} columns")
-            print(f"Transformed:    {X_trans.shape[0]} rows x {X_trans.shape[1]} components")
-            print(f"PCA variant:    {args.pca_variant}")
-            print(f"n_components:   {X_trans.shape[1]}")
+            print(f"Output shape:   {X_output.shape[0]} rows x {X_output.shape[1]} columns")
+            if enable_pca:
+                print(f"PCA variant:    {args.pca_variant}")
+                print(f"n_components:   {X_output.shape[1]}")
             print("Outputs:")
             print(f"  - transformed_X: {args.output_data}")
             print(f"  - pca_model:     {args.model_out}")
             print(f"  - pca_metadata:  {args.metadata_out}")
             print("=" * 80)
-            print("SUCCESS: PCA transformation finished.")
+            print("SUCCESS: Processing finished.")
             print("=" * 80)
 
         except Exception as exc:
@@ -315,6 +360,8 @@ implementation:
     args:
       - --input_data
       - {inputPath: input_data}
+      - --enable_pca
+      - {inputValue: enable_pca}
       - --pca_variant
       - {inputValue: pca_variant}
       - --n_components
