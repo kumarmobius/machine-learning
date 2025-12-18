@@ -16,7 +16,7 @@ outputs:
 
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: kumar2004/mobius:1.0
     command:
       - python3
       - -u
