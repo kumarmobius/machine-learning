@@ -6,6 +6,8 @@ inputs:
   - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
   - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
   - {name: feature_selector, type: Data, description: "Feature selector pickle"}
+  - {name: pca_model, type: Data, description: "PCA model pickle file"}
+  - {name: pca_metadata, type: Data, description: "PCA metadata JSON"}
   - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
   - {name: domain, type: String, description: "Upload service base domain"}
   - {name: get_cdn, type: String, description: "Public CDN base domain"}
@@ -16,6 +18,8 @@ outputs:
   - {name: preprocesser_pickle_cdn_url, type: String}
   - {name: preprocesser_metadata_cdn_url, type: String}
   - {name: feature_selector_cdn_url, type: String}
+  - {name: pca_model_cdn_url, type: String}
+  - {name: pca_metadata_cdn_url, type: String}
   - {name: test_data_cdn_url, type: String}
   - {name: schema_json, type: String}
 
@@ -48,6 +52,8 @@ implementation:
         parser.add_argument('--preprocesser_pickle', required=True)
         parser.add_argument('--preprocesser_metadata', required=True)
         parser.add_argument('--feature_selector', required=True)
+        parser.add_argument('--pca_model', required=True)
+        parser.add_argument('--pca_metadata', required=True)
 
         parser.add_argument('--bearer_token', required=True)
         parser.add_argument('--domain', required=True)
@@ -59,6 +65,8 @@ implementation:
         parser.add_argument('--preprocesser_pickle_cdn_url', required=True)
         parser.add_argument('--preprocesser_metadata_cdn_url', required=True)
         parser.add_argument('--feature_selector_cdn_url', required=True)
+        parser.add_argument('--pca_model_cdn_url', required=True)
+        parser.add_argument('--pca_metadata_cdn_url', required=True)
         parser.add_argument('--schema_json', required=True)
 
         args = parser.parse_args()
@@ -103,6 +111,8 @@ implementation:
         cdn_map["preprocessor_cdn"] = upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url)
         cdn_map["preprocessor_metadata_cdn"] = upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url)
         cdn_map["feature_selector_cdn"] = upload(args.feature_selector, args.feature_selector_cdn_url)
+        cdn_map["pca_cdn"] = upload(args.pca_model, args.pca_model_cdn_url)
+        cdn_map["pca_metadata_cdn"] = upload(args.pca_metadata, args.pca_metadata_cdn_url)
         cdn_map["test_data_cdn"] = upload(args.test_data, args.test_data_cdn_url)
 
         schema = {
@@ -127,6 +137,10 @@ implementation:
       - {inputPath: preprocesser_metadata}
       - --feature_selector
       - {inputPath: feature_selector}
+      - --pca_model
+      - {inputPath: pca_model}
+      - --pca_metadata
+      - {inputPath: pca_metadata}
       - --bearer_token
       - {inputPath: bearer_token}
       - --domain
@@ -143,6 +157,10 @@ implementation:
       - {outputPath: preprocesser_metadata_cdn_url}
       - --feature_selector_cdn_url
       - {outputPath: feature_selector_cdn_url}
+      - --pca_model_cdn_url
+      - {outputPath: pca_model_cdn_url}
+      - --pca_metadata_cdn_url
+      - {outputPath: pca_metadata_cdn_url}
       - --test_data_cdn_url
       - {outputPath: test_data_cdn_url}
       - --schema_json
