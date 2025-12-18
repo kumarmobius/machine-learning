@@ -1,4 +1,4 @@
-name: Data loader test
+name: Data loader v4 with Pagination
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
@@ -43,7 +43,7 @@ implementation:
             access_token = f.read().strip()
 
         logging.basicConfig(level=logging.INFO)
-        logger = logging.getLogger("api_retry")
+        logger = logging.getLogger("api_pagination")
 
         session = requests.Session()
         retries = Retry(
@@ -72,27 +72,118 @@ implementation:
             "endTime": 0
         }
 
+        def extract_records(body):
+            if isinstance(body, list):
+                return body
+            if isinstance(body, dict):
+                # Common patterns for data containers
+                for key in ["data", "content", "records", "results", "items"]:
+                    if key in body and isinstance(body[key], list):
+                        return body[key]
+                # If dict has no list container, might be single record
+                return [body]
+            return []
+
+        def discover_page_metadata(body):
+            page_size = None
+            total_pages = None
+            total_instances = None
+
+            if isinstance(body, dict):
+                page_size = body.get("pageSize")
+                total_pages = body.get("totalPages")
+                total_instances = body.get("totalInstances")
+
+                # Check nested "page" object
+                if "page" in body and isinstance(body["page"], dict):
+                    p = body["page"]
+                    page_size = page_size or p.get("pageSize")
+                    total_pages = total_pages or p.get("totalPages")
+                    total_instances = total_instances or p.get("totalInstances")
+
+            return page_size, total_pages, total_instances
+
+        # === STEP 1: Metadata Discovery ===
+        initial_size = 2000
+        base_url = args.api_url.rstrip('/')
+        separator = '&' if '?' in base_url else '?'
+        meta_url = f"{base_url}{separator}page=0&size={initial_size}&showPageableMetaData=true"
+
+        logger.info("Step 1: Making metadata discovery request")
         try:
-            logger.info("Sending request to API with retries enabled")
-            resp = session.post(args.api_url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            raw_data = resp.json()
+            resp_meta = session.post(meta_url, headers=headers, json=payload, timeout=30)
+            resp_meta.raise_for_status()
+            body_meta = resp_meta.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed after retries: {e}")
+            logger.error(f"Metadata request failed: {e}")
             raise
 
-        df = pd.DataFrame(raw_data)
+        # === STEP 2: Extract Pagination Metadata ===
+        detected_page_size, total_pages, total_instances = discover_page_metadata(body_meta)
+        
+        logger.info(f"Detected: pageSize={detected_page_size}, totalPages={total_pages}, totalInstances={total_instances}")
 
-        drop_cols = [
-            "piMetadata",
-            "execution_timestamp",
-            "pipelineid",
-            "component_id",
-            "projectid"
-        ]
-        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+        # === STEP 3: Decide Page Size ===
+        if detected_page_size:
+            page_size = min(detected_page_size, initial_size)
+            logger.info(f"Using server pageSize: {page_size}")
+        else:
+            inferred_records = extract_records(body_meta)
+            page_size = len(inferred_records) if inferred_records else initial_size
+            logger.info(f"Inferred pageSize from response: {page_size}")
 
-        # === Prepare target ===
+        # === STEP 4: Determine Total Pages ===
+        if total_pages is None and total_instances:
+            total_pages = (total_instances + page_size - 1) // page_size
+            logger.info(f"Calculated totalPages from totalInstances: {total_pages}")
+
+        # === STEP 5: Pagination Strategy ===
+        all_records = []
+
+        if total_pages is None:
+            # Case A: No pagination metadata - take what we got and stop
+            logger.warning("No pagination metadata found. Assuming single-page API.")
+            all_records.extend(extract_records(body_meta))
+        else:
+            # Case B: Pagination exists - fetch all pages deterministically
+            logger.info(f"Fetching {total_pages} pages with size {page_size}")
+            
+            for page in range(total_pages):
+                page_url = f"{base_url}{separator}page={page}&size={page_size}&showPageableMetaData=true"
+                
+                logger.info(f"Fetching page {page + 1}/{total_pages}")
+                try:
+                    resp_page = session.post(page_url, headers=headers, json=payload, timeout=30)
+                    resp_page.raise_for_status()
+                    body_page = resp_page.json()
+                    
+                    records = extract_records(body_page)
+                    all_records.extend(records)
+                    logger.info(f"Page {page + 1}: Retrieved {len(records)} records")
+                    
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Failed to fetch page {page}: {e}")
+                    raise
+
+        # === STEP 6: Stop Condition - Already Built In ===
+        logger.info(f"Total records collected: {len(all_records)}")
+
+        if not all_records:
+            raise ValueError("No records retrieved from API")
+
+        df = pd.DataFrame(all_records)
+
+        # # === Data Cleaning ===
+        # drop_cols = [
+        #     "piMetadata",
+        #     "execution_timestamp",
+        #     "pipelineid",
+        #     "component_id",
+        #     "projectid"
+        # ]
+        # df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+        # === Prepare Target ===
         if args.target_column in df.columns:
             target_values = df[args.target_column].copy()
         else:
@@ -105,19 +196,19 @@ implementation:
                 name=args.target_column
             )
 
-        # === Stratification logic ===
+        # === Stratification Logic ===
         if args.model_type.lower() == "classification" and target_values.nunique() > 1:
             stratify_param = target_values
         else:
             stratify_param = None
 
-        # === Convert split size ===
+        # === Convert Split Size ===
         split_size_input = float(args.split_size)
         test_size = split_size_input / 100.0 if split_size_input >= 1.0 else split_size_input
         if not (0.0 < test_size < 1.0):
             raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
 
-        # === Train-test split ===
+        # === Train-Test Split ===
         train_df, test_df = train_test_split(
             df,
             test_size=test_size,
@@ -126,20 +217,26 @@ implementation:
         )
 
         # === Diagnostics ===
-        print("===== TRAIN SET =====")
+        print("===== PAGINATION SUMMARY =====")
+        print(f"Total records fetched: {len(all_records)}")
+        print(f"Final dataset shape: {df.shape}")
+        
+        print("\n===== TRAIN SET =====")
         print("Shape:", train_df.shape)
         print(train_df.head(3).to_string())
 
-        print("===== TEST DATA =====")
+        print("\n===== TEST DATA =====")
         print("Shape:", test_df.shape)
         print(test_df.head(3).to_string())
 
-
+        # === Save Outputs ===
         os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
         train_df.to_parquet(args.train_set, index=False)
 
         os.makedirs(os.path.dirname(args.test_data) or ".", exist_ok=True)
         test_df.to_parquet(args.test_data, index=False)
+
+        logger.info("Data loading and splitting completed successfully")
 
     args:
       - --api_url
