@@ -1,0 +1,196 @@
+name: Data loader v5
+inputs:
+  - {name: api_url, type: String, description: "Base API URL (schema instances list endpoint)"}
+  - {name: access_token, type: String, description: "Bearer access token for API auth"}
+  - {name: split_size, type: Integer, default: "15", description: "Test split size as percent or fraction"}
+  - {name: target_column, type: String, description: "Target column for modeling"}
+  - {name: model_type, type: String, default: "classification", description: "classification or regression"}
+
+outputs:
+  - {name: train_set, type: Dataset}
+  - {name: test_data, type: Dataset}
+
+implementation:
+  container:
+    image: kumar2004/ml-base:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import pandas as pd
+        import numpy as np
+        import requests
+        import logging
+        from sklearn.model_selection import train_test_split
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        from datetime import datetime
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--api_url", required=True)
+        parser.add_argument("--access_token", required=True)
+        parser.add_argument("--split_size", type=float, default=15)
+        parser.add_argument("--target_column", required=True)
+        parser.add_argument("--model_type", default="classification")
+        parser.add_argument("--train_set", required=True)
+        parser.add_argument("--test_data", required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("data_loader_full")
+
+        with open(args.access_token) as f:
+            token = f.read().strip()
+
+        session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+        session.mount("http://", HTTPAdapter(max_retries=retries))
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+
+        payload = {
+            "dbType": "TIDB",
+            "entityId": "",
+            "entityIds": [],
+            "ownedOnly": False,
+            "projections": [],
+            "filter": {},
+            "startTime": 0,
+            "endTime": 0
+        }
+
+        def extract_records(body):
+            for key in ("content", "instances", "items", "data", "rows", "records"):
+                if isinstance(body, dict) and key in body and isinstance(body[key], list):
+                    return body[key]
+            if isinstance(body, list):
+                return body
+            if isinstance(body, dict):
+                for v in body.values():
+                    if isinstance(v, list):
+                        return v
+            return []
+
+        def discover_page_metadata(body):
+            page_size = None
+            total_pages = None
+            total_instances = None
+
+            if isinstance(body, dict):
+                page_size = body.get("pageSize")
+                total_pages = body.get("totalPages")
+                total_instances = body.get("totalInstances")
+
+                if "page" in body and isinstance(body["page"], dict):
+                    p = body["page"]
+                    page_size = page_size or p.get("pageSize")
+                    total_pages = total_pages or p.get("totalPages")
+
+            return page_size, total_pages, total_instances
+
+        logger.info("Discovering pagination metadata")
+        initial_size = 2000
+        meta_url = f"{args.api_url}?page=0&size={initial_size}&showPageableMetaData=true"
+
+        resp_meta = session.post(meta_url, headers=headers, json=payload, timeout=60)
+        resp_meta.raise_for_status()
+        body_meta = resp_meta.json()
+
+        detected_page_size, total_pages, total_instances = discover_page_metadata(body_meta)
+
+        if detected_page_size:
+            page_size = min(int(detected_page_size), initial_size)
+        else:
+            inferred = extract_records(body_meta)
+            page_size = len(inferred) if inferred else initial_size
+
+        if total_pages is None and total_instances:
+            total_pages = (int(total_instances) + page_size - 1) // page_size
+
+        logger.info(f"Page size: {page_size}")
+        logger.info(f"Total pages: {total_pages}")
+        logger.info(f"Total instances: {total_instances}")
+
+        all_records = []
+
+        if total_pages is None:
+            logger.warning("No pagination metadata; using single response")
+            all_records.extend(extract_records(body_meta))
+        else:
+            for page in range(int(total_pages)):
+                logger.info(f"Fetching page {page}")
+                page_url = f"{args.api_url}?page={page}&size={page_size}&showPageableMetaData=true"
+                r = session.post(page_url, headers=headers, json=payload, timeout=60)
+                r.raise_for_status()
+                all_records.extend(extract_records(r.json()))
+
+        if not all_records:
+            raise RuntimeError("No data fetched from API")
+
+        df = pd.DataFrame(all_records)
+
+        drop_cols = [
+            "piMetadata",
+            "execution_timestamp",
+            "pipelineid",
+            "component_id",
+            "projectid"
+        ]
+        df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True, errors="ignore")
+
+        if args.target_column in df.columns:
+            target = df[args.target_column]
+        else:
+            logger.warning("Target column missing; creating zero target")
+            target = pd.Series(np.zeros(len(df), dtype=np.int32), index=df.index)
+
+        stratify = target if args.model_type.lower() == "classification" and target.nunique() > 1 else None
+
+        split = args.split_size / 100.0 if args.split_size >= 1 else args.split_size
+        if not 0 < split < 1:
+            raise ValueError("Invalid split_size")
+
+        train_df, test_df = train_test_split(
+            df,
+            test_size=split,
+            random_state=42,
+            stratify=stratify
+        )
+
+        os.makedirs(os.path.dirname(args.train_set) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.test_data) or ".", exist_ok=True)
+
+        train_df.to_parquet(args.train_set, index=False)
+        test_df.to_parquet(args.test_data, index=False)
+
+        logger.info("TRAIN SHAPE: %s", train_df.shape)
+        logger.info("TEST SHAPE: %s", test_df.shape)
+        logger.info("Completed full data load and split")
+
+  args:
+    - --api_url
+    - {inputValue: api_url}
+    - --access_token
+    - {inputPath: access_token}
+    - --split_size
+    - {inputValue: split_size}
+    - --target_column
+    - {inputValue: target_column}
+    - --model_type
+    - {inputValue: model_type}
+    - --train_set
+    - {outputPath: train_set}
+    - --test_data
+    - {outputPath: test_data}
