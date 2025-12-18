@@ -1,10 +1,10 @@
-name: Data loader v5
+name: Data loader v6
 inputs:
-  - {name: api_url, type: String, description: "Base API URL (schema instances list endpoint)"}
-  - {name: access_token, type: String, description: "Bearer access token for API auth"}
-  - {name: split_size, type: Integer, default: "15", description: "Test split size as percent or fraction"}
-  - {name: target_column, type: String, description: "Target column for modeling"}
-  - {name: model_type, type: String, default: "classification", description: "classification or regression"}
+  - {name: api_url, type: String, description: "API URL to fetch JSON dataset"}
+  - {name: access_token, type: string, description: "Bearer access token for API auth"}
+  - {name: split_size, type: Integer, default: "15", description: "Test split size as integer percent (default 15) or fraction (e.g. 0.2)"}
+  - {name: target_column, type: String, description: "Name of target column used for anomaly labeling"}
+  - {name: model_type, type: String, default: "classification", description: "Type of model (classification or regression)"}
 
 outputs:
   - {name: train_set, type: Dataset}
@@ -27,7 +27,6 @@ implementation:
         from sklearn.model_selection import train_test_split
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
-        from datetime import datetime
 
         parser = argparse.ArgumentParser()
         parser.add_argument("--api_url", required=True)
@@ -40,7 +39,7 @@ implementation:
         args = parser.parse_args()
 
         logging.basicConfig(level=logging.INFO)
-        logger = logging.getLogger("data_loader_full")
+        logger = logging.getLogger("data_loader_v4")
 
         with open(args.access_token) as f:
             token = f.read().strip()
@@ -121,12 +120,11 @@ implementation:
 
         logger.info(f"Page size: {page_size}")
         logger.info(f"Total pages: {total_pages}")
-        logger.info(f"Total instances: {total_instances}")
 
         all_records = []
 
         if total_pages is None:
-            logger.warning("No pagination metadata; using single response")
+            logger.warning("No pagination metadata, using single response")
             all_records.extend(extract_records(body_meta))
         else:
             for page in range(int(total_pages)):
@@ -175,22 +173,21 @@ implementation:
         train_df.to_parquet(args.train_set, index=False)
         test_df.to_parquet(args.test_data, index=False)
 
-        logger.info("TRAIN SHAPE: %s", train_df.shape)
-        logger.info("TEST SHAPE: %s", test_df.shape)
-        logger.info("Completed full data load and split")
+        logger.info("Train shape: %s", train_df.shape)
+        logger.info("Test shape: %s", test_df.shape)
 
-  args:
-    - --api_url
-    - {inputValue: api_url}
-    - --access_token
-    - {inputPath: access_token}
-    - --split_size
-    - {inputValue: split_size}
-    - --target_column
-    - {inputValue: target_column}
-    - --model_type
-    - {inputValue: model_type}
-    - --train_set
-    - {outputPath: train_set}
-    - --test_data
-    - {outputPath: test_data}
+    args:
+      - --api_url
+      - {inputValue: api_url}
+      - --access_token
+      - {inputPath: access_token}
+      - --split_size
+      - {inputValue: split_size}
+      - --target_column
+      - {inputValue: target_column}
+      - --model_type
+      - {inputValue: model_type}
+      - --train_set
+      - {outputPath: train_set}
+      - --test_data
+      - {outputPath: test_data}
