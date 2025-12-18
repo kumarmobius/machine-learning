@@ -13,7 +13,7 @@ outputs:
   - {name: predictions, type: String, description: "Parquet with y_true and y_pred (and proba if available)"}
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: kumar2004/mobius:1.0
     command:
       - python3
       - -u
