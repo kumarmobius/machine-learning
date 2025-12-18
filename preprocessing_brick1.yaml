@@ -1,4 +1,4 @@
-name: Data Cleaning v1.3
+name: Data Cleaning v1.4
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Target column(s), comma-separated for multi-output"}
@@ -234,29 +234,48 @@ implementation:
             for col in cand:
                 ser = df[col].astype(object)
                 sample = ser.dropna().astype(str).head(500)
-                if sample.empty: continue
+                if sample.empty: 
+                    continue
                 
-                parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True)
-                frac = parsed.notna().mean()
+                try:
+                    parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True)
+                    frac = parsed.notna().mean()
+                except Exception:
+                    continue
                 
                 if frac >= 0.6:
-                    full = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True)
-                    df[col + "_orig"] = df[col]
-                    df[col] = full
-                    df[col + "_year"] = df[col].dt.year.astype('Int64')
-                    df[col + "_month"] = df[col].dt.month.astype('Int64')
-                    df[col + "_day"] = df[col].dt.day.astype('Int64')
-                    df[col + "_dayofweek"] = df[col].dt.dayofweek.astype('Int64')
-                    df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
-                    df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
-                    df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
-                    df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
-                    df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
-                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
-                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
-                    
-                    report['date_columns'].append({'col': col, 'parsable_fraction': frac})
-                    print(f"[INFO] Detected datetime in '{col}' ({frac*100:.1f}% valid)")
+                    try:
+                        full = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True)
+                        
+                        # CRITICAL FIX: Check if conversion actually resulted in datetime dtype
+                        if not pd.api.types.is_datetime64_any_dtype(full):
+                            report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': 'conversion_failed'})
+                            continue
+                        
+                        # Also check if we have any valid dates
+                        if full.notna().sum() == 0:
+                            report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': 'no_valid_dates'})
+                            continue
+                        
+                        df[col + "_orig"] = df[col]
+                        df[col] = full
+                        df[col + "_year"] = df[col].dt.year.astype('Int64')
+                        df[col + "_month"] = df[col].dt.month.astype('Int64')
+                        df[col + "_day"] = df[col].dt.day.astype('Int64')
+                        df[col + "_dayofweek"] = df[col].dt.dayofweek.astype('Int64')
+                        df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
+                        df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
+                        df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
+                        df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
+                        df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
+                        df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
+                        df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                        
+                        report['date_columns'].append({'col': col, 'parsable_fraction': frac})
+                        print(f"[INFO] Detected datetime in '{col}' ({frac*100:.1f}% valid)")
+                    except Exception as e:
+                        report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': str(e)})
+                        continue
 
             return df, report
 
