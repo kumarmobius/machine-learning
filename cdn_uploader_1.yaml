@@ -1,5 +1,4 @@
 name: Upload to CDN
-description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs along with a schema JSON containing an epoch timestamp.
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file"}
   - {name: train_x, type: Dataset, description: "Training features dataset"}
@@ -18,7 +17,7 @@ outputs:
   - {name: preprocesser_metadata_cdn_url, type: String}
   - {name: feature_selector_cdn_url, type: String}
   - {name: test_data_cdn_url, type: String}
-  - {name: schema_json, type: Data}
+  - {name: schema_json, type: String}
 
 implementation:
   container:
