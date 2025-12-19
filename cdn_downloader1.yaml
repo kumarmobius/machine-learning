@@ -1,21 +1,21 @@
-name: ML Artifacts Downloader v1
+name: ML Artifacts Downloader v2
 inputs:
   - {name: preprocessor_metadata_cdn, type: String, description: "CDN URL to download preprocessor metadata artifact", optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact", optional: true, default: ""}
   - {name: pca_cdn, type: String, description: "CDN URL to download PCA artifact", optional: true, default: ""}
   - {name: preprocessor_cdn, type: String, description: "CDN URL to download preprocessor artifact", optional: true, default: ""}
-  - {name: x_train, type: Dataset, description: "Training features dataset (local path)", optional: true}
-  - {name: y_train, type: Dataset, description: "Training labels dataset (local path)", optional: true}
-  - {name: test_data, type: Dataset, description: "Test dataset (local path)", optional: true}
+  - {name: x_train_cdn, type: String, description: "CDN URL to download training features dataset", optional: true, default: ""}
+  - {name: y_train_cdn, type: String, description: "CDN URL to download training labels dataset", optional: true, default: ""}
+  - {name: test_data_cdn, type: String, description: "CDN URL to download test dataset", optional: true, default: ""}
   - {name: bearer_token, type: string, description: "Optional path to file containing bearer token for authenticated downloads", optional: true, default: ""}
 outputs:
   - {name: preprocessor_metadata_local, type: Data, description: "Local path for downloaded preprocessor metadata"}
   - {name: feature_selector_local, type: Data, description: "Local path for downloaded feature selector"}
   - {name: pca_local, type: Data, description: "Local path for downloaded PCA"}
   - {name: preprocessor_local, type: Data, description: "Local path for downloaded preprocessor"}
-  - {name: x_train_local, type: Dataset, description: "Pass-through local path for x_train"}
-  - {name: y_train_local, type: Dataset, description: "Pass-through local path for y_train"}
-  - {name: test_data_local, type: Dataset, description: "Pass-through local path for test_data"}
+  - {name: x_train_local, type: Dataset, description: "Local path for downloaded x_train dataset"}
+  - {name: y_train_local, type: Dataset, description: "Local path for downloaded y_train dataset"}
+  - {name: test_data_local, type: Dataset, description: "Local path for downloaded test_data dataset"}
 implementation:
   container:
     image: kumar2004/ml-base:v1
@@ -38,9 +38,9 @@ implementation:
         parser.add_argument('--feature_selector_cdn', type=str, default="")
         parser.add_argument('--pca_cdn', type=str, default="")
         parser.add_argument('--preprocessor_cdn', type=str, default="")
-        parser.add_argument('--x_train', type=str, default="")
-        parser.add_argument('--y_train', type=str, default="")
-        parser.add_argument('--test_data', type=str, default="")
+        parser.add_argument('--x_train_cdn', type=str, default="")
+        parser.add_argument('--y_train_cdn', type=str, default="")
+        parser.add_argument('--test_data_cdn', type=str, default="")
         parser.add_argument('--bearer_token', type=str, default="")
         parser.add_argument('--preprocessor_metadata_local', type=str, required=True)
         parser.add_argument('--feature_selector_local', type=str, required=True)
@@ -54,7 +54,6 @@ implementation:
         logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         logger = logging.getLogger("ml_artifacts_downloader")
 
-        # HTTP session with retry
         session = requests.Session()
         try:
             retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], allowed_methods=frozenset(["GET","HEAD"]))
@@ -81,104 +80,39 @@ implementation:
             fd, tmp = tempfile.mkstemp(suffix=".download")
             os.close(fd)
             logger.info("Downloading %s -> %s", url, tmp)
-            try:
-                r = session.get(url, headers=headers, timeout=60)
-                r.raise_for_status()
-            except Exception as e:
-                logger.exception("Download failed for %s: %s", url, e)
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-                raise
+            r = session.get(url, headers=headers, timeout=120)
+            r.raise_for_status()
             with open(tmp, "wb") as fh:
                 fh.write(r.content)
             return tmp
 
         def place_artifact(tmp_file, out_path):
-            is_zip = False
             try:
                 with zipfile.ZipFile(tmp_file, "r") as z:
-                    is_zip = True
-            except zipfile.BadZipFile:
-                is_zip = False
-            if is_zip:
-                os.makedirs(out_path, exist_ok=True)
-                with zipfile.ZipFile(tmp_file, "r") as z:
-                    z.extractall(out_path)
-                logger.info("Extracted zip to %s", out_path)
-                try: 
-                    os.remove(tmp_file)
-                except Exception: 
-                    pass
-                return out_path
-            else:
-                if out_path.endswith(os.sep) or out_path.endswith("/"):
                     os.makedirs(out_path, exist_ok=True)
-                    fname = os.path.basename(tmp_file) or f"artifact_{np.random.randint(1e6)}"
-                    dest = os.path.join(out_path, fname)
-                else:
-                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                    dest = out_path
-                shutil.move(tmp_file, dest)
-                logger.info("Saved artifact file to %s", dest)
-                return dest
-
-        def write_meta_and_path(out_meta_path, path_val):
-            meta = {"artifact_local": None if path_val is None else str(path_val)}
-            try:
-                with open(out_meta_path + ".meta.json", "w", encoding="utf-8") as fh:
-                    json.dump(meta, fh)
-            except Exception:
-                logger.exception("Failed to write meta for %s", out_meta_path)
-            try:
-                with open(out_meta_path, "w", encoding="utf-8") as fh:
-                    fh.write("" if path_val is None else str(path_val))
-            except Exception:
-                logger.exception("Failed to write path file %s", out_meta_path)
+                    z.extractall(out_path)
+                    os.remove(tmp_file)
+                    return out_path
+            except zipfile.BadZipFile:
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                shutil.move(tmp_file, out_path)
+                return out_path
 
         def fetch_artifact(url, out_path):
-            if not url or not str(url).strip():
-                logger.info("No URL provided for target %s; writing null outputs", out_path)
-                write_meta_and_path(out_path, None)
-                return None
-            try:
-                tmp = download_to_temp(url)
-                placed = place_artifact(tmp, out_path)
-                write_meta_and_path(out_path, placed)
-                return placed
-            except Exception as e:
-                logger.exception("Failed to fetch artifact from %s: %s", url, e)
-                write_meta_and_path(out_path, None)
-                return None
-
-        def pass_through_dataset(input_path, output_path):
-            if input_path and os.path.exists(input_path):
-                logger.info("Passing through dataset from %s to %s", input_path, output_path)
-                with open(output_path, "w", encoding="utf-8") as fh:
-                    fh.write(str(input_path))
-                return input_path
-            else:
-                logger.info("No input dataset at %s; writing empty output", input_path)
-                with open(output_path, "w", encoding="utf-8") as fh:
+            if not url:
+                with open(out_path, "w") as fh:
                     fh.write("")
                 return None
+            tmp = download_to_temp(url)
+            return place_artifact(tmp, out_path)
 
-        # Fetch CDN artifacts
-        preprocessor_meta_local = fetch_artifact(args.preprocessor_metadata_cdn, args.preprocessor_metadata_local)
-        feat_local = fetch_artifact(args.feature_selector_cdn, args.feature_selector_local)
-        pca_local = fetch_artifact(args.pca_cdn, args.pca_local)
-        preprocessor_local = fetch_artifact(args.preprocessor_cdn, args.preprocessor_local)
-
-        # Pass through local datasets
-        x_train_local = pass_through_dataset(args.x_train, args.x_train_local)
-        y_train_local = pass_through_dataset(args.y_train, args.y_train_local)
-        test_data_local = pass_through_dataset(args.test_data, args.test_data_local)
-
-        logger.info("Artifacts downloaded: preprocessor_metadata=%s feature_selector=%s pca=%s preprocessor=%s",
-                    preprocessor_meta_local, feat_local, pca_local, preprocessor_local)
-        logger.info("Datasets passed through: x_train=%s y_train=%s test_data=%s",
-                    x_train_local, y_train_local, test_data_local)
+        fetch_artifact(args.preprocessor_metadata_cdn, args.preprocessor_metadata_local)
+        fetch_artifact(args.feature_selector_cdn, args.feature_selector_local)
+        fetch_artifact(args.pca_cdn, args.pca_local)
+        fetch_artifact(args.preprocessor_cdn, args.preprocessor_local)
+        fetch_artifact(args.x_train_cdn, args.x_train_local)
+        fetch_artifact(args.y_train_cdn, args.y_train_local)
+        fetch_artifact(args.test_data_cdn, args.test_data_local)
     args:
       - --preprocessor_metadata_cdn
       - {inputValue: preprocessor_metadata_cdn}
@@ -188,12 +122,12 @@ implementation:
       - {inputValue: pca_cdn}
       - --preprocessor_cdn
       - {inputValue: preprocessor_cdn}
-      - --x_train
-      - {inputPath: x_train}
-      - --y_train
-      - {inputPath: y_train}
-      - --test_data
-      - {inputPath: test_data}
+      - --x_train_cdn
+      - {inputValue: x_train_cdn}
+      - --y_train_cdn
+      - {inputValue: y_train_cdn}
+      - --test_data_cdn
+      - {inputValue: test_data_cdn}
       - --bearer_token
       - {inputPath: bearer_token}
       - --preprocessor_metadata_local
