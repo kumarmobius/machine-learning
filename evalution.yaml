@@ -1,4 +1,4 @@
-name: Evaluate Model v14.4
+name: Evaluate Model v14.5
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed) containing both features and target"}
   - {name: target_column, type: String, description: "Target column in y_test if multi-column", optional: true, default: ""}
@@ -126,6 +126,7 @@ implementation:
             except Exception as e:
                 raise ValueError(f"Could not load pickle from {path}: {e}")
 
+        #fadfF
         def fix_knn_targets(model):
             from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
             from sklearn.ensemble import VotingRegressor, VotingClassifier
@@ -137,22 +138,34 @@ implementation:
                 if isinstance(est, (KNeighborsRegressor, KNeighborsClassifier)):
                     if hasattr(est, '_y') and est._y is not None:
                         try:
-                            original_dtype = est._y.dtype if hasattr(est._y, 'dtype') else type(est._y)
-                            # Check if targets are strings or object type
-                            if est._y.dtype == object or isinstance(est._y[0], str):
-                                logger.info(f"Fixing {name} KNN targets from {original_dtype} to numeric")
-                                # Convert to numeric
-                                if est._y.ndim == 1:
-                                    est._y = pd.to_numeric(pd.Series(est._y), errors='coerce').values.astype(float)
-                                else:
-                                    est._y = np.array([[float(val) for val in row] for row in est._y])
+                            if hasattr(est._y, 'dtype'):
+                                if est._y.dtype == object or (est._y.dtype.kind in ('U', 'S', 'O')):
+                                    logger.info(f"Fixing {name} KNN targets from {est._y.dtype} to numeric")
+                                    if est._y.ndim == 1:
+                                        est._y = pd.to_numeric(pd.Series(est._y), errors='coerce').fillna(0).values.astype(np.float64)
+                                    else:
+                                        est._y = np.array([[float(val) if isinstance(val, (int, float, str)) else 0.0 for val in row] for row in est._y], dtype=np.float64)
+                                    logger.info(f"Successfully converted KNN targets to {est._y.dtype}")
+                                    fixed_count += 1
+                            elif isinstance(est._y, (list, tuple)):
+                                logger.info(f"Fixing {name} KNN targets from list/tuple to numeric")
+                                est._y = np.array([float(x) if isinstance(x, (int, float, str)) else 0.0 for x in est._y], dtype=np.float64)
                                 logger.info(f"Successfully converted KNN targets to {est._y.dtype}")
                                 fixed_count += 1
                         except Exception as e:
                             logger.warning(f"Could not fix KNN targets for {name}: {e}")
                 elif isinstance(est, (VotingRegressor, VotingClassifier)):
                     logger.info(f"Checking VotingRegressor/Classifier: {name}")
-                    if hasattr(est, 'estimators'):
+                    if hasattr(est, 'estimators_'):
+                        for idx, sub_est in enumerate(est.estimators_):
+                            estimator_name = f"estimator_{idx}"
+                            if hasattr(est, 'named_estimators_'):
+                                try:
+                                    estimator_name = list(est.named_estimators_.keys())[idx]
+                                except Exception:
+                                    pass
+                            fix_estimator(sub_est, f"{name}.{estimator_name}")
+                    elif hasattr(est, 'estimators'):
                         for estimator_name, sub_est in est.estimators:
                             fix_estimator(sub_est, f"{name}.{estimator_name}")
                 return est
