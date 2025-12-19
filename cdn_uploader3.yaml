@@ -1,4 +1,4 @@
-name: Model CDN uploader.
+name: Model CDN uploader
 inputs:
   - {name: model_pickle, type: Model, description: "Saved model pickle/joblib file to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
@@ -73,7 +73,7 @@ implementation:
                 raise FileNotFoundError(input_path)
             if os.path.isfile(input_path):
                 return input_path, None
-            tmpzip = os.path.join("//tmp", f"model_{uuid.uuid4().hex}.zip")
+            tmpzip = os.path.join(tempfile.gettempdir(), f"model_{uuid.uuid4().hex}.zip")
             shutil.make_archive(tmpzip.replace('.zip',''), 'zip', root_dir=input_path)
             return tmpzip, tmpzip
 
