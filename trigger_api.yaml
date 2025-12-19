@@ -1,0 +1,140 @@
+name: ML Pipeline Trigger 1
+inputs:
+  - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
+  - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
+  - {name: pipeline_id, type: String, description: "Pipeline ID to trigger"}
+  - {name: experiment_id, type: String, description: "Experiment ID"}
+  - {name: model_type, type: String}
+  - {name: target_column, type: String}
+  - {name: preprocessor_metadata_cdn, type: String, optional: true, default: ""}
+  - {name: feature_selector_cdn, type: String, optional: true, default: ""}
+  - {name: pca_cdn, type: String, optional: true, default: ""}
+  - {name: preprocessor_cdn, type: String, optional: true, default: ""}
+  - {name: x_train_cdn, type: String, optional: true, default: ""}
+  - {name: y_train_cdn, type: String, optional: true, default: ""}
+  - {name: test_data_cdn, type: String, optional: true, default: ""}
+  - {name: model_id, type: String, optional: true, default: ""}
+  - {name: project_id, type: String, optional: true, default: ""}
+  - {name: execution_id, type: Integer, description: "Execution counter"}
+
+outputs:
+  - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
+
+implementation:
+  container:
+    image: python:3.8
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import os
+        import sys
+        import requests
+
+        parser = argparse.ArgumentParser(description="Trigger ML pipeline")
+        parser.add_argument('--bearer_token', required=True)
+        parser.add_argument('--domain', required=True)
+        parser.add_argument('--pipeline_id', required=True)
+        parser.add_argument('--experiment_id', required=True)
+        parser.add_argument('--model_type', required=True)
+        parser.add_argument('--target_column', required=True)
+        parser.add_argument('--preprocessor_metadata_cdn', default="")
+        parser.add_argument('--feature_selector_cdn', default="")
+        parser.add_argument('--pca_cdn', default="")
+        parser.add_argument('--preprocessor_cdn', default="")
+        parser.add_argument('--x_train_cdn', default="")
+        parser.add_argument('--y_train_cdn', default="")
+        parser.add_argument('--test_data_cdn', default="")
+        parser.add_argument('--model_id', default="")
+        parser.add_argument('--project_id', default="")
+        parser.add_argument('--execution_id', type=int, required=True)
+        parser.add_argument('--trigger_response', required=True)
+        args = parser.parse_args()
+
+        with open(args.bearer_token, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+
+        url = (
+            f"{args.domain.rstrip('/')}"
+            f"/bob-service-test/v1.0/pipeline/trigger/ml"
+            f"?pipelineId={args.pipeline_id}"
+        )
+
+        payload = {
+            "pipelineType": "ML",
+            "containerResources": {},
+            "experimentId": args.experiment_id,
+            "enableCaching": True,
+            "parameters": {
+                "model_type": args.model_type,
+                "target_column": args.target_column,
+                "preprocessor_metadata_cdn": args.preprocessor_metadata_cdn,
+                "feature_selector_cdn": args.feature_selector_cdn,
+                "pca_cdn": args.pca_cdn,
+                "preprocessor_cdn": args.preprocessor_cdn,
+                "x_train_cdn": args.x_train_cdn,
+                "y_train_cdn": args.y_train_cdn,
+                "test_data_cdn": args.test_data_cdn,
+                "model_id": args.model_id,
+                "project_id": args.project_id,
+                "execution_id": args.execution_id
+            },
+            "version": 1
+        }
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "accept": "application/json"
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+
+        if not resp.ok:
+            print("Trigger failed:", resp.status_code, resp.text, file=sys.stderr)
+            resp.raise_for_status()
+
+        with open(args.trigger_response, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+
+        print("[INFO] Pipeline triggered successfully")
+        print(resp.text)
+
+    args:
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --pipeline_id
+      - {inputValue: pipeline_id}
+      - --experiment_id
+      - {inputValue: experiment_id}
+      - --model_type
+      - {inputValue: model_type}
+      - --target_column
+      - {inputValue: target_column}
+      - --preprocessor_metadata_cdn
+      - {inputValue: preprocessor_metadata_cdn}
+      - --feature_selector_cdn
+      - {inputValue: feature_selector_cdn}
+      - --pca_cdn
+      - {inputValue: pca_cdn}
+      - --preprocessor_cdn
+      - {inputValue: preprocessor_cdn}
+      - --x_train_cdn
+      - {inputValue: x_train_cdn}
+      - --y_train_cdn
+      - {inputValue: y_train_cdn}
+      - --test_data_cdn
+      - {inputValue: test_data_cdn}
+      - --model_id
+      - {inputValue: model_id}
+      - --project_id
+      - {inputValue: project_id}
+      - --execution_id
+      - {inputValue: execution_id}
+      - --trigger_response
+      - {outputPath: trigger_response}
