@@ -1,0 +1,122 @@
+name: Model CDN uploader
+inputs:
+  - {name: model_pickle, type: Model, description: "Saved model pickle/joblib file to upload"}
+  - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
+  - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
+  - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
+  - {name: name, type: String, description: "Optional friendly name to include in output JSON", optional: true}
+
+outputs:
+  - {name: model_pickle_cdn, type: String, description: "JSON containing the model pickle CDN URL (and optional name)"}
+  - {name: config_cdn_url, type: String, description: "JSON containing config with model_weights_cdn"}
+
+implementation:
+  container:
+    image: python:3.8
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, subprocess, json, os, uuid, tempfile, shutil, sys, traceback
+
+        parser = argparse.ArgumentParser(description="Upload model to CDN and emit config JSON.")
+        parser.add_argument('--model_pickle', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get_cdn', type=str, required=True)
+        parser.add_argument('--name', type=str, required=False, default="")
+
+        parser.add_argument('--model_pickle_cdn', type=str, required=True)
+        parser.add_argument('--config_cdn_url', type=str, required=True)
+        args = parser.parse_args()
+
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        def atomic_write_json(path, data):
+            ensure_parent_dir(path)
+            dirp = os.path.dirname(path) or "/tmp"
+            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp, path)
+            except Exception:
+                try: os.remove(tmp)
+                except Exception: pass
+                raise
+
+        with open(args.bearer_token, 'r', encoding='utf-8') as f:
+            bearer_token = f.read().strip()
+
+        upload_url = f"{args.domain.rstrip('/')}/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+
+        def run_curl_upload(file_path):
+            cmd = [
+                "curl", "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{file_path}",
+                "--fail", "--show-error"
+            ]
+            proc = subprocess.run(cmd, capture_output=True)
+            stdout = proc.stdout.decode("utf-8", errors="ignore")
+            stderr = proc.stderr.decode("utf-8", errors="ignore")
+            if proc.returncode != 0:
+                raise RuntimeError(f"curl failed: {stderr}\n{stdout}")
+            return json.loads(stdout)
+
+        def prepare_path_for_upload(input_path):
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(input_path)
+            if os.path.isfile(input_path):
+                return input_path, None
+            tmpzip = os.path.join("/tmp", f"model_{uuid.uuid4().hex}.zip")
+            shutil.make_archive(tmpzip.replace('.zip',''), 'zip', root_dir=input_path)
+            return tmpzip, tmpzip
+
+        try:
+            tmp = None
+            prepared, tmp = prepare_path_for_upload(args.model_pickle)
+            resp = run_curl_upload(prepared)
+            rel = resp.get("cdnUrl")
+            if not rel:
+                raise ValueError("Missing cdnUrl in response")
+            final_url = f"{args.get_cdn.rstrip('/')}{rel}"
+
+            model_out = {"model_pickle_cdn": final_url}
+            if args.name:
+                model_out["name"] = args.name
+            atomic_write_json(args.model_pickle_cdn, model_out)
+
+            config_out = {"model_weights_cdn": final_url}
+            atomic_write_json(args.config_cdn_url, config_out)
+
+            print("[INFO] Upload complete")
+            print("Model CDN:", final_url)
+
+        except Exception as e:
+            print("ERROR:", str(e), file=sys.stderr)
+            traceback.print_exc()
+            raise
+        finally:
+            if 'tmp' in locals() and tmp and os.path.exists(tmp):
+                try: os.remove(tmp)
+                except Exception: pass
+    args:
+      - --model_pickle
+      - {inputPath: model_pickle}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --name
+      - {inputValue: name}
+      - --model_pickle_cdn
+      - {outputPath: model_pickle_cdn}
+      - --config_cdn_url
+      - {outputPath: config_cdn_url}
