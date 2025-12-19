@@ -1,4 +1,4 @@
-name: Evaluate Model v14.1
+name: Evaluate Model v14.2
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed) containing both features and target"}
   - {name: target_column, type: String, description: "Target column in y_test if multi-column", optional: true, default: ""}
@@ -126,8 +126,52 @@ implementation:
             except Exception as e:
                 raise ValueError(f"Could not load pickle from {path}: {e}")
 
+        def fix_knn_targets(model):
+            from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
+            from sklearn.ensemble import VotingRegressor, VotingClassifier
+            
+            fixed_count = 0
+            
+            def fix_estimator(est, name=""):
+                nonlocal fixed_count
+                if isinstance(est, (KNeighborsRegressor, KNeighborsClassifier)):
+                    if hasattr(est, '_y') and est._y is not None:
+                        try:
+                            original_dtype = est._y.dtype if hasattr(est._y, 'dtype') else type(est._y)
+                            # Check if targets are strings or object type
+                            if est._y.dtype == object or isinstance(est._y[0], str):
+                                logger.info(f"Fixing {name} KNN targets from {original_dtype} to numeric")
+                                # Convert to numeric
+                                if est._y.ndim == 1:
+                                    est._y = pd.to_numeric(pd.Series(est._y), errors='coerce').values.astype(float)
+                                else:
+                                    est._y = np.array([[float(val) for val in row] for row in est._y])
+                                logger.info(f"Successfully converted KNN targets to {est._y.dtype}")
+                                fixed_count += 1
+                        except Exception as e:
+                            logger.warning(f"Could not fix KNN targets for {name}: {e}")
+                elif isinstance(est, (VotingRegressor, VotingClassifier)):
+                    logger.info(f"Checking VotingRegressor/Classifier: {name}")
+                    for estimator_name, sub_est in est.estimators_:
+                        fix_estimator(sub_est, f"{name}.{estimator_name}")
+                return est
+            
+            if isinstance(model, dict):
+                for key in model:
+                    logger.info(f"Checking model dict key: {key}")
+                    model[key] = fix_estimator(model[key], key)
+            else:
+                model = fix_estimator(model, "model")
+            
+            if fixed_count > 0:
+                logger.info(f"Fixed {fixed_count} KNN estimator(s)")
+            else:
+                logger.info("No KNN target fixes needed")
+            
+            return model
+
         def main():
-            parser = argparse.ArgumentParser(description="Evaluate Model v13 - Production")
+            parser = argparse.ArgumentParser(description="Evaluate Model v14.2 - Production")
             parser.add_argument("--test_data", type=str, required=True)
             parser.add_argument("--target_column", type=str, default="")
             parser.add_argument("--preprocessor", type=str, required=True)
@@ -142,7 +186,7 @@ implementation:
 
             try:
                 logger.info("=" * 80)
-                logger.info("EVALUATION STARTED - Production v13")
+                logger.info("EVALUATION STARTED - Production v14.2")
                 logger.info("=" * 80)
 
                 task = str(args.model_type).strip().lower()
@@ -166,7 +210,7 @@ implementation:
                 else:
                     logger.info("No feature selector provided")
 
-                # FIXED: Load PCA with proper None/empty checks
+                # Load PCA with proper None/empty checks
                 logger.info("Checking PCA artifact...")
                 pca_obj = None
                 if args.pca:
@@ -196,6 +240,13 @@ implementation:
                 except Exception:
                     model = load_pickle_any(args.model_pickle)
                 logger.info(f"Model loaded: {type(model)}")
+
+                # FIX: Apply KNN target fix
+                logger.info("=" * 80)
+                logger.info("CHECKING AND FIXING MODEL TARGETS")
+                logger.info("=" * 80)
+                model = fix_knn_targets(model)
+                logger.info("=" * 80)
 
                 model_name_str = None
                 try:
@@ -230,6 +281,10 @@ implementation:
                     if target_col not in test_df.columns:
                         raise ValueError(f"Target '{target_col}' not found")
                     y_raw = test_df[target_col].copy()
+                    # Ensure target is numeric for regression
+                    if task == "regression":
+                        y_raw = pd.to_numeric(y_raw, errors='coerce')
+                        logger.info(f"Target converted to numeric: {y_raw.dtype}")
                     y = y_raw
                     X_raw = test_df.drop(columns=[target_col])
                     logger.info(f"Single target: {target_col}")
@@ -313,7 +368,7 @@ implementation:
                 else:
                     Xs = Xp
 
-                # FIXED: Apply PCA only if pca_obj is not None
+                # Apply PCA only if pca_obj is not None
                 if pca_obj is not None:
                     logger.info("=" * 80)
                     logger.info("APPLYING PCA TRANSFORMATION")
