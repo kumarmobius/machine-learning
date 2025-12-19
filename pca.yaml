@@ -1,4 +1,4 @@
-name: PCA Transformer v4
+name: PCA Transformer v5
 inputs:
   - {name: input_data, type: Dataset, description: "Input dataset (CSV, Parquet, or JSONL)"}
   - {name: enable_pca, type: String, description: "Enable PCA transformation: true or false", optional: true, default: "true"}
@@ -28,15 +28,6 @@ implementation:
             d = os.path.dirname(path)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
-        def load_table(path: str) -> pd.DataFrame:
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".parquet":
-                return pd.read_parquet(path)
-            if ext == ".csv":
-                return pd.read_csv(path)
-            if ext in (".jsonl", ".ndjson"):
-                return pd.read_json(path, lines=True)
-            raise ValueError(f"Unsupported input file format '{ext}'. Only CSV, Parquet, or JSONL are allowed.")
         def clean_and_select_numeric(df: pd.DataFrame) -> pd.DataFrame:
             if df.empty:
                 raise ValueError("Input dataset is empty.")
@@ -164,7 +155,7 @@ implementation:
             if not enable_pca_flag:
                 print("[INFO] PCA is DISABLED. Passing through input data without transformation.")
                 print("[STEP 1/2] Loading dataset...")
-                df_raw = load_table(args.input_data)
+                df_raw = pd.read_parquet(args.input_data)
                 print(f"[INFO] Input shape: {df_raw.shape[0]} rows x {df_raw.shape[1]} columns")
                 print("[STEP 2/2] Saving passthrough outputs...")
                 ensure_dir_for(args.output_data)
