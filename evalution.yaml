@@ -1,4 +1,4 @@
-name: Evaluate Model v14.2
+name: Evaluate Model v14.4
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed) containing both features and target"}
   - {name: target_column, type: String, description: "Target column in y_test if multi-column", optional: true, default: ""}
@@ -152,8 +152,9 @@ implementation:
                             logger.warning(f"Could not fix KNN targets for {name}: {e}")
                 elif isinstance(est, (VotingRegressor, VotingClassifier)):
                     logger.info(f"Checking VotingRegressor/Classifier: {name}")
-                    for estimator_name, sub_est in est.estimators_:
-                        fix_estimator(sub_est, f"{name}.{estimator_name}")
+                    if hasattr(est, 'estimators'):
+                        for estimator_name, sub_est in est.estimators:
+                            fix_estimator(sub_est, f"{name}.{estimator_name}")
                 return est
             
             if isinstance(model, dict):
