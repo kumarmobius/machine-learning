@@ -1,4 +1,4 @@
-name: ML Artifacts Downloader v2
+name: ML Artifacts Downloader v3
 inputs:
   - {name: preprocessor_metadata_cdn, type: String, description: "CDN URL to download preprocessor metadata artifact", optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact", optional: true, default: ""}
@@ -16,6 +16,7 @@ outputs:
   - {name: x_train_local, type: Dataset, description: "Local path for downloaded x_train dataset"}
   - {name: y_train_local, type: Dataset, description: "Local path for downloaded y_train dataset"}
   - {name: test_data_local, type: Dataset, description: "Local path for downloaded test_data dataset"}
+
 implementation:
   container:
     image: kumar2004/ml-base:v1
@@ -24,8 +25,7 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, tempfile, json, shutil, zipfile, logging
-        import numpy as np
+        import argparse, os, sys, tempfile, shutil, zipfile, logging
         import requests
         from requests.adapters import HTTPAdapter
         try:
@@ -56,35 +56,51 @@ implementation:
 
         session = requests.Session()
         try:
-            retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], allowed_methods=frozenset(["GET","HEAD"]))
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[500, 502, 503, 504],
+                allowed_methods=frozenset(["GET", "HEAD"])
+            )
         except TypeError:
-            retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], method_whitelist=frozenset(["GET","HEAD"]))
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[500, 502, 503, 504],
+                method_whitelist=frozenset(["GET", "HEAD"])
+            )
+
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
 
         headers = {}
         if args.bearer_token and os.path.exists(args.bearer_token):
-            try:
-                with open(args.bearer_token, "r", encoding="utf-8") as fh:
-                    token = fh.read().strip()
+            with open(args.bearer_token, "r", encoding="utf-8") as f:
+                token = f.read().strip()
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-                    logger.info("Using bearer token for authenticated downloads")
-            except Exception:
-                logger.warning("Could not read bearer token file; continuing without Authorization header")
 
-        def download_to_temp(url):
-            if not url or not str(url).strip():
-                raise ValueError("Empty URL")
-            fd, tmp = tempfile.mkstemp(suffix=".download")
-            os.close(fd)
-            logger.info("Downloading %s -> %s", url, tmp)
+        def try_download(url):
+            logger.info("Attempting download: %s", url)
             r = session.get(url, headers=headers, timeout=120)
             r.raise_for_status()
+            fd, tmp = tempfile.mkstemp(suffix=".download")
+            os.close(fd)
             with open(tmp, "wb") as fh:
                 fh.write(r.content)
             return tmp
+
+        def download_with_fallback(url):
+            try:
+                return try_download(url)
+            except Exception as e:
+                logger.warning("Initial download failed: %s", e)
+                if "$$" in url and "$$$" not in url:
+                    fallback_url = url.replace("$$", "$$$")
+                    logger.info("Retrying with fallback URL: %s", fallback_url)
+                    return try_download(fallback_url)
+                raise
 
         def place_artifact(tmp_file, out_path):
             try:
@@ -99,11 +115,11 @@ implementation:
                 return out_path
 
         def fetch_artifact(url, out_path):
-            if not url:
+            if not url or not url.strip():
                 with open(out_path, "w") as fh:
                     fh.write("")
                 return None
-            tmp = download_to_temp(url)
+            tmp = download_with_fallback(url)
             return place_artifact(tmp, out_path)
 
         fetch_artifact(args.preprocessor_metadata_cdn, args.preprocessor_metadata_local)
@@ -113,6 +129,7 @@ implementation:
         fetch_artifact(args.x_train_cdn, args.x_train_local)
         fetch_artifact(args.y_train_cdn, args.y_train_local)
         fetch_artifact(args.test_data_cdn, args.test_data_local)
+
     args:
       - --preprocessor_metadata_cdn
       - {inputValue: preprocessor_metadata_cdn}
