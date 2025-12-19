@@ -21,7 +21,7 @@ inputs:
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
 
 outputs:
-  - {name: model_pickle, type: Data, description: "Pickled trained model (.pkl)"}
+  - {name: model_pickle, type: Model, description: "Pickled trained model (.pkl)"}
   - {name: metrics_json, type: Data, description: "Training metrics JSON"}
   - {name: model_config, type: Data, description: "Model configuration JSON (hyperparameters & metadata)"}
 
