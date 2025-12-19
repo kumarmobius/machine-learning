@@ -1,4 +1,4 @@
-name: Model CDN uploader..
+name: Model CDN uploader
 inputs:
   - {name: model_pickle, type: Model, description: "Saved model pickle/joblib file to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
@@ -82,7 +82,7 @@ implementation:
             stdout = proc.stdout.decode("utf-8", errors="ignore")
             stderr = proc.stderr.decode("utf-8", errors="ignore")
             if proc.returncode != 0:
-                raise RuntimeError(f"curl failed:\n{stderr}\n{stdout}")
+                raise RuntimeError(f"curl failed:{stderr}{stdout}")
             return json.loads(stdout)
 
         def prepare_path_for_upload(input_path):
