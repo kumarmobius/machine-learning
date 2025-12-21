@@ -1,4 +1,4 @@
-name: Data loader v6 with Auto Model Type Detection.
+name: Data loader v6 with Auto Model Type Detection
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
@@ -300,4 +300,4 @@ implementation:
       - --test_data
       - {outputPath: test_data}
       - --model_type
-      - {outputPath: model_type}
+      - {outputValue: model_type}
