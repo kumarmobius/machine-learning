@@ -1,7 +1,7 @@
-name: Data loader v8.
+name: Data loader v8
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
-  - {name: access_token, type: String, description: 'Bearer access token for API auth'}
+  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
   - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
 
