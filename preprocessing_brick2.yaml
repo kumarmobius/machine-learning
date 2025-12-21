@@ -677,7 +677,7 @@ implementation:
       - --cleaning_metadata
       - {inputPath: cleaning_metadata}
       - --model_type
-      - {inputPath: model_type}
+      - {inputValue: model_type}
       - --outlier_strategy
       - {inputValue: outlier_strategy}
       - --outlier_fold
