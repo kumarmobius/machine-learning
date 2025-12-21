@@ -300,4 +300,4 @@ implementation:
       - --test_data
       - {outputPath: test_data}
       - --model_type
-      - {outputValue: model_type}
+      - {outputPath: model_type}
