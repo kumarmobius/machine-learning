@@ -1,4 +1,4 @@
-name: Feature Engineering v1.1
+name: Feature Engineering v1.2
 inputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features from Brick 1"}
   - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
@@ -487,7 +487,7 @@ implementation:
         parser.add_argument('--cleaned_X', type=str, required=True)
         parser.add_argument('--cleaned_y', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
-        parser.add_argument('--model_type', type=str, default="classification")
+        parser.add_argument('--model_type', type=str, required=True)
         parser.add_argument('--outlier_strategy', type=str, default="drop_iqr")
         parser.add_argument('--outlier_fold', type=float, default=1.5)
         parser.add_argument('--max_knn_rows', type=int, default=5000)
