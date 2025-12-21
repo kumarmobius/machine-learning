@@ -1,4 +1,4 @@
-name: Data loader v8
+name: Data loader v8.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: String, description: 'Bearer access token for API auth'}
@@ -274,7 +274,7 @@ implementation:
         print(f"Data type: {target_values.dtype}")
         
         if detected_model_type == "classification":
-            print(f"Class distribution:\n{target_values.value_counts().to_string()}")
+            print(f"Class distribution:{target_values.value_counts().to_string()}")
         
         print("===== TRAIN SET =====")
         print("Shape:", train_df.shape)
