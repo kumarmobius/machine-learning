@@ -1,7 +1,7 @@
-name: Data loader v8
+name: Data loader v9
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
-  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
+  - {name: access_token, type: String, description: 'Bearer access token for API auth'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
   - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
 
@@ -115,30 +115,54 @@ implementation:
                 logger.warning("Target column contains only nulls, defaulting to classification")
                 return "classification"
             
+            original_dtype = target_clean.dtype
+            
+            # Try to convert to numeric (handles string representations of numbers)
+            target_numeric = pd.to_numeric(target_clean, errors='coerce')
+            numeric_conversion_success = target_numeric.notna().sum() / len(target_clean) > 0.8
+            
+            if numeric_conversion_success:
+                # Use numeric version for analysis
+                target_clean = target_numeric.dropna()
+                logger.info(f"Successfully converted {len(target_clean)} values to numeric")
+            
             dtype = target_clean.dtype
             n_unique = target_clean.nunique()
             n_total = len(target_clean)
             unique_ratio = n_unique / n_total
             
-            logger.info(f"Target analysis: dtype={dtype}, unique_values={n_unique}, total={n_total}, ratio={unique_ratio:.4f}")
+            logger.info(f"Target analysis: original_dtype={original_dtype}, dtype={dtype}, unique_values={n_unique}, total={n_total}, ratio={unique_ratio:.4f}")
             
-            # Rule 1: Object/string type
-            if dtype == 'object' or pd.api.types.is_string_dtype(dtype):
-                logger.info("Detected classification (string/object type)")
-                return "classification"
-            
-            # Rule 2: Boolean type
+            # Rule 1: Boolean type
             if pd.api.types.is_bool_dtype(dtype):
                 logger.info("Detected classification (boolean type)")
                 return "classification"
             
-            # Rule 3: Few unique values
-            if n_unique <= 20:
-                logger.info(f"Detected classification ({n_unique} unique values <= 20)")
+            # Rule 2: Non-numeric string type (after conversion attempt)
+            if (dtype == 'object' or pd.api.types.is_string_dtype(dtype)) and not numeric_conversion_success:
+                logger.info("Detected classification (non-numeric string type)")
                 return "classification"
             
-            # Rule 4: Many unique values with high ratio
-            if n_unique > 20 and unique_ratio > 0.05:
+            # Rule 3: Numeric with few unique values
+            if n_unique <= 10:
+                logger.info(f"Detected classification ({n_unique} unique values <= 10)")
+                return "classification"
+            
+            # Rule 4: Moderate unique values (11-20) - check if they're sequential integers
+            if 10 < n_unique <= 20:
+                if pd.api.types.is_integer_dtype(dtype):
+                    unique_vals = sorted(target_clean.unique())
+                    is_sequential = all(unique_vals[i+1] - unique_vals[i] == 1 for i in range(len(unique_vals)-1))
+                    if not is_sequential:
+                        logger.info(f"Detected classification ({n_unique} discrete integer values)")
+                        return "classification"
+                else:
+                    # Non-integer numeric with 11-20 unique values
+                    logger.info(f"Detected regression ({n_unique} continuous values)")
+                    return "regression"
+            
+            # Rule 5: Many unique values with high ratio
+            if n_unique > 20 or unique_ratio > 0.05:
                 logger.info(f"Detected regression ({n_unique} unique values, {unique_ratio:.2%} ratio)")
                 return "regression"
             
@@ -232,6 +256,16 @@ implementation:
         # === DETECT MODEL TYPE ===
         detected_model_type = detect_model_type(target_values)
         logger.info(f"✓ Detected model type: {detected_model_type.upper()}")
+        
+        # === Convert target to numeric if regression detected ===
+        if detected_model_type == "regression":
+            target_numeric = pd.to_numeric(target_values, errors='coerce')
+            if target_numeric.notna().sum() / len(target_values) > 0.8:
+                df[args.target_column] = target_numeric
+                target_values = target_numeric
+                logger.info(f"Converted target column to numeric type for regression")
+            else:
+                logger.warning("Failed to convert target to numeric, keeping original values")
 
         # === Stratification Logic with Safety Check ===
         stratify_param = None
@@ -248,6 +282,8 @@ implementation:
                     f"Skipping stratification: some classes have only {min_class_count} sample(s). "
                     f"Class distribution: {value_counts.to_dict()}"
                 )
+        elif detected_model_type == "regression":
+            logger.info("Regression detected: using random split (no stratification)")
 
         # === Convert Split Size ===
         split_size_input = float(args.split_size)
@@ -274,14 +310,29 @@ implementation:
         print(f"Data type: {target_values.dtype}")
         
         if detected_model_type == "classification":
-            print(f"Class distribution:{target_values.value_counts().to_string()}")
+            print(f"Class distribution:\n{target_values.value_counts().to_string()}")
+        else:
+            print(f"Target statistics:")
+            print(f"  Min: {target_values.min()}")
+            print(f"  Max: {target_values.max()}")
+            print(f"  Mean: {target_values.mean():.4f}")
+            print(f"  Median: {target_values.median():.4f}")
+            print(f"  Std: {target_values.std():.4f}")
         
         print("===== TRAIN SET =====")
         print("Shape:", train_df.shape)
+        if detected_model_type == "classification":
+            print(f"Class distribution in train:\n{train_df[args.target_column].value_counts().to_string()}")
+        else:
+            print(f"Target range in train: [{train_df[args.target_column].min():.4f}, {train_df[args.target_column].max():.4f}]")
         print(train_df.head(3).to_string())
 
         print("===== TEST DATA =====")
         print("Shape:", test_df.shape)
+        if detected_model_type == "classification":
+            print(f"Class distribution in test:\n{test_df[args.target_column].value_counts().to_string()}")
+        else:
+            print(f"Target range in test: [{test_df[args.target_column].min():.4f}, {test_df[args.target_column].max():.4f}]")
         print(test_df.head(3).to_string())
 
         # === Save Outputs ===
@@ -296,8 +347,10 @@ implementation:
         with open(args.model_type, 'w') as f:
             f.write(detected_model_type)
         
-        logger.info(f"Model type '{detected_model_type}' saved to output")
-        logger.info("Data loading and splitting completed successfully")
+        logger.info(f"✓ Model type '{detected_model_type}' saved to output")
+        logger.info(f"✓ Train set saved: {train_df.shape[0]} samples")
+        logger.info(f"✓ Test set saved: {test_df.shape[0]} samples")
+        logger.info("✓ Data loading and splitting completed successfully")
 
     args:
       - --api_url
