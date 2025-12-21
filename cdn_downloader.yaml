@@ -1,15 +1,17 @@
-name: Artifacts downloader from CDN v1
+name: Artifacts downloader from CDN v2
 inputs:
-  - {name: preprocessor_cdn, type: String, description: "CDN URL to download preprocessor artifact (cloudpickle/joblib). Optional", optional: true, default: ""}
-  - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact (optional).", optional: true, default: ""}
-  - {name: pca_cdn, type: String, description: "CDN URL to download PCA artifact (optional).", optional: true, default: ""}
-  - {name: model_pickle_cdn, type: String, description: "CDN URL to download model pickle/joblib artifact (optional).", optional: true, default: ""}
-  - {name: bearer_token, type: string, description: "Optional path to file containing bearer token for authenticated downloads", optional: true, default: ""}
+  - {name: preprocessor_cdn, type: String, optional: true, default: ""}
+  - {name: feature_selector_cdn, type: String, optional: true, default: ""}
+  - {name: pca_cdn, type: String, optional: true, default: ""}
+  - {name: model_pickle_cdn, type: String, optional: true, default: ""}
+  - {name: bearer_token, type: string, optional: true, default: ""}
+
 outputs:
-  - {name: preprocessor_local, type: Data, description: "Local file or directory path for downloaded preprocessor (or empty)"}
-  - {name: feature_selector_local, type: Data, description: "Local file or directory path for downloaded feature selector (or empty)"}
-  - {name: pca_local, type: Data, description: "Local file or directory path for downloaded PCA (or empty)"}
-  - {name: model_pickle_local, type: Model, description: "Local file or directory path for downloaded model pickle (or empty)"}
+  - {name: preprocessor_local, type: Data}
+  - {name: feature_selector_local, type: Data}
+  - {name: pca_local, type: Data}
+  - {name: model_pickle_local, type: Model}
+
 implementation:
   container:
     image: kumar2004/ml-base:v1
@@ -28,125 +30,99 @@ implementation:
             from urllib3 import Retry
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--preprocessor_cdn', type=str, default="")
-        parser.add_argument('--feature_selector_cdn', type=str, default="")
-        parser.add_argument('--pca_cdn', type=str, default="")
-        parser.add_argument('--model_pickle_cdn', type=str, default="")
-        parser.add_argument('--bearer_token', type=str, default="")
-        parser.add_argument('--preprocessor_local', type=str, required=True)
-        parser.add_argument('--feature_selector_local', type=str, required=True)
-        parser.add_argument('--pca_local', type=str, required=True)
-        parser.add_argument('--model_pickle_local', type=str, required=True)
+        parser.add_argument('--preprocessor_cdn', default="")
+        parser.add_argument('--feature_selector_cdn', default="")
+        parser.add_argument('--pca_cdn', default="")
+        parser.add_argument('--model_pickle_cdn', default="")
+        parser.add_argument('--bearer_token', default="")
+        parser.add_argument('--preprocessor_local', required=True)
+        parser.add_argument('--feature_selector_local', required=True)
+        parser.add_argument('--pca_local', required=True)
+        parser.add_argument('--model_pickle_local', required=True)
         args = parser.parse_args()
 
-        logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
         logger = logging.getLogger("artifacts_downloader")
 
-        # HTTP session with retry
         session = requests.Session()
-        try:
-            retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], allowed_methods=frozenset(["GET","HEAD"]))
-        except TypeError:
-            retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504], method_whitelist=frozenset(["GET","HEAD"]))
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
+        retry = Retry(total=5, backoff_factor=1, status_forcelist=[500,502,503,504])
+        session.mount("http://", HTTPAdapter(max_retries=retry))
+        session.mount("https://", HTTPAdapter(max_retries=retry))
 
         headers = {}
         if args.bearer_token and os.path.exists(args.bearer_token):
-            try:
-                with open(args.bearer_token, "r", encoding="utf-8") as fh:
-                    token = fh.read().strip()
+            with open(args.bearer_token, "r") as f:
+                token = f.read().strip()
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-                    logger.info("Using bearer token for authenticated downloads")
-            except Exception:
-                logger.warning("Could not read bearer token file; continuing without Authorization header")
 
-        def download_to_temp(url):
-            if not url or not str(url).strip():
-                raise ValueError("Empty URL")
-            fd, tmp = tempfile.mkstemp(suffix=".download")
-            os.close(fd)
-            logger.info("Downloading %s -> %s", url, tmp)
-            try:
-                r = session.get(url, headers=headers, timeout=60)
-                r.raise_for_status()
-            except Exception as e:
-                logger.exception("Download failed for %s: %s", url, e)
+        def candidate_urls(url):
+            if "$$$_" in url:
+                return [url, url.replace("$$$_", "$$_")]
+            return [url]
+
+        def download_with_fallback(url):
+            last_err = None
+            for u in candidate_urls(url):
                 try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-                raise
-            with open(tmp, "wb") as fh:
-                fh.write(r.content)
-            return tmp
-            is_zip = False
+                    logger.info("Trying download: %s", u)
+                    r = session.get(u, headers=headers, timeout=60)
+                    r.raise_for_status()
+                    fd, tmp = tempfile.mkstemp()
+                    os.close(fd)
+                    with open(tmp, "wb") as f:
+                        f.write(r.content)
+                    return tmp
+                except Exception as e:
+                    logger.warning("Download failed for %s", u)
+                    last_err = e
+            raise last_err
+
+        def place_artifact(tmp_file, out_path):
             try:
-                with zipfile.ZipFile(tmp_file, "r") as z:
+                with zipfile.ZipFile(tmp_file):
                     is_zip = True
             except zipfile.BadZipFile:
                 is_zip = False
+
             if is_zip:
-                # ensure out_path is treated as directory
                 os.makedirs(out_path, exist_ok=True)
                 with zipfile.ZipFile(tmp_file, "r") as z:
                     z.extractall(out_path)
-                logger.info("Extracted zip to %s", out_path)
-                try: os.remove(tmp_file)
-                except Exception: pass
+                os.remove(tmp_file)
                 return out_path
             else:
-                # if out_path ends with os.sep treat as directory, else file path
-                if out_path.endswith(os.sep) or out_path.endswith("/"):
-                    os.makedirs(out_path, exist_ok=True)
-                    fname = os.path.basename(tmp_file) or f"artifact_{np.random.randint(1e6)}"
-                    dest = os.path.join(out_path, fname)
-                else:
-                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                    dest = out_path
-                shutil.move(tmp_file, dest)
-                logger.info("Saved artifact file to %s", dest)
-                return dest
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                shutil.move(tmp_file, out_path)
+                return out_path
 
-        def write_meta_and_path(out_meta_path, path_val):
-            meta = {"artifact_local": None if path_val is None else str(path_val)}
-            try:
-                with open(out_meta_path + ".meta.json", "w", encoding="utf-8") as fh:
-                    json.dump(meta, fh)
-            except Exception:
-                logger.exception("Failed to write meta for %s", out_meta_path)
-            # Also write plain path for pipeline consumption
-            try:
-                with open(out_meta_path, "w", encoding="utf-8") as fh:
-                    fh.write("" if path_val is None else str(path_val))
-            except Exception:
-                logger.exception("Failed to write path file %s", out_meta_path)
+        def write_output(out_path, val):
+            with open(out_path, "w") as f:
+                f.write("" if val is None else str(val))
+            with open(out_path + ".meta.json", "w") as f:
+                json.dump({"artifact_local": val}, f)
 
-        def fetch_artifact(url, out_path):
-            if not url or not str(url).strip():
-                logger.info("No URL provided for target %s; writing null outputs", out_path)
-                write_meta_and_path(out_path, None)
+        def fetch(url, out_path):
+            if not url.strip():
+                write_output(out_path, None)
                 return None
             try:
-                tmp = download_to_temp(url)
+                tmp = download_with_fallback(url)
                 placed = place_artifact(tmp, out_path)
-                write_meta_and_path(out_path, placed)
+                write_output(out_path, placed)
                 return placed
             except Exception as e:
-                logger.exception("Failed to fetch artifact from %s: %s", url, e)
-                write_meta_and_path(out_path, None)
+                logger.exception("Final failure downloading %s", url)
+                write_output(out_path, None)
                 return None
 
-        # Fetch each artifact (will write <output>.meta.json and <output> path file)
-        pre_local = fetch_artifact(args.preprocessor_cdn, args.preprocessor_local)
-        feat_local = fetch_artifact(args.feature_selector_cdn, args.feature_selector_local)
-        pca_local = fetch_artifact(args.pca_cdn, args.pca_local)
-        model_local = fetch_artifact(args.model_pickle_cdn, args.model_pickle_local)
+        pre = fetch(args.preprocessor_cdn, args.preprocessor_local)
+        feat = fetch(args.feature_selector_cdn, args.feature_selector_local)
+        pca = fetch(args.pca_cdn, args.pca_local)
+        model = fetch(args.model_pickle_cdn, args.model_pickle_local)
 
-        logger.info("Artifacts downloaded: preprocessor=%s feature_selector=%s pca=%s model_pickle=%s",
-                    pre_local, feat_local, pca_local, model_local)
+        logger.info("Done. pre=%s feat=%s pca=%s model=%s", pre, feat, pca, model)
+
     args:
       - --preprocessor_cdn
       - {inputValue: preprocessor_cdn}
