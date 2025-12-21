@@ -1,5 +1,4 @@
-
-name: Feature Selection v5
+name: Feature Selection v5.1
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Brick 2"}
   - {name: train_y, type: Dataset, description: "Target labels from Brick 2"}
@@ -219,7 +218,7 @@ implementation:
         parser.add_argument('--engineering_metadata', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--enable_feature_selection', type=str, default="true")
-        parser.add_argument('--model_type', type=str, default="classification")
+        parser.add_argument('--model_type', type=str, required=True)
         parser.add_argument('--train_X', type=str, required=True)
         parser.add_argument('--train_y_out', type=str, required=True)
         parser.add_argument('--feature_selector', type=str, required=True)
