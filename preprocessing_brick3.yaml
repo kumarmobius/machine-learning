@@ -395,7 +395,7 @@ implementation:
       - --enable_feature_selection
       - {inputValue: enable_feature_selection}
       - --model_type
-      - {inputPath: model_type}
+      - {inputValue: model_type}
       - --train_X
       - {outputPath: train_X}
       - --train_y_out
