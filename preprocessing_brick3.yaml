@@ -6,7 +6,7 @@ inputs:
   - {name: engineering_metadata, type: Data, description: "Metadata from Brick 2"}
   - {name: preprocessor, type: Data, description: "Preprocessor from Brick 2 (pass-through)"}
   - {name: enable_feature_selection, type: String, description: "true/false to enable feature selection", optional: true, default: "false"}
-  - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
+  - {name: model_type, type: String, description: "classification or regression"}
 outputs:
   - {name: train_X, type: Dataset, description: "Final selected features parquet"}
   - {name: train_y, type: Dataset, description: "Target parquet (pass-through)"}
