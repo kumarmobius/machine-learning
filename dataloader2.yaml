@@ -1,4 +1,4 @@
-name: Data loader v6 with Auto Model Type Detection
+name: Data loader v6 with Auto Model Type Detection.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
@@ -104,16 +104,6 @@ implementation:
             return page_size, total_pages, total_instances
 
         def detect_model_type(target_series):
-            # """
-            # Automatically detect if the problem is classification or regression.
-            
-            # Rules:
-            # 1. If target is object/string type -> classification
-            # 2. If target is boolean -> classification
-            # 3. If target is numeric with <= 20 unique values -> classification
-            # 4. If target is numeric with > 20 unique values and > 5% unique ratio -> regression
-            # 5. Default: classification
-            # """
             if target_series.empty:
                 logger.warning("Empty target column, defaulting to classification")
                 return "classification"
