@@ -1,4 +1,4 @@
-name: Data loader v7
+name: Data loader v7 with Auto Model Type Detection
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
@@ -8,7 +8,7 @@ inputs:
 outputs:
   - {name: train_set, type: Dataset}
   - {name: test_data, type: Dataset}
-  - {name: model_type, type: String}
+  - {name: model_type, type: String, description: 'Auto-detected model type: classification or regression'}
 
 implementation:
   container:
