@@ -1,10 +1,10 @@
 name: Upload to CDN
 inputs:
-  - {name: test_data, type: Dataset, description: "Test dataset file"}
-  - {name: train_x, type: Dataset, description: "Training features dataset"}
-  - {name: train_y, type: Dataset, description: "Training labels dataset"}
-  - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
-  - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
+  - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
+  - {name: train_x, type: Dataset, description: "Training features dataset (CSV or Parquet)"}
+  - {name: train_y, type: Dataset, description: "Training labels dataset (CSV or Parquet)"}
+  - {name: preprocesser_pickle, type: Data, description: "Preprocessor pickle file"}
+  - {name: preprocesser_metadata, type: Data, description: "Preprocessor metadata JSON"}
   - {name: feature_selector, type: Data, description: "Feature selector pickle"}
   - {name: pca_model, type: Data, description: "PCA model pickle file"}
   - {name: pca_metadata, type: Data, description: "PCA metadata JSON"}
@@ -43,6 +43,8 @@ implementation:
         import json
         import os
         import time
+        import tempfile
+        import pandas as pd
 
         parser = argparse.ArgumentParser()
 
@@ -80,6 +82,16 @@ implementation:
             "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
         )
 
+        def ensure_csv(path):
+            if path.endswith(".csv"):
+                return path
+            if path.endswith(".parquet"):
+                df = pd.read_parquet(path)
+                tmp_csv = tempfile.mkstemp(suffix=".csv")[1]
+                df.to_csv(tmp_csv, index=False)
+                return tmp_csv
+            raise ValueError(f"Unsupported dataset format: {path}")
+
         def upload(file_path, output_path):
             cmd = [
                 "curl",
@@ -106,17 +118,17 @@ implementation:
             return full_url
 
         cdn_map = {}
-        cdn_map["train_x_cdn"] = upload(args.train_x, args.train_x_cdn_url)
-        cdn_map["train_y_cdn"] = upload(args.train_y, args.train_y_cdn_url)
+        cdn_map["train_x_cdn"] = upload(ensure_csv(args.train_x), args.train_x_cdn_url)
+        cdn_map["train_y_cdn"] = upload(ensure_csv(args.train_y), args.train_y_cdn_url)
+        cdn_map["test_data_cdn"] = upload(ensure_csv(args.test_data), args.test_data_cdn_url)
         cdn_map["preprocessor_cdn"] = upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url)
         cdn_map["preprocessor_metadata_cdn"] = upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url)
         cdn_map["feature_selector_cdn"] = upload(args.feature_selector, args.feature_selector_cdn_url)
         cdn_map["pca_cdn"] = upload(args.pca_model, args.pca_model_cdn_url)
         cdn_map["pca_metadata_cdn"] = upload(args.pca_metadata, args.pca_metadata_cdn_url)
-        cdn_map["test_data_cdn"] = upload(args.test_data, args.test_data_cdn_url)
 
         schema = {
-            "timestamp": int(time.time()),
+            "schema_timestamp_epoch": int(time.time()),
             **cdn_map
         }
 
