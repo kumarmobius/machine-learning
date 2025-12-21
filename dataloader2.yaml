@@ -1,7 +1,7 @@
-name: Data loader v9
+name: Data loader v9.
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
-  - {name: access_token, type: String, description: 'Bearer access token for API auth'}
+  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
   - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
 
@@ -310,7 +310,7 @@ implementation:
         print(f"Data type: {target_values.dtype}")
         
         if detected_model_type == "classification":
-            print(f"Class distribution:\n{target_values.value_counts().to_string()}")
+            print(f"Class distribution:{target_values.value_counts().to_string()}")
         else:
             print(f"Target statistics:")
             print(f"  Min: {target_values.min()}")
@@ -322,7 +322,7 @@ implementation:
         print("===== TRAIN SET =====")
         print("Shape:", train_df.shape)
         if detected_model_type == "classification":
-            print(f"Class distribution in train:\n{train_df[args.target_column].value_counts().to_string()}")
+            print(f"Class distribution in train:{train_df[args.target_column].value_counts().to_string()}")
         else:
             print(f"Target range in train: [{train_df[args.target_column].min():.4f}, {train_df[args.target_column].max():.4f}]")
         print(train_df.head(3).to_string())
@@ -330,7 +330,7 @@ implementation:
         print("===== TEST DATA =====")
         print("Shape:", test_df.shape)
         if detected_model_type == "classification":
-            print(f"Class distribution in test:\n{test_df[args.target_column].value_counts().to_string()}")
+            print(f"Class distribution in test:{test_df[args.target_column].value_counts().to_string()}")
         else:
             print(f"Target range in test: [{test_df[args.target_column].min():.4f}, {test_df[args.target_column].max():.4f}]")
         print(test_df.head(3).to_string())
