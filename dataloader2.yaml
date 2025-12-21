@@ -1,7 +1,7 @@
-name: Data loader v7 with Auto Model Type Detection
+name: Data loader v8
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
-  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
+  - {name: access_token, type: String, description: 'Bearer access token for API auth'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
   - {name: target_column, type: String, description: 'Name of target column used for anomaly labeling'}
 
@@ -233,11 +233,21 @@ implementation:
         detected_model_type = detect_model_type(target_values)
         logger.info(f"✓ Detected model type: {detected_model_type.upper()}")
 
-        # === Stratification Logic ===
+        # === Stratification Logic with Safety Check ===
+        stratify_param = None
         if detected_model_type == "classification" and target_values.nunique() > 1:
-            stratify_param = target_values
-        else:
-            stratify_param = None
+            # Check minimum class count
+            value_counts = target_values.value_counts()
+            min_class_count = value_counts.min()
+            
+            if min_class_count >= 2:
+                stratify_param = target_values
+                logger.info(f"Using stratified split (min class count: {min_class_count})")
+            else:
+                logger.warning(
+                    f"Skipping stratification: some classes have only {min_class_count} sample(s). "
+                    f"Class distribution: {value_counts.to_dict()}"
+                )
 
         # === Convert Split Size ===
         split_size_input = float(args.split_size)
@@ -262,6 +272,9 @@ implementation:
         print(f"Target column: {args.target_column}")
         print(f"Unique values: {target_values.nunique()}")
         print(f"Data type: {target_values.dtype}")
+        
+        if detected_model_type == "classification":
+            print(f"Class distribution:\n{target_values.value_counts().to_string()}")
         
         print("===== TRAIN SET =====")
         print("Shape:", train_df.shape)
