@@ -1,4 +1,4 @@
-name: Feature Engineering v1.2
+name: Feature Engineering v1.2.
 inputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features from Brick 1"}
   - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
@@ -677,7 +677,7 @@ implementation:
       - --cleaning_metadata
       - {inputPath: cleaning_metadata}
       - --model_type
-      - {inputValue: model_type}
+      - {inputPath: model_type}
       - --outlier_strategy
       - {inputValue: outlier_strategy}
       - --outlier_fold
