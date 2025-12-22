@@ -1,4 +1,4 @@
-name: Upload to CDN v2
+name: Upload to CDN v3
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
   - {name: train_x, type: Dataset, description: "Training features dataset (CSV or Parquet)"}
@@ -83,7 +83,6 @@ implementation:
         )
 
         def ensure_csv(path):
-            """Convert dataset to CSV format if needed, handling files without extensions."""
             # If path already ends with .csv, return as-is
             if path.endswith(".csv"):
                 return path
