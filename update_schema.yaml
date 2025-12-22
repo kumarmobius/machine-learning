@@ -1,4 +1,4 @@
-name: Update Schema Row v6
+name: Update Schema Row v7
 inputs:
   - { name: schema_id, type: String }
   - { name: update_data_json, type: String }
@@ -36,7 +36,6 @@ implementation:
         parser.add_argument('--schema_id', type=str, required=True)
         parser.add_argument('--update_data_json', type=str, required=True)
         parser.add_argument('--mapping_json', type=str, required=True)
-        # model_id and execution_id as integers to match backend validation
         parser.add_argument('--model_id', type=str, required=True)
         parser.add_argument('--execution_id', type=int, required=True)
         parser.add_argument('--tenant_id', type=str, required=True)
@@ -48,6 +47,23 @@ implementation:
 
         args = parser.parse_args()
 
+        # Helper function to check if value should be skipped
+        def should_skip_value(val):
+            """Returns True if value is -1 or "-1" (sentinel for skip)"""
+            return str(val).strip() == "-1"
+
+        # EARLY CHECK: If any critical input is -1, skip entire operation
+        critical_inputs = [
+            ('model_id', args.model_id),
+            ('project_id', args.project_id),
+            ('architecture_type', args.architecture_type)
+        ]
+        
+        for name, value in critical_inputs:
+            if should_skip_value(value):
+                print(f"INFO: {name} is -1. Skipping entire operation.")
+                sys.exit(0)
+
         # Keep integer types as provided by argparse
         model_id = args.model_id
         execution_id = args.execution_id
@@ -55,7 +71,7 @@ implementation:
 
         # READ FILES (support passing file path for tenant_id and bearer token)
         def read_file_if_path(path):
-            if path and path != '-1':
+            if path and not should_skip_value(path):
                 if os.path.exists(path):
                     with open(path, 'r') as f:
                         return f.read().strip()
@@ -69,13 +85,12 @@ implementation:
 
         # Parse JSON inputs (tolerate '-1' sentinel)
         try:
-            update_data = json.loads(args.update_data_json) if args.update_data_json and args.update_data_json != '-1' else {}
-            mapping = json.loads(args.mapping_json) if args.mapping_json and args.mapping_json != '-1' else {}
+            update_data = json.loads(args.update_data_json) if args.update_data_json and not should_skip_value(args.update_data_json) else {}
+            mapping = json.loads(args.mapping_json) if args.mapping_json and not should_skip_value(args.mapping_json) else {}
         except Exception as e:
             print("Invalid JSON for update_data_json or mapping_json:", e, file=sys.stderr)
             sys.exit(1)
 
-        # No float_keys_json behavior (removed per request)
         def coerce_if_needed(key, value):
             return value
 
@@ -96,7 +111,7 @@ implementation:
         http.mount("https://", adapter)
 
         # MULTIPLE ROWS PATH
-        if args.multiple_rows_json != "-1":
+        if not should_skip_value(args.multiple_rows_json):
             try:
                 rows = json.loads(args.multiple_rows_json)
                 if not isinstance(rows, list):
@@ -105,29 +120,54 @@ implementation:
                 print("Error in multiple_rows_json:", e, file=sys.stderr)
                 sys.exit(1)
 
-            for row in rows:
-                # Inject tenant_id if provided via file/input
-                if args.tenant_id != "-1" and tenant_id_file_value:
+            filtered_rows = []
+            for idx, row in enumerate(rows):
+                # Check if row has any -1 values in critical fields
+                skip_row = False
+                row_critical_fields = ['model_id', 'architecture_type', 'projectId']
+                
+                for field in row_critical_fields:
+                    if field in row and should_skip_value(row[field]):
+                        print(f"INFO: Skipping row {idx} because {field}=-1")
+                        skip_row = True
+                        break
+                
+                if skip_row:
+                    continue
+                
+                # Inject tenant_id if provided via file/input and not -1
+                if not should_skip_value(args.tenant_id) and tenant_id_file_value:
                     row["tenant_id"] = tenant_id_file_value
-                # Inject projectId if provided (string per schema)
-                if args.project_id != "-1":
+                
+                # Inject projectId if provided and not -1
+                if not should_skip_value(args.project_id):
                     row["projectId"] = project_id_val
-                # Inject architecture_type if provided
-                if args.architecture_type != "-1":
+                
+                # Inject architecture_type if provided and not -1
+                if not should_skip_value(args.architecture_type):
                     row["architecture_type"] = args.architecture_type
-                # Inject model_id as integer if provided and not already present
-                if args.model_id is not None and "model_id" not in row:
-                    # ensure integer type in JSON
+                
+                # Inject model_id if provided and not -1 and not already present
+                if not should_skip_value(args.model_id) and "model_id" not in row:
                     row["model_id"] = model_id
+                
                 # Ensure execution_id exists on each row (integer)
                 if "execution_id" not in row:
                     row["execution_id"] = int(execution_id)
+                
+                filtered_rows.append(row)
 
-            create_url = f"{args.domain.rstrip('/')}/pi-entity-instances-service/v2.0/schemas/{args.schema_id}/instances"
-            payload = {"data": rows}
-            resp = http.post(create_url, headers=headers, data=json.dumps(payload))
-            print(resp.text)
-            resp.raise_for_status()
+            # Only post if we have rows to process
+            if filtered_rows:
+                create_url = f"{args.domain.rstrip('/')}/pi-entity-instances-service/v2.0/schemas/{args.schema_id}/instances"
+                payload = {"data": filtered_rows}
+                resp = http.post(create_url, headers=headers, data=json.dumps(payload))
+                print(resp.text)
+                resp.raise_for_status()
+                print(f"SUCCESS: Posted {len(filtered_rows)} rows")
+            else:
+                print("INFO: No valid rows to process after filtering -1 values. Exiting successfully.")
+            
             sys.exit(0)
 
         # SINGLE ROW – CHECK EXISTENCE
@@ -175,6 +215,7 @@ implementation:
             resp = http.patch(update_url, headers=headers, data=json.dumps(update_payload))
             print(resp.text)
             resp.raise_for_status()
+            print("SUCCESS: Updated existing row")
 
         else:
             # CREATE NEW ROW
@@ -191,12 +232,21 @@ implementation:
                     if keys in update_data:
                         creation[column] = coerce_if_needed(keys, update_data[keys])
 
+            # Always add execution_id
             creation["execution_id"] = int(execution_id)
-            creation["model_id"] = model_id
-            if tenant_id_file_value:
+            
+            # Only add fields if they are NOT -1
+            if not should_skip_value(args.model_id):
+                creation["model_id"] = model_id
+            
+            if not should_skip_value(args.tenant_id) and tenant_id_file_value:
                 creation["tenant_id"] = tenant_id_file_value
-            creation["projectId"] = project_id_val
-            creation["architecture_type"] = args.architecture_type
+            
+            if not should_skip_value(args.project_id):
+                creation["projectId"] = project_id_val
+            
+            if not should_skip_value(args.architecture_type):
+                creation["architecture_type"] = args.architecture_type
 
             create_url = f"{args.domain.rstrip('/')}/pi-entity-instances-service/v2.0/schemas/{args.schema_id}/instances"
             payload = {"data": [creation]}
@@ -204,6 +254,7 @@ implementation:
             resp = http.post(create_url, headers=headers, data=json.dumps(payload))
             print(resp.text)
             resp.raise_for_status()
+            print("SUCCESS: Created new row")
 
     args:
       - --schema_id
