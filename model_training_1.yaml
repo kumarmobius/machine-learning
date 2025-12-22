@@ -71,7 +71,7 @@ implementation:
             CatBoostRegressor = None
       
         def load_parquet_df(path):
-            return pd.read_csv(path, engine="auto")
+            return pd.read_csv(path)
       
         def ensure_dir_for(p):
             d = os.path.dirname(p)
