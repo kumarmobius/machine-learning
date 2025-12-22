@@ -1,5 +1,4 @@
-
-name: Upload to CDN v1
+name: Upload to CDN v2
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
   - {name: train_x, type: Dataset, description: "Training features dataset (CSV or Parquet)"}
@@ -84,14 +83,37 @@ implementation:
         )
 
         def ensure_csv(path):
+            """Convert dataset to CSV format if needed, handling files without extensions."""
+            # If path already ends with .csv, return as-is
             if path.endswith(".csv"):
                 return path
+            
+            # If path ends with .parquet, convert to CSV
             if path.endswith(".parquet"):
                 df = pd.read_parquet(path)
                 tmp_csv = tempfile.mkstemp(suffix=".csv")[1]
                 df.to_csv(tmp_csv, index=False)
                 return tmp_csv
-            raise ValueError(f"Unsupported dataset format: {path}")
+            
+            # For files without extension (like 'data'), try to detect format
+            # First, try reading as parquet (most common in ML pipelines)
+            try:
+                df = pd.read_parquet(path)
+                tmp_csv = tempfile.mkstemp(suffix=".csv")[1]
+                df.to_csv(tmp_csv, index=False)
+                return tmp_csv
+            except Exception:
+                pass
+            
+            # If parquet fails, try reading as CSV
+            try:
+                # Test if it's already a valid CSV
+                pd.read_csv(path, nrows=1)
+                return path
+            except Exception:
+                pass
+            
+            raise ValueError(f"Unsupported dataset format or unable to read: {path}")
 
         def upload(file_path, output_path):
             cmd = [
