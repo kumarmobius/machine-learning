@@ -1,4 +1,4 @@
-name: ML Pipeline Trigger 3
+name: ML Pipeline Trigger 4
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -15,7 +15,7 @@ inputs:
   - {name: test_data_cdn, type: String, optional: true, default: ""}
   - {name: model_id, type: String, optional: true, default: ""}
   - {name: project_id, type: String, optional: true, default: ""}
-  - {name: execution_id, type: Integer, optional: true, default: ""}
+  - {name: execution_id, type: Integer, optional: true, default: 0}
 
 outputs:
   - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
@@ -50,7 +50,7 @@ implementation:
         parser.add_argument('--test_data_cdn', default="")
         parser.add_argument('--model_id', default="")
         parser.add_argument('--project_id', default="")
-        parser.add_argument('--execution_id', default="")
+        parser.add_argument('--execution_id', type=int, default=0)
         parser.add_argument('--trigger_response', required=True)
         args = parser.parse_args()
 
@@ -90,7 +90,7 @@ implementation:
             parameters["model_id"] = args.model_id
         if args.project_id:
             parameters["project_id"] = args.project_id
-        if args.execution_id:
+        if args.execution_id != 0:
             parameters["execution_id"] = args.execution_id
 
         # Build payload - exactly matching the working curl structure
@@ -114,6 +114,7 @@ implementation:
         print(f"[DEBUG] Triggering pipeline at: {url}")
         print(f"[DEBUG] Pipeline ID: {args.pipeline_id}")
         print(f"[DEBUG] Experiment ID: {args.experiment_id}")
+        print(f"[DEBUG] Execution ID: {args.execution_id} (type: {type(args.execution_id).__name__})")
         print(f"[DEBUG] Payload: {json.dumps(payload, indent=2)}")
         
         # Make the request
