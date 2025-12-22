@@ -1,11 +1,11 @@
-name: ML Pipeline Trigger 2
+name: ML Pipeline Trigger 3
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
   - {name: pipeline_id, type: String, description: "Pipeline ID to trigger"}
   - {name: experiment_id, type: String, description: "Experiment ID"}
-  - {name: model_type, type: String}
-  - {name: target_column, type: String}
+  - {name: model_type, type: String, optional: true, default: ""}
+  - {name: target_column, type: String, optional: true, default: ""}
   - {name: preprocessor_metadata_cdn, type: String, optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, optional: true, default: ""}
   - {name: pca_cdn, type: String, optional: true, default: ""}
@@ -15,7 +15,7 @@ inputs:
   - {name: test_data_cdn, type: String, optional: true, default: ""}
   - {name: model_id, type: String, optional: true, default: ""}
   - {name: project_id, type: String, optional: true, default: ""}
-  - {name: execution_id, type: Integer, description: "Execution counter"}
+  - {name: execution_id, type: String, optional: true, default: ""}
 
 outputs:
   - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
@@ -39,8 +39,8 @@ implementation:
         parser.add_argument('--domain', required=True)
         parser.add_argument('--pipeline_id', required=True)
         parser.add_argument('--experiment_id', required=True)
-        parser.add_argument('--model_type', required=True)
-        parser.add_argument('--target_column', required=True)
+        parser.add_argument('--model_type', default="")
+        parser.add_argument('--target_column', default="")
         parser.add_argument('--preprocessor_metadata_cdn', default="")
         parser.add_argument('--feature_selector_cdn', default="")
         parser.add_argument('--pca_cdn', default="")
@@ -50,58 +50,106 @@ implementation:
         parser.add_argument('--test_data_cdn', default="")
         parser.add_argument('--model_id', default="")
         parser.add_argument('--project_id', default="")
-        parser.add_argument('--execution_id', type=int, required=True)
+        parser.add_argument('--execution_id', default="")
         parser.add_argument('--trigger_response', required=True)
         args = parser.parse_args()
 
+        # Read bearer token
         with open(args.bearer_token, "r", encoding="utf-8") as f:
             token = f.read().strip()
 
+        # Construct URL - exactly like the working curl
         url = (
             f"{args.domain.rstrip('/')}"
             f"/bob-service-test/v1.0/pipeline/trigger/ml"
             f"?pipelineId={args.pipeline_id}"
         )
 
+        # Build parameters object - only include non-empty values
+        parameters = {}
+        
+        if args.model_type:
+            parameters["model_type"] = args.model_type
+        if args.target_column:
+            parameters["target_column"] = args.target_column
+        if args.preprocessor_metadata_cdn:
+            parameters["preprocessor_metadata_cdn"] = args.preprocessor_metadata_cdn
+        if args.feature_selector_cdn:
+            parameters["feature_selector_cdn"] = args.feature_selector_cdn
+        if args.pca_cdn:
+            parameters["pca_cdn"] = args.pca_cdn
+        if args.preprocessor_cdn:
+            parameters["preprocessor_cdn"] = args.preprocessor_cdn
+        if args.x_train_cdn:
+            parameters["x_train_cdn"] = args.x_train_cdn
+        if args.y_train_cdn:
+            parameters["y_train_cdn"] = args.y_train_cdn
+        if args.test_data_cdn:
+            parameters["test_data_cdn"] = args.test_data_cdn
+        if args.model_id:
+            parameters["model_id"] = args.model_id
+        if args.project_id:
+            parameters["project_id"] = args.project_id
+        if args.execution_id:
+            parameters["execution_id"] = args.execution_id
+
+        # Build payload - exactly matching the working curl structure
         payload = {
             "pipelineType": "ML",
             "containerResources": {},
             "experimentId": args.experiment_id,
             "enableCaching": True,
-            "parameters": {
-                "model_type": args.model_type,
-                "target_column": args.target_column,
-                "preprocessor_metadata_cdn": args.preprocessor_metadata_cdn,
-                "feature_selector_cdn": args.feature_selector_cdn,
-                "pca_cdn": args.pca_cdn,
-                "preprocessor_cdn": args.preprocessor_cdn,
-                "x_train_cdn": args.x_train_cdn,
-                "y_train_cdn": args.y_train_cdn,
-                "test_data_cdn": args.test_data_cdn,
-                "model_id": args.model_id,
-                "project_id": args.project_id,
-                "execution_id": args.execution_id
-            },
+            "parameters": parameters,
             "version": 1
         }
 
+        # Headers - exactly matching the working curl
         headers = {
+            "accept": "application/json",
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "accept": "application/json"
+            "Content-Type": "application/json"
         }
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        # Print debug information
+        print(f"[DEBUG] Triggering pipeline at: {url}")
+        print(f"[DEBUG] Pipeline ID: {args.pipeline_id}")
+        print(f"[DEBUG] Experiment ID: {args.experiment_id}")
+        print(f"[DEBUG] Payload: {json.dumps(payload, indent=2)}")
+        
+        # Make the request
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            
+            if not resp.ok:
+                error_detail = ""
+                try:
+                    error_json = resp.json()
+                    error_detail = json.dumps(error_json, indent=2)
+                except:
+                    error_detail = resp.text
+                
+                print(f"[ERROR] Trigger failed with status {resp.status_code}", file=sys.stderr)
+                print(f"[ERROR] Response: {error_detail}", file=sys.stderr)
+                
+                if resp.status_code == 404:
+                    print("[ERROR] Pipeline not found. Please verify:", file=sys.stderr)
+                    print(f"  - Pipeline ID is correct: {args.pipeline_id}", file=sys.stderr)
+                elif resp.status_code == 401 or resp.status_code == 403:
+                    print("[ERROR] Authentication/Authorization failed", file=sys.stderr)
+                
+                resp.raise_for_status()
 
-        if not resp.ok:
-            print("Trigger failed:", resp.status_code, resp.text, file=sys.stderr)
-            resp.raise_for_status()
+            # Write response
+            response_text = resp.text
+            with open(args.trigger_response, "w", encoding="utf-8") as f:
+                f.write(response_text)
 
-        with open(args.trigger_response, "w", encoding="utf-8") as f:
-            f.write(resp.text)
-
-        print("[INFO] Pipeline triggered successfully")
-        print(resp.text)
+            print("[SUCCESS] Pipeline triggered successfully")
+            print(response_text)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Request failed: {str(e)}", file=sys.stderr)
+            raise
 
     args:
       - --bearer_token
