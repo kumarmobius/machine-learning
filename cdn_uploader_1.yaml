@@ -1,4 +1,5 @@
-name: Upload to CDN
+
+name: Upload to CDN v1
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
   - {name: train_x, type: Dataset, description: "Training features dataset (CSV or Parquet)"}
