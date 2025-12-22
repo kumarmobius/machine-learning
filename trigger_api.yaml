@@ -1,4 +1,4 @@
-name: ML Pipeline Trigger 4
+name: ML Pipeline Trigger 5
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -15,7 +15,7 @@ inputs:
   - {name: test_data_cdn, type: String, optional: true, default: ""}
   - {name: model_id, type: String, optional: true, default: ""}
   - {name: project_id, type: String, optional: true, default: ""}
-  - {name: execution_id, type: Integer, optional: true, default: "0"}
+  - {name: execution_id, type: Integer, optional: true}
 
 outputs:
   - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
@@ -50,7 +50,7 @@ implementation:
         parser.add_argument('--test_data_cdn', default="")
         parser.add_argument('--model_id', default="")
         parser.add_argument('--project_id', default="")
-        parser.add_argument('--execution_id', type=int, default=0)
+        parser.add_argument('--execution_id', type=int)
         parser.add_argument('--trigger_response', required=True)
         args = parser.parse_args()
 
