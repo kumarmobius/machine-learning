@@ -1,4 +1,4 @@
-name: ML Pipeline Trigger 1
+name: ML Pipeline Trigger 2
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -22,7 +22,7 @@ outputs:
 
 implementation:
   container:
-    image: python:3.8
+    image: kumar2004/mobius:1.0
     command:
       - python3
       - -u
