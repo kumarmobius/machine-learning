@@ -15,7 +15,7 @@ inputs:
   - {name: test_data_cdn, type: String, optional: true, default: ""}
   - {name: model_id, type: String, optional: true, default: ""}
   - {name: project_id, type: String, optional: true, default: ""}
-  - {name: execution_id, type: Integer, optional: true, default: 0}
+  - {name: execution_id, type: Integer, optional: true, default: "0"}
 
 outputs:
   - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
