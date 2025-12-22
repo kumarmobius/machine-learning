@@ -4,10 +4,10 @@ inputs:
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
   - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
   - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
-  - {name: name, type: String, description: "Optional friendly name to include in model output JSON", optional: true}
+  - {name: name, type: String, description: "Friendly name to include in schema CDN JSON", optional: false}
 
 outputs:
-  - {name: model_pickle_cdn, type: String, description: "JSON containing the model pickle CDN URL (and optional name)"}
+  - {name: schema_cdn_json, type: String, description: "JSON containing the model_pickle_cdn and name"}
   - {name: config_cdn_url, type: String, description: "JSON containing config with model_weights_cdn"}
 
 implementation:
@@ -33,9 +33,9 @@ implementation:
         parser.add_argument('--bearer_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
         parser.add_argument('--get_cdn', type=str, required=True)
-        parser.add_argument('--name', type=str, required=False, default="")
+        parser.add_argument('--name', type=str, required=True)
 
-        parser.add_argument('--model_pickle_cdn', type=str, required=True)
+        parser.add_argument('--schema_cdn_json', type=str, required=True)
         parser.add_argument('--config_cdn_url', type=str, required=True)
         args = parser.parse_args()
 
@@ -110,10 +110,12 @@ implementation:
 
             final_url = f"{args.get_cdn.rstrip('/')}{rel}"
 
-            model_out = {"model_pickle_cdn": final_url}
-            if args.name:
-                model_out["name"] = args.name
-            atomic_write_json(args.model_pickle_cdn, model_out)
+            # schema JSON contains both model_pickle_cdn and name (name is required)
+            schema_out = {
+                "model_pickle_cdn": final_url,
+                "name": args.name
+            }
+            atomic_write_json(args.schema_cdn_json, schema_out)
 
             config_out = {"model_weights_cdn": final_url}
             atomic_write_json(args.config_cdn_url, config_out)
@@ -143,7 +145,7 @@ implementation:
       - {inputValue: get_cdn}
       - --name
       - {inputValue: name}
-      - --model_pickle_cdn
-      - {outputPath: model_pickle_cdn}
+      - --schema_cdn_json
+      - {outputPath: schema_cdn_json}
       - --config_cdn_url
       - {outputPath: config_cdn_url}
