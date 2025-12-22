@@ -1,4 +1,4 @@
-name: ML Artifacts Downloader v4
+name: ML Artifacts Downloader v4.
 inputs:
   - {name: preprocessor_metadata_cdn, type: String, description: "CDN URL to download preprocessor metadata artifact", optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact", optional: true, default: ""}
@@ -82,7 +82,6 @@ implementation:
                     headers["Authorization"] = f"Bearer {token}"
 
         def convert_to_three_dollars(url):
-            """Convert URLs with $ or $$ to $$$"""
             if "$$$" in url:
                 return url
             elif "$$" in url:
