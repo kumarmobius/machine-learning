@@ -1,4 +1,4 @@
-name: Upload to CDN v3
+name: Upload to CDN v4
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
   - {name: train_x, type: Dataset, description: "Training features dataset (CSV or Parquet)"}
@@ -150,7 +150,7 @@ implementation:
         cdn_map["pca_metadata_cdn"] = upload(args.pca_metadata, args.pca_metadata_cdn_url)
 
         schema = {
-            "schema_timestamp_epoch": int(time.time()),
+            "timestamp": int(time.time()),
             **cdn_map
         }
 
