@@ -1,4 +1,4 @@
-name: Model CDN uploader
+name: Model CDN uploader v2
 inputs:
   - {name: model_pickle, type: Model, description: "Saved model pickle/joblib file to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
