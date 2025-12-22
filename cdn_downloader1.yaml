@@ -1,4 +1,4 @@
-name: ML Artifacts Downloader v4.
+name: ML Artifacts Downloader v5
 inputs:
   - {name: preprocessor_metadata_cdn, type: String, description: "CDN URL to download preprocessor metadata artifact", optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact", optional: true, default: ""}
@@ -101,7 +101,6 @@ implementation:
             return tmp
 
         def download_with_fallback(url):
-            """Try downloading with $$$ first, then fall back to original URL"""
             original_url = url
             
             # First attempt: Convert to $$$ if not already
