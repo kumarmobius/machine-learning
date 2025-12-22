@@ -1,4 +1,4 @@
-name: ML Artifacts Downloader v3
+name: ML Artifacts Downloader v4
 inputs:
   - {name: preprocessor_metadata_cdn, type: String, description: "CDN URL to download preprocessor metadata artifact", optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact", optional: true, default: ""}
@@ -25,7 +25,7 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, tempfile, shutil, zipfile, logging
+        import argparse, os, sys, tempfile, shutil, zipfile, logging, re
         import requests
         from requests.adapters import HTTPAdapter
         try:
@@ -81,6 +81,16 @@ implementation:
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
 
+        def convert_to_three_dollars(url):
+            """Convert URLs with $ or $$ to $$$"""
+            if "$$$" in url:
+                return url
+            elif "$$" in url:
+                return url.replace("$$", "$$$")
+            elif "_$_" in url:
+                return url.replace("_$_", "_$$$_")
+            return url
+
         def try_download(url):
             logger.info("Attempting download: %s", url)
             r = session.get(url, headers=headers, timeout=120)
@@ -92,15 +102,27 @@ implementation:
             return tmp
 
         def download_with_fallback(url):
-            try:
-                return try_download(url)
-            except Exception as e:
-                logger.warning("Initial download failed: %s", e)
-                if "$$" in url and "$$$" not in url:
-                    fallback_url = url.replace("$$", "$$$")
-                    logger.info("Retrying with fallback URL: %s", fallback_url)
-                    return try_download(fallback_url)
-                raise
+            """Try downloading with $$$ first, then fall back to original URL"""
+            original_url = url
+            
+            # First attempt: Convert to $$$ if not already
+            three_dollar_url = convert_to_three_dollars(url)
+            
+            if three_dollar_url != original_url:
+                logger.info("Trying with $$$ URL first: %s", three_dollar_url)
+                try:
+                    return try_download(three_dollar_url)
+                except Exception as e:
+                    logger.warning("Download with $$$ failed: %s", e)
+                    logger.info("Falling back to original URL: %s", original_url)
+                    try:
+                        return try_download(original_url)
+                    except Exception as e2:
+                        logger.error("Both download attempts failed")
+                        raise e2
+            else:
+                # URL already has $$$, just try it
+                return try_download(original_url)
 
         def place_artifact(tmp_file, out_path):
             try:
@@ -116,6 +138,7 @@ implementation:
 
         def fetch_artifact(url, out_path):
             if not url or not url.strip():
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                 with open(out_path, "w") as fh:
                     fh.write("")
                 return None
@@ -129,6 +152,8 @@ implementation:
         fetch_artifact(args.x_train_cdn, args.x_train_local)
         fetch_artifact(args.y_train_cdn, args.y_train_local)
         fetch_artifact(args.test_data_cdn, args.test_data_local)
+
+        logger.info("All artifacts downloaded successfully")
 
     args:
       - --preprocessor_metadata_cdn
