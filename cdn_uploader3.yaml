@@ -1,4 +1,4 @@
-name: Model CDN uploader v2
+name: Model CDN uploader v3
 inputs:
   - {name: model_pickle, type: Model, description: "Saved model pickle/joblib file to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
@@ -112,7 +112,7 @@ implementation:
 
             # schema JSON contains both model_pickle_cdn and name (name is required)
             schema_out = {
-                "model_pickle_cdn": final_url,
+                "model_url": final_url,
                 "name": args.name
             }
             atomic_write_json(args.schema_cdn_json, schema_out)
