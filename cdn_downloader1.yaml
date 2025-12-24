@@ -1,4 +1,4 @@
-name: ML Artifacts Downloader v5
+name: ML Artifacts Downloader v6
 inputs:
   - {name: preprocessor_metadata_cdn, type: String, description: "CDN URL to download preprocessor metadata artifact", optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, description: "CDN URL to download feature selector artifact", optional: true, default: ""}
@@ -81,13 +81,14 @@ implementation:
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
 
-        def convert_to_three_dollars(url):
-            if "$$$" in url:
-                return url
-            elif "$$" in url:
-                return url.replace("$$", "$$$")
-            elif "_$_" in url:
-                return url.replace("_$_", "_$$$_")
+        def encode_special_chars(url):
+            url = url.replace("$", "%24")
+            url = url.replace("(", "%28")
+            url = url.replace(")", "%29")
+            url = url.replace("[", "%5B")
+            url = url.replace("]", "%5D")
+            url = url.replace("{", "%7B")
+            url = url.replace("}", "%7D")
             return url
 
         def try_download(url):
@@ -103,15 +104,15 @@ implementation:
         def download_with_fallback(url):
             original_url = url
             
-            # First attempt: Convert to $$$ if not already
-            three_dollar_url = convert_to_three_dollars(url)
+            # Encode special characters in URL
+            encoded_url = encode_special_chars(url)
             
-            if three_dollar_url != original_url:
-                logger.info("Trying with $$$ URL first: %s", three_dollar_url)
+            if encoded_url != original_url:
+                logger.info("Trying with encoded URL: %s", encoded_url)
                 try:
-                    return try_download(three_dollar_url)
+                    return try_download(encoded_url)
                 except Exception as e:
-                    logger.warning("Download with $$$ failed: %s", e)
+                    logger.warning("Download with encoded URL failed: %s", e)
                     logger.info("Falling back to original URL: %s", original_url)
                     try:
                         return try_download(original_url)
@@ -119,7 +120,7 @@ implementation:
                         logger.error("Both download attempts failed")
                         raise e2
             else:
-                # URL already has $$$, just try it
+                # URL doesn't have special characters, just try it
                 return try_download(original_url)
 
         def place_artifact(tmp_file, out_path):
