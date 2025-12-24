@@ -25,7 +25,7 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, tempfile, shutil, zipfile, logging, re
+        import argparse, os, sys, tempfile, shutil, zipfile, logging
         import requests
         from requests.adapters import HTTPAdapter
         try:
@@ -81,18 +81,8 @@ implementation:
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
 
-        def encode_special_chars(url):
-            url = url.replace("$", "%24")
-            url = url.replace("(", "%28")
-            url = url.replace(")", "%29")
-            url = url.replace("[", "%5B")
-            url = url.replace("]", "%5D")
-            url = url.replace("{", "%7B")
-            url = url.replace("}", "%7D")
-            return url
-
-        def try_download(url):
-            logger.info("Attempting download: %s", url)
+        def download_file(url):
+            logger.info("Downloading: %s", url)
             r = session.get(url, headers=headers, timeout=120)
             r.raise_for_status()
             fd, tmp = tempfile.mkstemp(suffix=".download")
@@ -100,28 +90,6 @@ implementation:
             with open(tmp, "wb") as fh:
                 fh.write(r.content)
             return tmp
-
-        def download_with_fallback(url):
-            original_url = url
-            
-            # Encode special characters in URL
-            encoded_url = encode_special_chars(url)
-            
-            if encoded_url != original_url:
-                logger.info("Trying with encoded URL: %s", encoded_url)
-                try:
-                    return try_download(encoded_url)
-                except Exception as e:
-                    logger.warning("Download with encoded URL failed: %s", e)
-                    logger.info("Falling back to original URL: %s", original_url)
-                    try:
-                        return try_download(original_url)
-                    except Exception as e2:
-                        logger.error("Both download attempts failed")
-                        raise e2
-            else:
-                # URL doesn't have special characters, just try it
-                return try_download(original_url)
 
         def place_artifact(tmp_file, out_path):
             try:
@@ -141,7 +109,7 @@ implementation:
                 with open(out_path, "w") as fh:
                     fh.write("")
                 return None
-            tmp = download_with_fallback(url)
+            tmp = download_file(url)
             return place_artifact(tmp, out_path)
 
         fetch_artifact(args.preprocessor_metadata_cdn, args.preprocessor_metadata_local)
