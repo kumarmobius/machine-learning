@@ -12,7 +12,7 @@ outputs:
   - {name: pca_metadata, type: Data, description: "PCA metadata JSON (shapes, variance, loadings, etc.)"}
 implementation:
   container:
-    image: gurpreetgandhi/nesy-factory:vtests3
+    image:  gurpreetgandhi/nesy-factory:vtest4
     command:
       - python3
       - -u
