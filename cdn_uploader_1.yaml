@@ -44,6 +44,7 @@ implementation:
         import os
         import time
         import tempfile
+        import shutil
         import pandas as pd
 
         parser = argparse.ArgumentParser()
@@ -72,6 +73,16 @@ implementation:
         parser.add_argument('--schema_json', required=True)
 
         args = parser.parse_args()
+
+        def encode_special_chars(text):
+            text = text.replace("$", "%24")
+            text = text.replace("(", "%28")
+            text = text.replace(")", "%29")
+            text = text.replace("[", "%5B")
+            text = text.replace("]", "%5D")
+            text = text.replace("{", "%7B")
+            text = text.replace("}", "%7D")
+            return text
 
         with open(args.bearer_token, "r") as f:
             bearer_token = f.read().strip()
@@ -114,30 +125,54 @@ implementation:
             
             raise ValueError(f"Unsupported dataset format or unable to read: {path}")
 
+        def sanitize_file_for_upload(file_path):
+            """Sanitize filename by encoding special characters"""
+            original_name = os.path.basename(file_path)
+            sanitized_name = encode_special_chars(original_name)
+            
+            if sanitized_name != original_name:
+                # Create a copy with sanitized name
+                temp_dir = tempfile.gettempdir()
+                sanitized_path = os.path.join(temp_dir, sanitized_name)
+                shutil.copy2(file_path, sanitized_path)
+                return sanitized_path, sanitized_path  # return path and temp file to cleanup
+            
+            return file_path, None
+
         def upload(file_path, output_path):
-            cmd = [
-                "curl",
-                "--location", upload_url,
-                "--header", f"Authorization: Bearer {bearer_token}",
-                "--form", f"file=@{file_path}",
-                "--fail",
-                "--show-error"
-            ]
+            sanitized_path, temp_file = sanitize_file_for_upload(file_path)
+            
+            try:
+                cmd = [
+                    "curl",
+                    "--location", upload_url,
+                    "--header", f"Authorization: Bearer {bearer_token}",
+                    "--form", f"file=@{sanitized_path}",
+                    "--fail",
+                    "--show-error"
+                ]
 
-            result = subprocess.run(cmd, capture_output=True, check=True)
-            response = json.loads(result.stdout.decode())
+                result = subprocess.run(cmd, capture_output=True, check=True)
+                response = json.loads(result.stdout.decode())
 
-            relative_url = response.get("cdnUrl")
-            if not relative_url:
-                raise RuntimeError(f"cdnUrl missing in response: {response}")
+                relative_url = response.get("cdnUrl")
+                if not relative_url:
+                    raise RuntimeError(f"cdnUrl missing in response: {response}")
 
-            full_url = f"{args.get_cdn}{relative_url}"
+                full_url = f"{args.get_cdn}{relative_url}"
 
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            with open(output_path, "w") as f:
-                f.write(full_url)
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                with open(output_path, "w") as f:
+                    f.write(full_url)
 
-            return full_url
+                return full_url
+            
+            finally:
+                if temp_file and os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
 
         cdn_map = {}
         cdn_map["train_x_cdn"] = upload(ensure_csv(args.train_x), args.train_x_cdn_url)
