@@ -27,7 +27,7 @@ outputs:
 
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: gurpreetgandhi/nesy-factory:vtest4
     command:
       - python3
       - -u
