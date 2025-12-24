@@ -1,7 +1,7 @@
 name: Upload to CDN v4
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
-  - {name: train_x, type: Dataset, """Sanitize filename by encoding special characters"""description: "Training features dataset (CSV or Parquet)"}
+  - {name: train_x, type: Dataset,description: "Training features dataset (CSV or Parquet)"}
   - {name: train_y, type: Dataset, description: "Training labels dataset (CSV or Parquet)"}
   - {name: preprocesser_pickle, type: Data, description: "Preprocessor pickle file"}
   - {name: preprocesser_metadata, type: Data, description: "Preprocessor metadata JSON"}
