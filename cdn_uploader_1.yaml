@@ -1,4 +1,4 @@
-name: Upload to CDN v4
+name: Upload to CDN v5
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
   - {name: train_x, type: Dataset,description: "Training features dataset (CSV or Parquet)"}
@@ -150,20 +150,21 @@ implementation:
                     "--fail",
                     "--show-error"
                 ]
-
+        
                 result = subprocess.run(cmd, capture_output=True, check=True)
                 response = json.loads(result.stdout.decode())
-
+        
                 relative_url = response.get("cdnUrl")
                 if not relative_url:
                     raise RuntimeError(f"cdnUrl missing in response: {response}")
-
+        
+                relative_url = encode_special_chars(relative_url)
                 full_url = f"{args.get_cdn}{relative_url}"
-
+        
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 with open(output_path, "w") as f:
                     f.write(full_url)
-
+        
                 return full_url
             
             finally:
