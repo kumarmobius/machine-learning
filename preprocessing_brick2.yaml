@@ -19,7 +19,7 @@ outputs:
   - {name: engineering_metadata, type: Data, description: "JSON metadata"}
 implementation:
   container:
-    image: gurpreetgandhi/nesy-factory:vtests3
+    image:  gurpreetgandhi/nesy-factory:vtest4
     command:
       - python3
       - -u
