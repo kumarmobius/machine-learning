@@ -12,7 +12,7 @@ outputs:
   - {name: cleaning_metadata, type: Data, description: "JSON metadata with cleaning stats"}
 implementation:
   container:
-    image: kumar2004/mobius:1.0
+    image: gurpreetgandhi/nesy-factory:vtests3
     command:
       - python3
       - -u
