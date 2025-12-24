@@ -12,7 +12,7 @@ inputs:
 
 implementation:
   container:
-    image: python:3.9-slim
+    image: gurpreetgandhi/nesy-factory:vtests3
     command:
       - sh
       - -c
