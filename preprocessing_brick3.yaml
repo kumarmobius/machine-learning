@@ -14,7 +14,7 @@ outputs:
   - {name: preprocess_metadata, type: Data, description: "Combined metadata JSON"}
 implementation:
   container:
-    image: gurpreetgandhi/nesy-factory:vtests3
+    image:  gurpreetgandhi/nesy-factory:vtest4
     command:
       - python3
       - -u
