@@ -1,4 +1,4 @@
-name: ML Pipeline Trigger 5
+name: Stacking and Voting Pipeline Trigger
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
