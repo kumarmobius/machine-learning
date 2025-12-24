@@ -66,6 +66,16 @@ implementation:
                     pass
                 raise
 
+        def encode_special_chars(text):
+            text = text.replace("$", "%24")
+            text = text.replace("(", "%28")
+            text = text.replace(")", "%29")
+            text = text.replace("[", "%5B")
+            text = text.replace("]", "%5D")
+            text = text.replace("{", "%7B")
+            text = text.replace("}", "%7D")
+            return text
+
         # Read bearer token from provided path
         with open(args.bearer_token, 'r', encoding='utf-8') as f:
             bearer_token = f.read().strip()
@@ -109,9 +119,20 @@ implementation:
             if not os.path.exists(input_path):
                 raise FileNotFoundError(f"Path not found: {input_path}")
             if os.path.isfile(input_path):
+                # Sanitize filename before uploading
+                original_name = os.path.basename(input_path)
+                sanitized_name = encode_special_chars(original_name)
+                if sanitized_name != original_name:
+                    # Create a copy with sanitized name
+                    temp_dir = "/tmp"
+                    sanitized_path = os.path.join(temp_dir, sanitized_name)
+                    shutil.copy2(input_path, sanitized_path)
+                    return sanitized_path, sanitized_path
                 return input_path, None
-            # it's a directory -> zip
-            tmpzip = os.path.join("/tmp", f"artifact_{uuid.uuid4().hex}.zip")
+            # it's a directory -> zip with sanitized name
+            original_name = os.path.basename(input_path.rstrip('/'))
+            sanitized_name = encode_special_chars(original_name)
+            tmpzip = os.path.join("/tmp", f"{sanitized_name}_{uuid.uuid4().hex}.zip")
             shutil.make_archive(tmpzip.replace(".zip", ""), 'zip', root_dir=input_path)
             return tmpzip, tmpzip  # second value is the temp file to clean up
 
@@ -183,8 +204,9 @@ implementation:
                 print("[INFO] No pca provided or path missing; writing null output")
                 atomic_write_json(args.pca_cdn, {"pca_cdn": None})
 
-            # Prepare and upload config_string as a JSON/text file
-            cfg_tmp = os.path.join("/tmp", f"config_{uuid.uuid4().hex}.json")
+            # Prepare and upload config_string as a JSON/text file with sanitized name
+            sanitized_config_name = encode_special_chars(f"config_{uuid.uuid4().hex}.json")
+            cfg_tmp = os.path.join("/tmp", sanitized_config_name)
             try:
                 with open(cfg_tmp, "w", encoding="utf-8") as f:
                     f.write(args.config_string)
