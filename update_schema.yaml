@@ -12,7 +12,7 @@ inputs:
 
 implementation:
   container:
-    image: gurpreetgandhi/nesy-factory:vtests3
+    image:  gurpreetgandhi/nesy-factory:vtest4
     command:
       - sh
       - -c
