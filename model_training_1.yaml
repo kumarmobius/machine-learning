@@ -16,7 +16,7 @@ outputs:
 
 implementation:
   container:
-    image: kumar2004/mobius:1.0
+    image: gurpreetgandhi/nesy-factory:vtests3
     command:
       - python3
       - -u
