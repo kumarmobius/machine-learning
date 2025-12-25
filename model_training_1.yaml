@@ -1,4 +1,4 @@
-name: Stacking and Voting V8
+name: Stacking and Voting V9 Enhanced
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -9,6 +9,58 @@ inputs:
   - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking (e.g. 'lightgbm' or 'logistic'). If absent, prefer LightGBM/XGBoost when available, else fallback.", optional: true, default: ""}
   - {name: stacking_cv, type: Integer, default: "5"}
   - {name: random_state, type: Integer, optional: true, default: "50"}
+  
+  # Tree-based hyperparameters
+  - {name: n_estimators, type: Integer, optional: true, default: "500"}
+  - {name: n_estimators_boost, type: Integer, optional: true, default: "300"}
+  - {name: max_depth_tree, type: Integer, optional: true, default: "12"}
+  - {name: max_depth_boost, type: Integer, optional: true, default: "8"}
+  - {name: min_samples_leaf, type: Integer, optional: true, default: "2"}
+  - {name: min_samples_split, type: Integer, optional: true, default: "5"}
+  - {name: max_features, type: String, optional: true, default: "sqrt"}
+  - {name: learning_rate, type: Float, optional: true, default: "0.1"}
+  
+  # KNN hyperparameters
+  - {name: knn_k, type: Integer, optional: true, default: "9"}
+  - {name: knn_weights, type: String, optional: true, default: "distance"}
+  
+  # SVM hyperparameters
+  - {name: svm_C, type: Float, optional: true, default: "10.0"}
+  - {name: svm_gamma, type: String, optional: true, default: "scale"}
+  - {name: svm_kernel, type: String, optional: true, default: "rbf"}
+  - {name: svm_max_iter, type: Integer, optional: true, default: "50000"}
+  - {name: nu_default, type: Float, optional: true, default: "0.6"}
+  
+  # Linear model hyperparameters
+  - {name: ridge_alpha, type: Float, optional: true, default: "1.0"}
+  - {name: lasso_alpha, type: Float, optional: true, default: "0.1"}
+  - {name: elasticnet_alpha, type: Float, optional: true, default: "0.1"}
+  - {name: elasticnet_l1_ratio, type: Float, optional: true, default: "0.5"}
+  
+  # Neural network hyperparameters
+  - {name: mlp_hidden_layers, type: String, optional: true, default: "512,256,128"}
+  - {name: mlp_activation, type: String, optional: true, default: "relu"}
+  - {name: mlp_alpha, type: Float, optional: true, default: "0.0001"}
+  - {name: mlp_max_iter, type: Integer, optional: true, default: "1000"}
+  
+  # SGD hyperparameters
+  - {name: sgd_max_iter, type: Integer, optional: true, default: "5000"}
+  - {name: sgd_alpha, type: Float, optional: true, default: "0.0001"}
+  
+  # Boosting library hyperparameters
+  - {name: lgbm_n_estimators, type: Integer, optional: true, default: "300"}
+  - {name: lgbm_learning_rate, type: Float, optional: true, default: "0.05"}
+  - {name: lgbm_max_depth, type: Integer, optional: true, default: "10"}
+  - {name: lgbm_num_leaves, type: Integer, optional: true, default: "63"}
+  
+  - {name: xgb_n_estimators, type: Integer, optional: true, default: "300"}
+  - {name: xgb_learning_rate, type: Float, optional: true, default: "0.05"}
+  - {name: xgb_max_depth, type: Integer, optional: true, default: "10"}
+  
+  - {name: cat_n_estimators, type: Integer, optional: true, default: "300"}
+  - {name: cat_learning_rate, type: Float, optional: true, default: "0.05"}
+  - {name: cat_depth, type: Integer, optional: true, default: "10"}
+
 outputs:
   - {name: model_pickle, type: Model }
   - {name: metrics_json, type: Data }
@@ -78,6 +130,25 @@ implementation:
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
       
+        def get_model_params(model):
+            try:
+                if hasattr(model, 'get_params'):
+                    params = model.get_params(deep=False)
+                    # Convert non-serializable objects to strings
+                    serializable_params = {}
+                    for k, v in params.items():
+                        if isinstance(v, (int, float, str, bool, type(None))):
+                            serializable_params[k] = v
+                        elif isinstance(v, (list, tuple)):
+                            serializable_params[k] = str(v)
+                        else:
+                            serializable_params[k] = str(type(v).__name__)
+                    return serializable_params
+                return {}
+            except Exception as e:
+                print(f"[WARN] Could not extract params: {e}")
+                return {}
+      
         ap = argparse.ArgumentParser()
         ap.add_argument('--X_data', required=True)
         ap.add_argument('--y_data', required=True)
@@ -88,6 +159,58 @@ implementation:
         ap.add_argument('--meta_model_name', default="")
         ap.add_argument('--stacking_cv', type=int, default=5)
         ap.add_argument('--random_state', type=int, default=42)
+        
+        # Tree-based hyperparameters
+        ap.add_argument('--n_estimators', type=int, default=500)
+        ap.add_argument('--n_estimators_boost', type=int, default=300)
+        ap.add_argument('--max_depth_tree', type=int, default=12)
+        ap.add_argument('--max_depth_boost', type=int, default=8)
+        ap.add_argument('--min_samples_leaf', type=int, default=2)
+        ap.add_argument('--min_samples_split', type=int, default=5)
+        ap.add_argument('--max_features', default="sqrt")
+        ap.add_argument('--learning_rate', type=float, default=0.1)
+        
+        # KNN hyperparameters
+        ap.add_argument('--knn_k', type=int, default=9)
+        ap.add_argument('--knn_weights', default="distance")
+        
+        # SVM hyperparameters
+        ap.add_argument('--svm_C', type=float, default=10.0)
+        ap.add_argument('--svm_gamma', default="scale")
+        ap.add_argument('--svm_kernel', default="rbf")
+        ap.add_argument('--svm_max_iter', type=int, default=50000)
+        ap.add_argument('--nu_default', type=float, default=0.6)
+        
+        # Linear model hyperparameters
+        ap.add_argument('--ridge_alpha', type=float, default=1.0)
+        ap.add_argument('--lasso_alpha', type=float, default=0.1)
+        ap.add_argument('--elasticnet_alpha', type=float, default=0.1)
+        ap.add_argument('--elasticnet_l1_ratio', type=float, default=0.5)
+        
+        # Neural network hyperparameters
+        ap.add_argument('--mlp_hidden_layers', default="512,256,128")
+        ap.add_argument('--mlp_activation', default="relu")
+        ap.add_argument('--mlp_alpha', type=float, default=0.0001)
+        ap.add_argument('--mlp_max_iter', type=int, default=1000)
+        
+        # SGD hyperparameters
+        ap.add_argument('--sgd_max_iter', type=int, default=5000)
+        ap.add_argument('--sgd_alpha', type=float, default=0.0001)
+        
+        # Boosting library hyperparameters
+        ap.add_argument('--lgbm_n_estimators', type=int, default=300)
+        ap.add_argument('--lgbm_learning_rate', type=float, default=0.05)
+        ap.add_argument('--lgbm_max_depth', type=int, default=10)
+        ap.add_argument('--lgbm_num_leaves', type=int, default=63)
+        
+        ap.add_argument('--xgb_n_estimators', type=int, default=300)
+        ap.add_argument('--xgb_learning_rate', type=float, default=0.05)
+        ap.add_argument('--xgb_max_depth', type=int, default=10)
+        
+        ap.add_argument('--cat_n_estimators', type=int, default=300)
+        ap.add_argument('--cat_learning_rate', type=float, default=0.05)
+        ap.add_argument('--cat_depth', type=int, default=10)
+        
         ap.add_argument('--model_pickle', required=True)
         ap.add_argument('--metrics_json', required=True)
         ap.add_argument('--model_config', required=True)
@@ -97,62 +220,65 @@ implementation:
             random.seed(int(args.random_state))
             np.random.seed(int(args.random_state))
       
-            # Enhanced hyperparameters
+            # Parse MLP hidden layers
+            mlp_hidden_layers = tuple(int(x.strip()) for x in args.mlp_hidden_layers.split(',') if x.strip())
+      
+            # Build hyperparameters dictionary from args
             STATIC = {
                 # Tree-based
-                "n_estimators": 500,
-                "n_estimators_boost": 300,
-                "min_samples_leaf": 2,
-                "min_samples_split": 5,
-                "max_depth_tree": 12,
-                "max_depth_boost": 8,
-                "max_features": "sqrt",
-                "learning_rate": 0.1,
+                "n_estimators": args.n_estimators,
+                "n_estimators_boost": args.n_estimators_boost,
+                "min_samples_leaf": args.min_samples_leaf,
+                "min_samples_split": args.min_samples_split,
+                "max_depth_tree": args.max_depth_tree,
+                "max_depth_boost": args.max_depth_boost,
+                "max_features": args.max_features,
+                "learning_rate": args.learning_rate,
                 
                 # KNN
-                "knn_k": 9,
-                "knn_weights": "distance",
+                "knn_k": args.knn_k,
+                "knn_weights": args.knn_weights,
                 "knn_algorithm": "auto",
                 
                 # SVM
-                "svm_C": 10.0,
-                "svm_gamma": "scale",
-                "svm_kernel": "rbf",
-                "svm_max_iter": 50000,
-                "nu_default": 0.6,
+                "svm_C": args.svm_C,
+                "svm_gamma": args.svm_gamma,
+                "svm_kernel": args.svm_kernel,
+                "svm_max_iter": args.svm_max_iter,
+                "nu_default": args.nu_default,
                 
                 # Linear models
-                "ridge_alpha": 1.0,
-                "lasso_alpha": 0.1,
-                "elasticnet_alpha": 0.1,
-                "elasticnet_l1_ratio": 0.5,
+                "ridge_alpha": args.ridge_alpha,
+                "lasso_alpha": args.lasso_alpha,
+                "elasticnet_alpha": args.elasticnet_alpha,
+                "elasticnet_l1_ratio": args.elasticnet_l1_ratio,
                 
                 # Neural networks
-                "mlp_hidden_layer_sizes": (512, 256, 128),
-                "mlp_activation": "relu",
-                "mlp_alpha": 0.0001,
+                "mlp_hidden_layer_sizes": mlp_hidden_layers,
+                "mlp_activation": args.mlp_activation,
+                "mlp_alpha": args.mlp_alpha,
                 "mlp_learning_rate": "adaptive",
-                "mlp_max_iter": 1000,
+                "mlp_max_iter": args.mlp_max_iter,
                 
                 # SGD
-                "sgd_max_iter": 5000,
+                "sgd_max_iter": args.sgd_max_iter,
                 "sgd_tol": 1e-4,
                 "sgd_learning_rate": "optimal",
-                "sgd_alpha": 0.0001,
+                "sgd_alpha": args.sgd_alpha,
                 
                 # Boosting libraries
-                "meta_lgbm_n_estimators": 300,
-                "meta_lgbm_learning_rate": 0.05,
-                "meta_lgbm_max_depth": 10,
-                "meta_lgbm_num_leaves": 63,
+                "meta_lgbm_n_estimators": args.lgbm_n_estimators,
+                "meta_lgbm_learning_rate": args.lgbm_learning_rate,
+                "meta_lgbm_max_depth": args.lgbm_max_depth,
+                "meta_lgbm_num_leaves": args.lgbm_num_leaves,
                 
-                "meta_xgb_n_estimators": 300,
-                "meta_xgb_learning_rate": 0.05,
-                "meta_xgb_max_depth": 10,
+                "meta_xgb_n_estimators": args.xgb_n_estimators,
+                "meta_xgb_learning_rate": args.xgb_learning_rate,
+                "meta_xgb_max_depth": args.xgb_max_depth,
                 
-                "meta_cat_n_estimators": 300,
-                "meta_cat_learning_rate": 0.05,
-                "meta_cat_depth": 10,
+                "meta_cat_n_estimators": args.cat_n_estimators,
+                "meta_cat_learning_rate": args.cat_learning_rate,
+                "meta_cat_depth": args.cat_depth,
                 
                 # Ensemble settings
                 "STACKING_CV": int(args.stacking_cv or 5),
@@ -317,7 +443,7 @@ implementation:
                         return LinearSVC(
                             C=STATIC["svm_C"],
                             max_iter=STATIC["svm_max_iter"],
-                            dual=False,
+                            dual='auto',  # Fixed: use 'auto' instead of False
                             tol=1e-4,
                             random_state=rs
                         )
@@ -475,10 +601,12 @@ implementation:
                             max_iter=STATIC["svm_max_iter"]
                         )
                     if n == "linearsvr":
+                        # Fixed: use squared_epsilon_insensitive loss or dual='auto'
                         return LinearSVR(
                             C=STATIC["svm_C"],
                             max_iter=STATIC["svm_max_iter"],
-                            dual=False,
+                            dual='auto',  # Fixed: use 'auto' instead of False
+                            loss='squared_epsilon_insensitive',  # Fixed: compatible loss function
                             tol=1e-4,
                             random_state=rs
                         )
@@ -623,6 +751,7 @@ implementation:
                 trained_estimators = []
                 trained_base_info = []
                 model_to_train = None
+                model_params = {}  # Store actual model parameters
       
                 if ensemble_type not in ("stacking","voting"):
                     if selected_model_names:
@@ -647,6 +776,7 @@ implementation:
                         model_inst.fit(X, y_series)
                     trained_object = model_inst
                     trained_base_info = [model_to_train]
+                    model_params[model_to_train] = get_model_params(model_inst)
                 else:
                     if not selected_model_names:
                         raise ValueError("Ensemble requested but no base models selected.")
@@ -691,6 +821,7 @@ implementation:
                                     warnings.simplefilter("ignore")
                                     est.fit(X, y_series)
                                 safe_estimators.append((name, est))
+                                model_params[name] = get_model_params(est)
                             except Exception as e:
                                 print(f"[WARN] Trial-fit failed for {name}: {e}. Skipping this estimator.")
                         else:
@@ -706,6 +837,7 @@ implementation:
                             est0.fit(X, y_series)
                         trained_estimators = [(name0, est0)]
                         trained_object = est0
+                        model_params[name0] = get_model_params(est0)
                     else:
                         if ensemble_type == "voting":
                             try:
@@ -722,6 +854,8 @@ implementation:
                                             vote.fit(X, y_series)
                                     trained_object = vote
                                     trained_base_info = [nm for nm,_ in safe_estimators]
+                                    for nm, est in safe_estimators:
+                                        model_params[nm] = get_model_params(est)
                                 else:
                                     vote = VotingRegressor(estimators=safe_estimators, n_jobs=-1)
                                     with warnings.catch_warnings():
@@ -729,6 +863,8 @@ implementation:
                                         vote.fit(X, y_series)
                                     trained_object = vote
                                     trained_base_info = [nm for nm,_ in safe_estimators]
+                                    for nm, est in safe_estimators:
+                                        model_params[nm] = get_model_params(est)
                             except Exception as e:
                                 print(f"[WARN] Voting ensemble failed: {e}. Training base estimators individually as fallback.")
                                 trained_estimators = []
@@ -738,6 +874,7 @@ implementation:
                                             warnings.simplefilter("ignore")
                                             est.fit(X, y_series)
                                         trained_estimators.append((nm, est))
+                                        model_params[nm] = get_model_params(est)
                                     except Exception as e2:
                                         print(f"[WARN] Base estimator {nm} failed in fallback fit: {e2}")
                                 trained_object = None
@@ -753,6 +890,10 @@ implementation:
                                     stack.fit(X, y_series)
                                 trained_object = stack
                                 trained_base_info = [nm for nm,_ in safe_estimators]
+                                # Extract params from base and meta estimators
+                                for nm, est in safe_estimators:
+                                    model_params[nm] = get_model_params(est)
+                                model_params['meta_estimator'] = get_model_params(final_est)
                             except Exception as e:
                                 print(f"[WARN] Initial stacking.fit failed: {e}. Attempting to identify and remove failing base estimators and retry once.")
                                 surviving = []
@@ -763,6 +904,7 @@ implementation:
                                             warnings.simplefilter("ignore")
                                             est.fit(X, y_series)
                                         surviving.append((nm, est))
+                                        model_params[nm] = get_model_params(est)
                                     except Exception as e2:
                                         print(f"[WARN] Estimator {nm} failed trial-fit: {e2}. Removing it from ensemble.")
                                 if len(surviving) >= 2:
@@ -776,6 +918,7 @@ implementation:
                                             stack2.fit(X, y_series)
                                         trained_object = stack2
                                         trained_base_info = [nm for nm,_ in surviving]
+                                        model_params['meta_estimator'] = get_model_params(final_est)
                                     except Exception as e3:
                                         print(f"[WARN] Retry stacking.fit also failed: {e3}. Falling back to training base estimators individually.")
                                         trained_estimators = []
@@ -849,28 +992,31 @@ implementation:
                 else:
                     raise ValueError("No trained model or estimators to save for target " + str(target_name))
       
-                return save_obj, metrics, trained_base_info
+                return save_obj, metrics, trained_base_info, model_params
       
             # Main multi/single target driver
             multi_output = (y_df.shape[1] > 1)
             models_saved = {}
             metrics_out = {}
             base_info_map = {}
+            all_model_params = {}  # Store all model parameters
       
             if not multi_output:
                 # single-target: use existing logic by calling train_single_target once
                 col = y_df.columns[0]
-                save_obj, met, info = train_single_target(X, y_df.iloc[:,0], col)
+                save_obj, met, info, params = train_single_target(X, y_df.iloc[:,0], col)
                 models_saved[col] = save_obj
                 metrics_out[col] = met
                 base_info_map[col] = info
+                all_model_params[col] = params
             else:
                 print(f"[INFO] Detected multi-target (n_targets={y_df.shape[1]}). Training one model per target independently.")
                 for col in y_df.columns:
-                    save_obj, met, info = train_single_target(X, y_df[col], col)
+                    save_obj, met, info, params = train_single_target(X, y_df[col], col)
                     models_saved[col] = save_obj
                     metrics_out[col] = met
                     base_info_map[col] = info
+                    all_model_params[col] = params
       
             # Save the models (one dict for all targets)
             ensure_dir_for(args.model_pickle)
@@ -899,11 +1045,12 @@ implementation:
                 "ensemble_type": ensemble_type,
                 "models_selected": selected_model_names,
                 "meta_model_name": meta_name or ("lightgbm" if (LGBMClassifier or LGBMRegressor) else ("xgboost" if (XGBClassifier or XGBRegressor) else "fallback")),
-                "static_defaults": STATIC,
+                "hyperparameters_configured": STATIC,
                 "stacking_cv": stacking_cv,
                 "random_state": int(args.random_state),
                 "multi_output": multi_output,
-                "targets": list(y_df.columns)
+                "targets": list(y_df.columns),
+                "model_parameters": all_model_params  # Add actual model parameters
             }
             ensure_dir_for(args.model_config)
             with open(args.model_config, "w", encoding="utf-8") as fh:
@@ -937,6 +1084,76 @@ implementation:
       - {inputValue: stacking_cv}
       - --random_state
       - {inputValue: random_state}
+      - --n_estimators
+      - {inputValue: n_estimators}
+      - --n_estimators_boost
+      - {inputValue: n_estimators_boost}
+      - --max_depth_tree
+      - {inputValue: max_depth_tree}
+      - --max_depth_boost
+      - {inputValue: max_depth_boost}
+      - --min_samples_leaf
+      - {inputValue: min_samples_leaf}
+      - --min_samples_split
+      - {inputValue: min_samples_split}
+      - --max_features
+      - {inputValue: max_features}
+      - --learning_rate
+      - {inputValue: learning_rate}
+      - --knn_k
+      - {inputValue: knn_k}
+      - --knn_weights
+      - {inputValue: knn_weights}
+      - --svm_C
+      - {inputValue: svm_C}
+      - --svm_gamma
+      - {inputValue: svm_gamma}
+      - --svm_kernel
+      - {inputValue: svm_kernel}
+      - --svm_max_iter
+      - {inputValue: svm_max_iter}
+      - --nu_default
+      - {inputValue: nu_default}
+      - --ridge_alpha
+      - {inputValue: ridge_alpha}
+      - --lasso_alpha
+      - {inputValue: lasso_alpha}
+      - --elasticnet_alpha
+      - {inputValue: elasticnet_alpha}
+      - --elasticnet_l1_ratio
+      - {inputValue: elasticnet_l1_ratio}
+      - --mlp_hidden_layers
+      - {inputValue: mlp_hidden_layers}
+      - --mlp_activation
+      - {inputValue: mlp_activation}
+      - --mlp_alpha
+      - {inputValue: mlp_alpha}
+      - --mlp_max_iter
+      - {inputValue: mlp_max_iter}
+      - --sgd_max_iter
+      - {inputValue: sgd_max_iter}
+      - --sgd_alpha
+      - {inputValue: sgd_alpha}
+      - --lgbm_n_estimators
+      - {inputValue: lgbm_n_estimators}
+      - --lgbm_learning_rate
+      - {inputValue: lgbm_learning_rate}
+      - --lgbm_max_depth
+      - {inputValue: lgbm_max_depth}
+      - --lgbm_num_leaves
+      - {inputValue: lgbm_num_leaves}
+      - --xgb_n_estimators
+      - {inputValue: xgb_n_estimators}
+      - --xgb_learning_rate
+      - {inputValue: xgb_learning_rate}
+      - --xgb_max_depth
+      - {inputValue: xgb_max_depth}
+      - --cat_n_estimators
+      - {inputValue: cat_n_estimators}
+      - --cat_learning_rate
+      - {inputValue: cat_learning_rate}
+      - --cat_depth
+      - {inputValue: cat_depth}
       - --model_pickle
       - {outputPath: model_pickle}
       - --metrics_json
