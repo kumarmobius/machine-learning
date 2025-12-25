@@ -130,7 +130,7 @@ implementation:
 
             out = {
                 "name": args.name,
-                "model_cdn": model_url,
+                "model_weights_cdn": model_url,
                 "model_metadata_cdn": meta_url
             }
 
