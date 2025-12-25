@@ -146,7 +146,7 @@ implementation:
             logger.info("TARGET VARIABLE DISTRIBUTION (FULL DATASET)")
             try:
                 value_counts = y.value_counts(dropna=False)
-                logger.info(f"Value counts:\n{value_counts.to_string()}")
+                logger.info(f"Value counts:{value_counts.to_string()}")
             except Exception as e:
                 logger.warning(f"Could not print value_counts: {e}")
             
@@ -157,7 +157,7 @@ implementation:
             
             try:
                 dist_pct = y.value_counts(dropna=False, normalize=True) * 100
-                logger.info(f"Class distribution percentages:\n{dist_pct.to_string()}")
+                logger.info(f"Class distribution percentages:{dist_pct.to_string()}")
             except Exception as e:
                 logger.warning(f"Could not print distribution percentages: {e}")
 
