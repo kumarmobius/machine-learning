@@ -1,4 +1,4 @@
-name: model training
+name: Supervised Training
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
@@ -33,8 +33,9 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, traceback
-        import pandas as pd, numpy as np, joblib
+        import argparse, os, sys, json, traceback, logging, time
+        import pandas as pd, numpy as np
+        import cloudpickle
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
         from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
@@ -45,6 +46,14 @@ implementation:
         from sklearn.pipeline import Pipeline
         from sklearn.svm import SVC, LinearSVC, NuSVC, SVR, LinearSVR
 
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        logger = logging.getLogger(__name__)
+
         def ensure_dir_for(p):
             d = os.path.dirname(p)
             if d and not os.path.exists(d):
@@ -54,6 +63,7 @@ implementation:
             return str(s).strip().lower() in ("1","true","t","yes","y")
 
         def load_parquet_df(path):
+            logger.info(f"Loading parquet file: {path}")
             return pd.read_csv(path)
 
         def try_load_metadata(path):
@@ -62,12 +72,14 @@ implementation:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to load metadata as JSON from {path}: {e}")
             try:
+                import joblib
                 return joblib.load(path)
-            except Exception:
-                return None
+            except Exception as e:
+                logger.warning(f"Failed to load metadata with joblib from {path}: {e}")
+            return None
 
         ap = argparse.ArgumentParser()
         ap.add_argument('--X_data', type=str, required=True)
@@ -94,21 +106,23 @@ implementation:
         ap.add_argument('--model_config', type=str, required=True)
         args = ap.parse_args()
 
+        start_time = time.time()
+        
         try:
-            print("="*80)
-            print("TRAINING STARTED (models: knn | decisiontree | extratrees | svc | linearsvc | nusvc | svr | linearsvr)")
-            print("="*80)
+            logger.info("="*80)
+            logger.info("TRAINING STARTED")
+            logger.info(f"Models supported: knn | decisiontree | extratrees | svc | linearsvc | nusvc | svr | linearsvr")
+            logger.info("="*80)
 
             X = load_parquet_df(args.X_data)
-            print(f"[INFO] X shape: {X.shape}")
-            print("[INFO] X.head():")
-            print(X.head())
+            logger.info(f"X shape: {X.shape}")
+            logger.info(f"X columns: {list(X.columns)}")
 
             y_df = load_parquet_df(args.y_data)
             if isinstance(y_df, pd.DataFrame):
                 if y_df.shape[1] == 1 and not args.target_column:
                     y = y_df.iloc[:, 0].copy()
-                    print(f"[INFO] Auto-detected single column: {y_df.columns[0]}")
+                    logger.info(f"Auto-detected single column: {y_df.columns[0]}")
                 else:
                     col = args.target_column.strip()
                     if not col:
@@ -119,7 +133,7 @@ implementation:
 
             # align lengths/indices if mismatch
             if len(X) != len(y):
-                print(f"[WARN] Length mismatch: X={len(X)}, y={len(y)}")
+                logger.warning(f"Length mismatch: X={len(X)}, y={len(y)}")
                 common_idx = X.index.intersection(y.index)
                 if len(common_idx) > 0:
                     X = X.loc[common_idx].sort_index()
@@ -129,44 +143,72 @@ implementation:
                     X = X.reset_index(drop=True).iloc[:m, :].copy()
                     y = y.reset_index(drop=True).iloc[:m].copy()
 
-            print("===== TARGET VARIABLE DISTRIBUTION (FULL DATASET) =====")
+            logger.info("TARGET VARIABLE DISTRIBUTION (FULL DATASET)")
             try:
-                print(y.value_counts(dropna=False).to_string())
-            except Exception:
-                print("[INFO] Could not print value_counts (non-hashable types).")
+                value_counts = y.value_counts(dropna=False)
+                logger.info(f"Value counts:\n{value_counts.to_string()}")
+            except Exception as e:
+                logger.warning(f"Could not print value_counts: {e}")
+            
             try:
-                print("Unique classes:", int(y.nunique()))
+                logger.info(f"Unique classes: {int(y.nunique())}")
             except Exception:
-                print("Unique classes: unknown")
+                logger.info("Unique classes: unknown")
+            
             try:
-                print("Class distribution percentages:")
-                print((y.value_counts(dropna=False, normalize=True) * 100).to_string())
-            except Exception:
-                pass
+                dist_pct = y.value_counts(dropna=False, normalize=True) * 100
+                logger.info(f"Class distribution percentages:\n{dist_pct.to_string()}")
+            except Exception as e:
+                logger.warning(f"Could not print distribution percentages: {e}")
 
             task = args.model_type.strip().lower()
             metrics = {"task": task, "samples": int(len(y)), "features": int(X.shape[1])}
             model_name = args.model_name.strip().lower()
             model_obj = None
 
-            # prepare model config skeleton
+            # Prepare comprehensive model config with all training parameters
             model_config = {
                 "model_name": model_name,
                 "task": task,
-                "random_state": int(args.random_state),
-                "params": {}
+                "training_parameters": {
+                    "model_type": args.model_type,
+                    "enbalance": args.enbalance,
+                    "target_column": args.target_column,
+                    "model_name": args.model_name,
+                    "n_neighbors": args.n_neighbors,
+                    "dt_max_depth": args.dt_max_depth,
+                    "n_estimators": args.n_estimators,
+                    "min_samples_leaf": args.min_samples_leaf,
+                    "n_jobs": args.n_jobs,
+                    "use_scaler": args.use_scaler,
+                    "svm_kernel": args.svm_kernel,
+                    "svm_C": args.svm_C,
+                    "svm_gamma": args.svm_gamma,
+                    "svm_nu": args.svm_nu,
+                    "svm_probability": args.svm_probability,
+                    "random_state": args.random_state
+                },
+                "model_specific_params": {},
+                "data_info": {
+                    "samples": int(len(y)),
+                    "features": int(X.shape[1]),
+                    "target_shape": y.shape
+                },
+                "training_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
             # For classification: try integer encoded labels, otherwise use LabelEncoder fallback
             if task == "classification":
-                print("[INFO] Classification task detected")
+                logger.info("Classification task detected")
                 meta = try_load_metadata(args.preprocess_metadata)
                 label_mapping = meta.get("label_mapping") if meta else None
 
                 try:
                     y_prepared = pd.Series(y).astype(int)
                     map_info = {"mode": "already_encoded", "label_mapping_reference": label_mapping}
-                except Exception:
+                    logger.info("Target already encoded as integers")
+                except Exception as e:
+                    logger.info(f"Encoding target with LabelEncoder: {e}")
                     le = LabelEncoder()
                     y_prepared = pd.Series(le.fit_transform(y.astype(str)), index=y.index)
                     map_info = {"mode": "label_encoder_fallback", "classes": le.classes_.tolist()}
@@ -176,32 +218,62 @@ implementation:
                     dropped = int((~valid_mask).sum())
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_prepared = y_prepared[valid_mask].reset_index(drop=True)
-                    print(f"[WARN] Dropped {dropped} invalid rows")
+                    logger.warning(f"Dropped {dropped} invalid rows")
 
                 sample_weight = None
                 if bool_from_str(args.enbalance):
-                    print("[INFO] Computing sample weights for imbalance")
+                    logger.info("Computing sample weights for class imbalance handling")
                     try:
                         sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
                     except Exception as e:
-                        print(f"[WARN] Could not compute sample weights: {e}")
+                        logger.warning(f"Could not compute sample weights: {e}")
 
                 # Choose and configure model for classification
                 if model_name == "knn":
-                    print(f"[INFO] Training KNeighborsClassifier (n_neighbors={args.n_neighbors})")
+                    logger.info(f"Training KNeighborsClassifier (n_neighbors={args.n_neighbors})")
                     clf = KNeighborsClassifier(n_neighbors=int(args.n_neighbors), n_jobs=int(args.n_jobs))
-                    model_config["params"] = {"n_neighbors": int(args.n_neighbors)}
+                    model_config["model_specific_params"] = {
+                        "n_neighbors": int(args.n_neighbors),
+                        "n_jobs": int(args.n_jobs),
+                        "algorithm": "auto"
+                    }
 
                 elif model_name == "decisiontree":
                     max_depth = None if args.dt_max_depth.strip() in ("", "none", "null") else int(args.dt_max_depth)
-                    print(f"[INFO] Training DecisionTreeClassifier (max_depth={max_depth})")
-                    clf = DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced' if bool_from_str(args.enbalance) else None, random_state=args.random_state)
-                    model_config["params"] = {"max_depth": max_depth, "class_weight": 'balanced' if bool_from_str(args.enbalance) else None}
+                    logger.info(f"Training DecisionTreeClassifier (max_depth={max_depth})")
+                    class_weight = 'balanced' if bool_from_str(args.enbalance) else None
+                    clf = DecisionTreeClassifier(
+                        max_depth=max_depth, 
+                        class_weight=class_weight, 
+                        random_state=args.random_state,
+                        min_samples_leaf=int(args.min_samples_leaf)
+                    )
+                    model_config["model_specific_params"] = {
+                        "max_depth": max_depth,
+                        "class_weight": class_weight,
+                        "min_samples_leaf": int(args.min_samples_leaf),
+                        "criterion": "gini",
+                        "splitter": "best"
+                    }
 
                 elif model_name == "extratrees":
-                    print(f"[INFO] Training ExtraTreesClassifier (n_estimators={args.n_estimators}, min_samples_leaf={args.min_samples_leaf})")
-                    clf = ExtraTreesClassifier(n_estimators=int(args.n_estimators), min_samples_leaf=int(args.min_samples_leaf), n_jobs=int(args.n_jobs), random_state=args.random_state, class_weight='balanced' if bool_from_str(args.enbalance) else None)
-                    model_config["params"] = {"n_estimators": int(args.n_estimators), "min_samples_leaf": int(args.min_samples_leaf), "n_jobs": int(args.n_jobs), "class_weight": 'balanced' if bool_from_str(args.enbalance) else None}
+                    logger.info(f"Training ExtraTreesClassifier (n_estimators={args.n_estimators}, min_samples_leaf={args.min_samples_leaf})")
+                    class_weight = 'balanced' if bool_from_str(args.enbalance) else None
+                    clf = ExtraTreesClassifier(
+                        n_estimators=int(args.n_estimators), 
+                        min_samples_leaf=int(args.min_samples_leaf), 
+                        n_jobs=int(args.n_jobs), 
+                        random_state=args.random_state, 
+                        class_weight=class_weight
+                    )
+                    model_config["model_specific_params"] = {
+                        "n_estimators": int(args.n_estimators),
+                        "min_samples_leaf": int(args.min_samples_leaf),
+                        "n_jobs": int(args.n_jobs),
+                        "class_weight": class_weight,
+                        "criterion": "gini",
+                        "bootstrap": True
+                    }
 
                 elif model_name in ("svc", "nusvc", "linearsvc"):
                     svm_prob = bool_from_str(args.svm_probability)
@@ -209,22 +281,59 @@ implementation:
                     C = float(args.svm_C)
                     gamma = args.svm_gamma
                     nu = float(args.svm_nu)
-                    print(f"[INFO] Training SVM classifier ({model_name}) kernel={kernel} C={C} gamma={gamma} probability={svm_prob}")
+                    use_scaler = bool_from_str(args.use_scaler)
+                    class_weight = 'balanced' if bool_from_str(args.enbalance) else None
+                    
+                    logger.info(f"Training SVM classifier ({model_name}) kernel={kernel} C={C} gamma={gamma} probability={svm_prob} use_scaler={use_scaler}")
+                    
                     if model_name == "svc":
-                        base = SVC(kernel=kernel, C=C, gamma=(None if gamma in ("", "none") else (float(gamma) if gamma not in ("scale","auto") else gamma)), probability=svm_prob, class_weight='balanced' if bool_from_str(args.enbalance) else None, random_state=args.random_state)
+                        gamma_val = None if gamma in ("", "none") else (float(gamma) if gamma not in ("scale","auto") else gamma)
+                        base = SVC(
+                            kernel=kernel, 
+                            C=C, 
+                            gamma=gamma_val, 
+                            probability=svm_prob, 
+                            class_weight=class_weight, 
+                            random_state=args.random_state
+                        )
                     elif model_name == "nusvc":
-                        base = NuSVC(kernel=kernel, nu=nu, C=C, gamma=(None if gamma in ("", "none") else (float(gamma) if gamma not in ("scale","auto") else gamma)), probability=svm_prob, class_weight='balanced' if bool_from_str(args.enbalance) else None, random_state=args.random_state)
+                        gamma_val = None if gamma in ("", "none") else (float(gamma) if gamma not in ("scale","auto") else gamma)
+                        base = NuSVC(
+                            kernel=kernel, 
+                            nu=nu, 
+                            C=C, 
+                            gamma=gamma_val, 
+                            probability=svm_prob, 
+                            class_weight=class_weight, 
+                            random_state=args.random_state
+                        )
                     else:  # linearsvc
-                        base = LinearSVC(C=C, max_iter=10000, class_weight='balanced' if bool_from_str(args.enbalance) else None, random_state=args.random_state)
+                        base = LinearSVC(
+                            C=C, 
+                            max_iter=10000, 
+                            class_weight=class_weight, 
+                            random_state=args.random_state
+                        )
+                    
                     # scale if requested
-                    if bool_from_str(args.use_scaler):
+                    if use_scaler:
                         clf = Pipeline([('scaler', StandardScaler()), ('est', base)])
                     else:
                         clf = base
-                    model_config["params"] = {"svm_type": model_name, "kernel": kernel, "C": C, "gamma": gamma, "nu": nu, "probability": svm_prob, "use_scaler": bool_from_str(args.use_scaler)}
+                    
+                    model_config["model_specific_params"] = {
+                        "svm_type": model_name,
+                        "kernel": kernel,
+                        "C": C,
+                        "gamma": gamma,
+                        "nu": nu,
+                        "probability": svm_prob,
+                        "use_scaler": use_scaler,
+                        "class_weight": class_weight,
+                        "max_iter": 10000 if model_name == "linearsvc" else -1
+                    }
 
                 elif model_name in ("svr", "linearsvr"):
-                    # although regression, user asked for SVM family; keep classification branch safe - user should pass model_type=regression for svr
                     raise ValueError("For SVR/LinearSVR use model_type=regression. Set --model_type regression and model_name svr or linearsvr")
 
                 else:
@@ -232,26 +341,29 @@ implementation:
 
                 # cross-val attempt
                 try:
+                    logger.info("Performing 5-fold cross validation")
                     cv_scores = cross_val_score(clf, X, y_prepared, cv=5, scoring='accuracy', n_jobs=int(args.n_jobs))
                     metrics["cv_accuracy_mean"] = float(cv_scores.mean())
                     metrics["cv_accuracy_std"] = float(cv_scores.std())
-                    print(f"[INFO] CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                    logger.info(f"CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
                 except Exception as e:
-                    print(f"[WARN] CV failed: {e}")
+                    logger.warning(f"Cross-validation failed: {e}")
 
                 # fit with sample_weight when supported
                 try:
-                    # pipeline case: estimator is the last step
-                    if hasattr(clf, "fit"):
-                        # Try to pass sample_weight; many sklearn estimators accept it
-                        try:
-                            clf.fit(X, y_prepared, sample_weight=sample_weight)
-                        except TypeError:
-                            clf.fit(X, y_prepared)
-                    else:
+                    logger.info("Fitting model to training data")
+                    fit_start = time.time()
+                    
+                    # Try to pass sample_weight; many sklearn estimators accept it
+                    try:
+                        clf.fit(X, y_prepared, sample_weight=sample_weight)
+                    except TypeError:
                         clf.fit(X, y_prepared)
+                    
+                    fit_time = time.time() - fit_start
+                    logger.info(f"Model fitting completed in {fit_time:.2f} seconds")
                 except Exception as e:
-                    print(f"[ERROR] Fit failed: {e}")
+                    logger.error(f"Model fitting failed: {e}")
                     raise
 
                 y_pred = clf.predict(X)
@@ -262,68 +374,112 @@ implementation:
                     "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "model": model_name,
                     "balanced": bool_from_str(args.enbalance),
-                    "label_info": map_info
+                    "label_info": map_info,
+                    "training_time_seconds": fit_time
                 })
                 model_obj = clf
 
             elif task == "regression":
-                print("[INFO] Regression task detected")
+                logger.info("Regression task detected")
                 y_num = pd.to_numeric(y, errors="coerce")
                 valid_mask = y_num.notna()
                 if not valid_mask.all():
                     dropped = int((~valid_mask).sum())
-                    print(f"[WARN] Dropping {dropped} rows with non-numeric target")
+                    logger.warning(f"Dropping {dropped} rows with non-numeric target")
                     X = X.loc[valid_mask].reset_index(drop=True)
                     y_num = y_num[valid_mask].reset_index(drop=True)
 
                 if model_name == "knn":
-                    print(f"[INFO] Training KNeighborsRegressor (n_neighbors={args.n_neighbors})")
+                    logger.info(f"Training KNeighborsRegressor (n_neighbors={args.n_neighbors})")
                     reg = KNeighborsRegressor(n_neighbors=int(args.n_neighbors), n_jobs=int(args.n_jobs))
-                    model_config["params"] = {"n_neighbors": int(args.n_neighbors)}
+                    model_config["model_specific_params"] = {
+                        "n_neighbors": int(args.n_neighbors),
+                        "n_jobs": int(args.n_jobs),
+                        "algorithm": "auto",
+                        "weights": "uniform"
+                    }
 
                 elif model_name == "decisiontree":
                     max_depth = None if args.dt_max_depth.strip() in ("", "none", "null") else int(args.dt_max_depth)
-                    print(f"[INFO] Training DecisionTreeRegressor (max_depth={max_depth})")
-                    reg = DecisionTreeRegressor(max_depth=max_depth, random_state=args.random_state)
-                    model_config["params"] = {"max_depth": max_depth}
+                    logger.info(f"Training DecisionTreeRegressor (max_depth={max_depth})")
+                    reg = DecisionTreeRegressor(
+                        max_depth=max_depth, 
+                        random_state=args.random_state,
+                        min_samples_leaf=int(args.min_samples_leaf)
+                    )
+                    model_config["model_specific_params"] = {
+                        "max_depth": max_depth,
+                        "min_samples_leaf": int(args.min_samples_leaf),
+                        "criterion": "squared_error",
+                        "splitter": "best"
+                    }
 
                 elif model_name == "extratrees":
-                    print(f"[INFO] Training ExtraTreesRegressor (n_estimators={args.n_estimators}, min_samples_leaf={args.min_samples_leaf})")
-                    reg = ExtraTreesRegressor(n_estimators=int(args.n_estimators), min_samples_leaf=int(args.min_samples_leaf), n_jobs=int(args.n_jobs), random_state=args.random_state)
-                    model_config["params"] = {"n_estimators": int(args.n_estimators), "min_samples_leaf": int(args.min_samples_leaf), "n_jobs": int(args.n_jobs)}
+                    logger.info(f"Training ExtraTreesRegressor (n_estimators={args.n_estimators}, min_samples_leaf={args.min_samples_leaf})")
+                    reg = ExtraTreesRegressor(
+                        n_estimators=int(args.n_estimators), 
+                        min_samples_leaf=int(args.min_samples_leaf), 
+                        n_jobs=int(args.n_jobs), 
+                        random_state=args.random_state
+                    )
+                    model_config["model_specific_params"] = {
+                        "n_estimators": int(args.n_estimators),
+                        "min_samples_leaf": int(args.min_samples_leaf),
+                        "n_jobs": int(args.n_jobs),
+                        "criterion": "squared_error",
+                        "bootstrap": True
+                    }
 
                 elif model_name in ("svr", "linearsvr"):
                     kernel = args.svm_kernel
                     C = float(args.svm_C)
                     gamma = args.svm_gamma
-                    print(f"[INFO] Training SVM regressor ({model_name}) kernel={kernel} C={C} gamma={gamma}")
+                    use_scaler = bool_from_str(args.use_scaler)
+                    
+                    logger.info(f"Training SVM regressor ({model_name}) kernel={kernel} C={C} gamma={gamma} use_scaler={use_scaler}")
+                    
                     if model_name == "svr":
-                        base = SVR(kernel=kernel, C=C, gamma=(None if gamma in ("", "none") else (float(gamma) if gamma not in ("scale","auto") else gamma)))
+                        gamma_val = None if gamma in ("", "none") else (float(gamma) if gamma not in ("scale","auto") else gamma)
+                        base = SVR(kernel=kernel, C=C, gamma=gamma_val)
                     else:
-                        base = LinearSVR(C=C, max_iter=10000)
-                    if bool_from_str(args.use_scaler):
+                        base = LinearSVR(C=C, max_iter=10000, random_state=args.random_state)
+                    
+                    if use_scaler:
                         reg = Pipeline([('scaler', StandardScaler()), ('est', base)])
                     else:
                         reg = base
-                    model_config["params"] = {"svm_type": model_name, "kernel": kernel, "C": C, "gamma": gamma, "use_scaler": bool_from_str(args.use_scaler)}
+                    
+                    model_config["model_specific_params"] = {
+                        "svm_type": model_name,
+                        "kernel": kernel,
+                        "C": C,
+                        "gamma": gamma,
+                        "use_scaler": use_scaler,
+                        "max_iter": 10000
+                    }
 
                 else:
                     raise ValueError("Unsupported model_name for regression. Use 'knn', 'decisiontree', 'extratrees', 'svr', or 'linearsvr'.")
 
                 # cross-val attempt
                 try:
+                    logger.info("Performing 5-fold cross validation")
                     cv_scores = cross_val_score(reg, X, y_num, cv=5, scoring='r2', n_jobs=int(args.n_jobs))
                     metrics["cv_r2_mean"] = float(cv_scores.mean())
                     metrics["cv_r2_std"] = float(cv_scores.std())
-                    print(f"[INFO] CV R2: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+                    logger.info(f"CV R2: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
                 except Exception as e:
-                    print(f"[WARN] CV failed: {e}")
+                    logger.warning(f"Cross-validation failed: {e}")
 
                 # fit
                 try:
+                    logger.info("Fitting model to training data")
+                    fit_start = time.time()
                     reg.fit(X, y_num)
+                    fit_time = time.time() - fit_start
+                    logger.info(f"Model fitting completed in {fit_time:.2f} seconds")
                 except Exception as e:
-                    print(f"[ERROR] Fit failed: {e}")
+                    logger.error(f"Model fitting failed: {e}")
                     raise
 
                 y_pred = reg.predict(X)
@@ -331,40 +487,51 @@ implementation:
                     "r2_train": float(r2_score(y_num, y_pred)),
                     "rmse_train": float(np.sqrt(mean_squared_error(y_num, y_pred))),
                     "mae_train": float(mean_absolute_error(y_num, y_pred)),
-                    "model": model_name
+                    "model": model_name,
+                    "training_time_seconds": fit_time
                 })
                 model_obj = reg
 
             else:
                 raise ValueError(f"Unsupported model_type '{args.model_type}'")
 
-            # finalize model_config
+            # finalize model_config with additional info
             model_config["random_state"] = int(args.random_state)
             model_config["trained_samples"] = int(len(X))
             model_config["trained_features"] = int(X.shape[1])
+            model_config["feature_names"] = X.columns.tolist()
+            model_config["training_time_seconds"] = time.time() - start_time
 
-            # save model, metrics and config
+            # Save model using cloudpickle
+            logger.info(f"Saving model to {args.model_pickle}")
             ensure_dir_for(args.model_pickle)
-            joblib.dump(model_obj, args.model_pickle)
+            with open(args.model_pickle, 'wb') as f:
+                cloudpickle.dump(model_obj, f)
 
+            # Save metrics
+            logger.info(f"Saving metrics to {args.metrics_json}")
             ensure_dir_for(args.metrics_json)
             with open(args.metrics_json, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, indent=2, ensure_ascii=False)
 
+            # Save comprehensive model config
+            logger.info(f"Saving model configuration to {args.model_config}")
             ensure_dir_for(args.model_config)
             with open(args.model_config, "w", encoding="utf-8") as f:
                 json.dump(model_config, f, indent=2, ensure_ascii=False)
 
-            print("="*80)
-            print("SUCCESS: Training completed")
-            print(json.dumps(metrics, indent=2))
-            print("="*80)
+            total_time = time.time() - start_time
+            logger.info("="*80)
+            logger.info(f"SUCCESS: Training completed in {total_time:.2f} seconds")
+            logger.info(f"Model saved: {args.model_pickle}")
+            logger.info(f"Metrics saved: {args.metrics_json}")
+            logger.info(f"Config saved: {args.model_config}")
+            logger.info("="*80)
 
         except Exception as e:
-            print("="*80, file=sys.stderr)
-            print("ERROR DURING TRAINING", file=sys.stderr)
-            traceback.print_exc()
-            print("="*80, file=sys.stderr)
+            logger.error("ERROR DURING TRAINING")
+            logger.error(traceback.format_exc())
+            logger.error("="*80)
             sys.exit(1)
 
     args:
