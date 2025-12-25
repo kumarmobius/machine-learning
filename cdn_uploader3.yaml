@@ -1,14 +1,14 @@
-name: Model CDN uploader v3
+name: Model CDN uploader v4
 inputs:
   - {name: model_pickle, type: Model, description: "Saved model pickle/joblib file to upload"}
+  - {name: model_metadata_cdn, type: Data, description: "Model metadata file to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
   - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
   - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
-  - {name: name, type: String, description: "Friendly name to include in schema CDN JSON", optional: false}
+  - {name: name, type: String, description: "Friendly name to include in schema CDN JSON"}
 
 outputs:
-  - {name: schema_cdn_json, type: String, description: "JSON containing the model_pickle_cdn and name"}
-  - {name: config_cdn_url, type: String, description: "JSON containing config with model_weights_cdn"}
+  - {name: schema_cdn_json, type: String, description: "JSON containing model CDN URLs and name"}
 
 implementation:
   container:
@@ -28,15 +28,14 @@ implementation:
         import sys
         import traceback
 
-        parser = argparse.ArgumentParser(description="Upload model to CDN and emit config JSON.")
+        parser = argparse.ArgumentParser(description="Upload model + metadata to CDN.")
         parser.add_argument('--model_pickle', type=str, required=True)
+        parser.add_argument('--model_metadata_cdn', type=str, required=True)
         parser.add_argument('--bearer_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
         parser.add_argument('--get_cdn', type=str, required=True)
         parser.add_argument('--name', type=str, required=True)
-
         parser.add_argument('--schema_cdn_json', type=str, required=True)
-        parser.add_argument('--config_cdn_url', type=str, required=True)
         args = parser.parse_args()
 
         def ensure_parent_dir(path):
@@ -46,8 +45,7 @@ implementation:
 
         def atomic_write_json(path, data):
             ensure_parent_dir(path)
-            dirp = os.path.dirname(path) or tempfile.gettempdir()
-            fd, tmp = tempfile.mkstemp(prefix="tmp_json_", dir=dirp)
+            fd, tmp = tempfile.mkstemp(prefix="tmp_json_")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False)
@@ -60,16 +58,16 @@ implementation:
                 raise
 
         def encode_special_chars(text):
-            text = text.replace("$", "%24")
-            text = text.replace("(", "%28")
-            text = text.replace(")", "%29")
-            text = text.replace("[", "%5B")
-            text = text.replace("]", "%5D")
-            text = text.replace("{", "%7B")
-            text = text.replace("}", "%7D")
-            return text
+            return (
+                text.replace("$", "%24")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
+                    .replace("{", "%7B")
+                    .replace("}", "%7D")
+            )
 
-        # Read bearer token
         with open(args.bearer_token, "r", encoding="utf-8") as f:
             bearer_token = f.read().strip()
 
@@ -79,86 +77,83 @@ implementation:
             "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
         )
 
-        def run_curl_upload(file_path):
+        def run_upload(path):
             cmd = [
                 "curl",
                 "--location", upload_url,
                 "--header", f"Authorization: Bearer {bearer_token}",
-                "--form", f"file=@{file_path}",
+                "--form", f"file=@{path}",
                 "--fail",
                 "--show-error"
             ]
-            proc = subprocess.run(cmd, capture_output=True)
-            stdout = proc.stdout.decode("utf-8", errors="ignore")
-            stderr = proc.stderr.decode("utf-8", errors="ignore")
-            if proc.returncode != 0:
-                raise RuntimeError(f"curl failed:{stderr}{stdout}")
-            return json.loads(stdout)
+            p = subprocess.run(cmd, capture_output=True)
+            if p.returncode != 0:
+                raise RuntimeError(p.stderr.decode())
+            return json.loads(p.stdout.decode())
 
-        def prepare_path_for_upload(input_path):
-            if not os.path.exists(input_path):
-                raise FileNotFoundError(input_path)
-            if os.path.isfile(input_path):
-                # Sanitize filename before uploading
-                original_name = os.path.basename(input_path)
-                sanitized_name = encode_special_chars(original_name)
-                if sanitized_name != original_name:
-                    # Create a copy with sanitized name
-                    temp_dir = tempfile.gettempdir()
-                    sanitized_path = os.path.join(temp_dir, sanitized_name)
-                    shutil.copy2(input_path, sanitized_path)
-                    return sanitized_path, sanitized_path
-                return input_path, None
+        def prepare_file(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
 
-            # it's a directory -> zip with sanitized name
-            original_name = os.path.basename(input_path.rstrip('/'))
-            sanitized_name = encode_special_chars(original_name)
-            tmpzip = os.path.join(
+            if os.path.isfile(path):
+                name = os.path.basename(path)
+                safe = encode_special_chars(name)
+                if safe != name:
+                    tmp = os.path.join(tempfile.gettempdir(), safe)
+                    shutil.copy2(path, tmp)
+                    return tmp, tmp
+                return path, None
+
+            safe = encode_special_chars(os.path.basename(path))
+            zip_path = os.path.join(
                 tempfile.gettempdir(),
-                f"{sanitized_name}_{uuid.uuid4().hex}.zip"
+                f"{safe}_{uuid.uuid4().hex}.zip"
             )
-            shutil.make_archive(tmpzip.replace(".zip", ""), "zip", root_dir=input_path)
-            return tmpzip, tmpzip
+            shutil.make_archive(zip_path[:-4], "zip", path)
+            return zip_path, zip_path
 
-        try:
-            tmp = None
-
-            prepared, tmp = prepare_path_for_upload(args.model_pickle)
-            resp = run_curl_upload(prepared)
-
+        def upload_and_get_url(path):
+            prepared, tmp = prepare_file(path)
+            resp = run_upload(prepared)
             rel = resp.get("cdnUrl")
             if not rel:
-                raise ValueError("Missing cdnUrl in upload response")
+                raise ValueError("cdnUrl missing in response")
+            full = f"{args.get_cdn.rstrip('/')}{rel}"
+            return encode_special_chars(full), tmp
 
-            final_url = f"{args.get_cdn.rstrip('/')}{rel}"
+        tmp_files = []
 
-            # schema JSON contains both model_pickle_cdn and name (name is required)
-            schema_out = {
-                "model_url": final_url,
-                "name": args.name
+        try:
+            model_url, t1 = upload_and_get_url(args.model_pickle)
+            meta_url, t2 = upload_and_get_url(args.model_metadata_cdn)
+            tmp_files.extend(filter(None, [t1, t2]))
+
+            out = {
+                "name": args.name,
+                "model_cdn": model_url,
+                "model_metadata_cdn": meta_url
             }
-            atomic_write_json(args.schema_cdn_json, schema_out)
 
-            config_out = {"model_weights_cdn": final_url}
-            atomic_write_json(args.config_cdn_url, config_out)
+            atomic_write_json(args.schema_cdn_json, out)
 
             print("[INFO] Upload complete")
-            print("[CDN] Model:", final_url)
+            print("[CDN] Model:", model_url)
+            print("[CDN] Metadata:", meta_url)
 
-        except Exception as e:
-            print("ERROR:", str(e), file=sys.stderr)
+        except Exception:
             traceback.print_exc()
             raise
-
         finally:
-            if tmp and os.path.exists(tmp):
+            for f in tmp_files:
                 try:
-                    os.remove(tmp)
+                    os.remove(f)
                 except Exception:
                     pass
     args:
       - --model_pickle
       - {inputPath: model_pickle}
+      - --model_metadata_cdn
+      - {inputPath: model_metadata_cdn}
       - --bearer_token
       - {inputPath: bearer_token}
       - --domain
@@ -169,5 +164,3 @@ implementation:
       - {inputValue: name}
       - --schema_cdn_json
       - {outputPath: schema_cdn_json}
-      - --config_cdn_url
-      - {outputPath: config_cdn_url}
