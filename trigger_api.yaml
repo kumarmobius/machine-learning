@@ -5,6 +5,65 @@ inputs:
   - {name: pipeline_id, type: String, description: "Pipeline ID to trigger"}
   - {name: experiment_id, type: String, description: "Experiment ID"}
   - {name: model_type, type: String, optional: true, default: ""}
+  - {name: ensemble_type, type: String, description: "none | stacking | voting", optional: true, default: "stacking"}
+  - {name: n_ensemble_models, type: Integer, description: "If >1 and model_names not provided, randomly pick this many models from default pool", optional: true, default: "0"}
+  - {name: model_names, type: String, description: "Optional comma-separated list of model names to use verbatim (overrides n_ensemble_models)", optional: true, default: ""}
+  - {name: meta_model_name, type: String, description: "Optional meta-model name for stacking (e.g. 'lightgbm' or 'logistic'). If absent, prefer LightGBM/XGBoost when available, else fallback.", optional: true, default: ""}
+  - {name: stacking_cv, type: Integer, default: "4"}
+  - {name: random_state, type: Integer, optional: true, default: "50"}
+
+  # Tree-based hyperparameters
+  - {name: n_estimators, type: Integer, optional: true, default: "100"}
+  - {name: n_estimators_boost, type: Integer, optional: true, default: "100"}
+  - {name: max_depth_tree, type: Integer, optional: true, default: "6"}
+  - {name: max_depth_boost, type: Integer, optional: true, default: "5"}
+  - {name: min_samples_leaf, type: Integer, optional: true, default: "2"}
+  - {name: min_samples_split, type: Integer, optional: true, default: "5"}
+  - {name: max_features, type: String, optional: true, default: "sqrt"}
+  - {name: learning_rate, type: Float, optional: true, default: "0.1"}
+
+  # KNN hyperparameters
+  - {name: knn_k, type: Integer, optional: true, default: "9"}
+  - {name: knn_weights, type: String, optional: true, default: "distance"}
+
+  # SVM hyperparameters
+  - {name: svm_C, type: Float, optional: true, default: "10.0"}
+  - {name: svm_gamma, type: String, optional: true, default: "scale"}
+  - {name: svm_kernel, type: String, optional: true, default: "rbf"}
+  - {name: svm_max_iter, type: Integer, optional: true, default: "5000"}
+  - {name: nu_default, type: Float, optional: true, default: "0.6"}
+
+  # Linear model hyperparameters
+  - {name: ridge_alpha, type: Float, optional: true, default: "1.0"}
+  - {name: lasso_alpha, type: Float, optional: true, default: "0.1"}
+  - {name: elasticnet_alpha, type: Float, optional: true, default: "0.1"}
+  - {name: elasticnet_l1_ratio, type: Float, optional: true, default: "0.5"}
+
+  # Neural network hyperparameters
+  - {name: mlp_hidden_layers, type: String, optional: true, default: "128,64"}
+  - {name: mlp_activation, type: String, optional: true, default: "relu"}
+  - {name: mlp_alpha, type: Float, optional: true, default: "0.0001"}
+  - {name: mlp_max_iter, type: Integer, optional: true, default: "300"}
+
+  # SGD hyperparameters
+  - {name: sgd_max_iter, type: Integer, optional: true, default: "5000"}
+  - {name: sgd_alpha, type: Float, optional: true, default: "0.0001"}
+
+  # Boosting library hyperparameters
+  - {name: lgbm_n_estimators, type: Integer, optional: true, default: "100"}
+  - {name: lgbm_learning_rate, type: Float, optional: true, default: "0.1"}
+  - {name: lgbm_max_depth, type: Integer, optional: true, default: "10"}
+  - {name: lgbm_num_leaves, type: Integer, optional: true, default: "30"}
+
+  - {name: xgb_n_estimators, type: Integer, optional: true, default: "100"}
+  - {name: xgb_learning_rate, type: Float, optional: true, default: "0.05"}
+  - {name: xgb_max_depth, type: Integer, optional: true, default: "10"}
+
+  - {name: cat_n_estimators, type: Integer, optional: true, default: "100"}
+  - {name: cat_learning_rate, type: Float, optional: true, default: "0.05"}
+  - {name: cat_depth, type: Integer, optional: true, default: "10"}
+
+  # existing inputs (unchanged)
   - {name: target_column, type: String, optional: true, default: ""}
   - {name: preprocessor_metadata_cdn, type: String, optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, optional: true, default: ""}
@@ -39,7 +98,68 @@ implementation:
         parser.add_argument('--domain', required=True)
         parser.add_argument('--pipeline_id', required=True)
         parser.add_argument('--experiment_id', required=True)
+
+        # Ensemble control
         parser.add_argument('--model_type', default="")
+        parser.add_argument('--ensemble_type', default="stacking")
+        parser.add_argument('--n_ensemble_models', type=int, default=0)
+        parser.add_argument('--model_names', default="")
+        parser.add_argument('--meta_model_name', default="")
+        parser.add_argument('--stacking_cv', type=int, default=4)
+        parser.add_argument('--random_state', type=int, default=50)
+
+        # Tree-based
+        parser.add_argument('--n_estimators', type=int, default=100)
+        parser.add_argument('--n_estimators_boost', type=int, default=100)
+        parser.add_argument('--max_depth_tree', type=int, default=6)
+        parser.add_argument('--max_depth_boost', type=int, default=5)
+        parser.add_argument('--min_samples_leaf', type=int, default=2)
+        parser.add_argument('--min_samples_split', type=int, default=5)
+        parser.add_argument('--max_features', default="sqrt")
+        parser.add_argument('--learning_rate', type=float, default=0.1)
+
+        # KNN
+        parser.add_argument('--knn_k', type=int, default=9)
+        parser.add_argument('--knn_weights', default="distance")
+
+        # SVM
+        parser.add_argument('--svm_C', type=float, default=10.0)
+        parser.add_argument('--svm_gamma', default="scale")
+        parser.add_argument('--svm_kernel', default="rbf")
+        parser.add_argument('--svm_max_iter', type=int, default=5000)
+        parser.add_argument('--nu_default', type=float, default=0.6)
+
+        # Linear
+        parser.add_argument('--ridge_alpha', type=float, default=1.0)
+        parser.add_argument('--lasso_alpha', type=float, default=0.1)
+        parser.add_argument('--elasticnet_alpha', type=float, default=0.1)
+        parser.add_argument('--elasticnet_l1_ratio', type=float, default=0.5)
+
+        # MLP
+        parser.add_argument('--mlp_hidden_layers', default="128,64")
+        parser.add_argument('--mlp_activation', default="relu")
+        parser.add_argument('--mlp_alpha', type=float, default=0.0001)
+        parser.add_argument('--mlp_max_iter', type=int, default=300)
+
+        # SGD
+        parser.add_argument('--sgd_max_iter', type=int, default=5000)
+        parser.add_argument('--sgd_alpha', type=float, default=0.0001)
+
+        # Boosting libs
+        parser.add_argument('--lgbm_n_estimators', type=int, default=100)
+        parser.add_argument('--lgbm_learning_rate', type=float, default=0.1)
+        parser.add_argument('--lgbm_max_depth', type=int, default=10)
+        parser.add_argument('--lgbm_num_leaves', type=int, default=30)
+
+        parser.add_argument('--xgb_n_estimators', type=int, default=100)
+        parser.add_argument('--xgb_learning_rate', type=float, default=0.05)
+        parser.add_argument('--xgb_max_depth', type=int, default=10)
+
+        parser.add_argument('--cat_n_estimators', type=int, default=100)
+        parser.add_argument('--cat_learning_rate', type=float, default=0.05)
+        parser.add_argument('--cat_depth', type=int, default=10)
+
+        # Other existing inputs
         parser.add_argument('--target_column', default="")
         parser.add_argument('--preprocessor_metadata_cdn', default="")
         parser.add_argument('--feature_selector_cdn', default="")
@@ -50,8 +170,9 @@ implementation:
         parser.add_argument('--test_data_cdn', default="")
         parser.add_argument('--model_id', default="")
         parser.add_argument('--project_id', default="")
-        parser.add_argument('--execution_id', type=int)
+        parser.add_argument('--execution_id', type=int, default=0)
         parser.add_argument('--trigger_response', required=True)
+
         args = parser.parse_args()
 
         # Read bearer token
@@ -65,11 +186,74 @@ implementation:
             f"?pipelineId={args.pipeline_id}"
         )
 
-        # Build parameters object - only include non-empty values
+        # Build parameters object
         parameters = {}
-        
+
+        # Ensemble control: only include if provided or meaningful
         if args.model_type:
             parameters["model_type"] = args.model_type
+        if args.ensemble_type:
+            parameters["ensemble_type"] = args.ensemble_type
+        if args.n_ensemble_models and args.n_ensemble_models > 0:
+            parameters["n_ensemble_models"] = args.n_ensemble_models
+        if args.model_names:
+            # pass verbatim comma-separated string; let the pipeline parse it
+            parameters["model_names"] = args.model_names
+        if args.meta_model_name:
+            parameters["meta_model_name"] = args.meta_model_name
+        if args.stacking_cv is not None:
+            parameters["stacking_cv"] = args.stacking_cv
+        if args.random_state is not None:
+            parameters["random_state"] = args.random_state
+
+        # Always include hyperparameters (they have sensible defaults)
+        parameters.update({
+            "n_estimators": args.n_estimators,
+            "n_estimators_boost": args.n_estimators_boost,
+            "max_depth_tree": args.max_depth_tree,
+            "max_depth_boost": args.max_depth_boost,
+            "min_samples_leaf": args.min_samples_leaf,
+            "min_samples_split": args.min_samples_split,
+            "max_features": args.max_features,
+            "learning_rate": args.learning_rate,
+
+            "knn_k": args.knn_k,
+            "knn_weights": args.knn_weights,
+
+            "svm_C": args.svm_C,
+            "svm_gamma": args.svm_gamma,
+            "svm_kernel": args.svm_kernel,
+            "svm_max_iter": args.svm_max_iter,
+            "nu_default": args.nu_default,
+
+            "ridge_alpha": args.ridge_alpha,
+            "lasso_alpha": args.lasso_alpha,
+            "elasticnet_alpha": args.elasticnet_alpha,
+            "elasticnet_l1_ratio": args.elasticnet_l1_ratio,
+
+            "mlp_hidden_layers": args.mlp_hidden_layers,
+            "mlp_activation": args.mlp_activation,
+            "mlp_alpha": args.mlp_alpha,
+            "mlp_max_iter": args.mlp_max_iter,
+
+            "sgd_max_iter": args.sgd_max_iter,
+            "sgd_alpha": args.sgd_alpha,
+
+            "lgbm_n_estimators": args.lgbm_n_estimators,
+            "lgbm_learning_rate": args.lgbm_learning_rate,
+            "lgbm_max_depth": args.lgbm_max_depth,
+            "lgbm_num_leaves": args.lgbm_num_leaves,
+
+            "xgb_n_estimators": args.xgb_n_estimators,
+            "xgb_learning_rate": args.xgb_learning_rate,
+            "xgb_max_depth": args.xgb_max_depth,
+
+            "cat_n_estimators": args.cat_n_estimators,
+            "cat_learning_rate": args.cat_learning_rate,
+            "cat_depth": args.cat_depth,
+        })
+
+        # Existing optional inputs - include only when non-empty / meaningful
         if args.target_column:
             parameters["target_column"] = args.target_column
         if args.preprocessor_metadata_cdn:
@@ -90,7 +274,7 @@ implementation:
             parameters["model_id"] = args.model_id
         if args.project_id:
             parameters["project_id"] = args.project_id
-        if args.execution_id != 0:
+        if args.execution_id and args.execution_id != 0:
             parameters["execution_id"] = args.execution_id
 
         # Build payload - exactly matching the working curl structure
@@ -116,11 +300,11 @@ implementation:
         print(f"[DEBUG] Experiment ID: {args.experiment_id}")
         print(f"[DEBUG] Execution ID: {args.execution_id} (type: {type(args.execution_id).__name__})")
         print(f"[DEBUG] Payload: {json.dumps(payload, indent=2)}")
-        
+
         # Make the request
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
-            
+
             if not resp.ok:
                 error_detail = ""
                 try:
@@ -128,16 +312,16 @@ implementation:
                     error_detail = json.dumps(error_json, indent=2)
                 except:
                     error_detail = resp.text
-                
+
                 print(f"[ERROR] Trigger failed with status {resp.status_code}", file=sys.stderr)
                 print(f"[ERROR] Response: {error_detail}", file=sys.stderr)
-                
+
                 if resp.status_code == 404:
                     print("[ERROR] Pipeline not found. Please verify:", file=sys.stderr)
                     print(f"  - Pipeline ID is correct: {args.pipeline_id}", file=sys.stderr)
                 elif resp.status_code == 401 or resp.status_code == 403:
                     print("[ERROR] Authentication/Authorization failed", file=sys.stderr)
-                
+
                 resp.raise_for_status()
 
             # Write response
@@ -148,7 +332,7 @@ implementation:
 
             print("[SUCCESS] Pipeline triggered successfully")
             print(response_text)
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERROR] Request failed: {str(e)}", file=sys.stderr)
             raise
@@ -162,8 +346,110 @@ implementation:
       - {inputValue: pipeline_id}
       - --experiment_id
       - {inputValue: experiment_id}
+
+      # Ensemble control args mapping
       - --model_type
       - {inputValue: model_type}
+      - --ensemble_type
+      - {inputValue: ensemble_type}
+      - --n_ensemble_models
+      - {inputValue: n_ensemble_models}
+      - --model_names
+      - {inputValue: model_names}
+      - --meta_model_name
+      - {inputValue: meta_model_name}
+      - --stacking_cv
+      - {inputValue: stacking_cv}
+      - --random_state
+      - {inputValue: random_state}
+
+      # Tree-based
+      - --n_estimators
+      - {inputValue: n_estimators}
+      - --n_estimators_boost
+      - {inputValue: n_estimators_boost}
+      - --max_depth_tree
+      - {inputValue: max_depth_tree}
+      - --max_depth_boost
+      - {inputValue: max_depth_boost}
+      - --min_samples_leaf
+      - {inputValue: min_samples_leaf}
+      - --min_samples_split
+      - {inputValue: min_samples_split}
+      - --max_features
+      - {inputValue: max_features}
+      - --learning_rate
+      - {inputValue: learning_rate}
+
+      # KNN
+      - --knn_k
+      - {inputValue: knn_k}
+      - --knn_weights
+      - {inputValue: knn_weights}
+
+      # SVM
+      - --svm_C
+      - {inputValue: svm_C}
+      - --svm_gamma
+      - {inputValue: svm_gamma}
+      - --svm_kernel
+      - {inputValue: svm_kernel}
+      - --svm_max_iter
+      - {inputValue: svm_max_iter}
+      - --nu_default
+      - {inputValue: nu_default}
+
+      # Linear
+      - --ridge_alpha
+      - {inputValue: ridge_alpha}
+      - --lasso_alpha
+      - {inputValue: lasso_alpha}
+      - --elasticnet_alpha
+      - {inputValue: elasticnet_alpha}
+      - --elasticnet_l1_ratio
+      - {inputValue: elasticnet_l1_ratio}
+
+      # MLP
+      - --mlp_hidden_layers
+      - {inputValue: mlp_hidden_layers}
+      - --mlp_activation
+      - {inputValue: mlp_activation}
+      - --mlp_alpha
+      - {inputValue: mlp_alpha}
+      - --mlp_max_iter
+      - {inputValue: mlp_max_iter}
+
+      # SGD
+      - --sgd_max_iter
+      - {inputValue: sgd_max_iter}
+      - --sgd_alpha
+      - {inputValue: sgd_alpha}
+
+      # Boosting libs
+      - --lgbm_n_estimators
+      - {inputValue: lgbm_n_estimators}
+      - --lgbm_learning_rate
+      - {inputValue: lgbm_learning_rate}
+      - --lgbm_max_depth
+      - {inputValue: lgbm_max_depth}
+      - --lgbm_num_leaves
+      - {inputValue: lgbm_num_leaves}
+
+      - --xgb_n_estimators
+      - {inputValue: xgb_n_estimators}
+      - --xgb_learning_rate
+      - {inputValue: xgb_learning_rate}
+      - --xgb_max_depth
+      - {inputValue: xgb_max_depth}
+
+      - --cat_n_estimators
+      - {inputValue: cat_n_estimators}
+      - --cat_learning_rate
+      - {inputValue: cat_learning_rate}
+      - --cat_depth
+      - {inputValue: cat_depth}
+
+      # existing optional inputs mapping
       - --target_column
       - {inputValue: target_column}
       - --preprocessor_metadata_cdn
