@@ -1,4 +1,4 @@
-name: SVM and KNN Trigger
+name: SVM and KNN Trigger v1
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -22,20 +22,22 @@ inputs:
   - {name: n_estimators, type: Integer, description: "Number of estimators (for tree ensembles)", optional: true, default: "100"}
   - {name: min_samples_leaf, type: Integer, description: "min_samples_leaf for tree models", optional: true, default: "1"}
   - {name: n_jobs, type: Integer, description: "n_jobs for parallel models (-1 for all cores)", optional: true, default: "-1"}
-  - {name: use_scaler, type: String, description: "true/false. If true, apply StandardScaler for SVM/linear models", optional: true, default: "true"}
   - {name: svm_kernel, type: String, description: "kernel for SVC/SVR (rbf|linear|poly|sigmoid)", optional: true, default: "rbf"}
   - {name: svm_C, type: Float, description: "C parameter for SVMs", optional: true, default: "1.0"}
   - {name: svm_gamma, type: String, description: "gamma for SVC/SVR ('scale','auto' or float)", optional: true, default: "scale"}
   - {name: svm_nu, type: Float, description: "nu parameter for NuSVC (0<nu<=1). Used only for nusvc", optional: true, default: "0.5"}
   - {name: svm_probability, type: String, description: "true/false: enable probability=True for SVC (slower)", optional: true, default: "false"}
   - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
+  - {name: cv_folds, type: Integer, description: "Number of folds for cross-validation", optional: true, default: "5"}
+  - {name: max_iter_svm, type: Integer, description: "Maximum iterations for SVM convergence", optional: true, default: "10000"}
+  - {name: early_stopping, type: String, description: "Enable early stopping for tree models (true/false)", optional: true, default: "false"}
 
 outputs:
   - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
 
 implementation:
   container:
-    image: kumar2004/mobius:1.0
+    image: gurpreetgandhi/nesy-factory:vtest4
     command:
       - python3
       - -u
@@ -71,13 +73,15 @@ implementation:
         parser.add_argument('--n_estimators', type=int, default=100)
         parser.add_argument('--min_samples_leaf', type=int, default=1)
         parser.add_argument('--n_jobs', type=int, default=-1)
-        parser.add_argument('--use_scaler', default="true")
         parser.add_argument('--svm_kernel', default="rbf")
         parser.add_argument('--svm_C', type=float, default=1.0)
         parser.add_argument('--svm_gamma', default="scale")
         parser.add_argument('--svm_nu', type=float, default=0.5)
         parser.add_argument('--svm_probability', default="false")
         parser.add_argument('--random_state', type=int, default=48)
+        parser.add_argument('--cv_folds', type=int, default=5)
+        parser.add_argument('--max_iter_svm', type=int, default=10000)
+        parser.add_argument('--early_stopping', default="false")
         parser.add_argument('--trigger_response', required=True)
         args = parser.parse_args()
 
@@ -133,8 +137,6 @@ implementation:
             parameters["min_samples_leaf"] = args.min_samples_leaf
         if args.n_jobs:
             parameters["n_jobs"] = args.n_jobs
-        if args.use_scaler:
-            parameters["use_scaler"] = args.use_scaler
         if args.svm_kernel:
             parameters["svm_kernel"] = args.svm_kernel
         if args.svm_C:
@@ -147,6 +149,12 @@ implementation:
             parameters["svm_probability"] = args.svm_probability
         if args.random_state:
             parameters["random_state"] = args.random_state
+        if args.cv_folds:
+            parameters["cv_folds"] = args.cv_folds
+        if args.max_iter_svm:
+            parameters["max_iter_svm"] = args.max_iter_svm
+        if args.early_stopping:
+            parameters["early_stopping"] = args.early_stopping
 
         # Build payload - exactly matching the working curl structure
         payload = {
@@ -272,8 +280,6 @@ implementation:
       - {inputValue: min_samples_leaf}
       - --n_jobs
       - {inputValue: n_jobs}
-      - --use_scaler
-      - {inputValue: use_scaler}
       - --svm_kernel
       - {inputValue: svm_kernel}
       - --svm_C
@@ -286,5 +292,11 @@ implementation:
       - {inputValue: svm_probability}
       - --random_state
       - {inputValue: random_state}
+      - --cv_folds
+      - {inputValue: cv_folds}
+      - --max_iter_svm
+      - {inputValue: max_iter_svm}
+      - --early_stopping
+      - {inputValue: early_stopping}
       - --trigger_response
       - {outputPath: trigger_response}
