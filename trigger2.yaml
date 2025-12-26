@@ -1,0 +1,290 @@
+name: SVM and KNN Trigger
+inputs:
+  - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
+  - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
+  - {name: pipeline_id, type: String, description: "Pipeline ID to trigger"}
+  - {name: experiment_id, type: String, description: "Experiment ID"}
+  - {name: model_type, type: String, optional: true, default: ""}
+  - {name: target_column, type: String, optional: true, default: ""}
+  - {name: preprocessor_metadata_cdn, type: String, optional: true, default: ""}
+  - {name: feature_selector_cdn, type: String, optional: true, default: ""}
+  - {name: pca_cdn, type: String, optional: true, default: ""}
+  - {name: preprocessor_cdn, type: String, optional: true, default: ""}
+  - {name: x_train_cdn, type: String, optional: true, default: ""}
+  - {name: y_train_cdn, type: String, optional: true, default: ""}
+  - {name: test_data_cdn, type: String, optional: true, default: ""}
+  - {name: model_id, type: String, optional: true, default: ""}
+  - {name: project_id, type: String, optional: true, default: ""}
+  - {name: execution_id, type: Integer, optional: true}
+  - {name: model_name, type: String, description: "Model to train: knn | decisiontree | extratrees | svc | linearsvc | nusvc | svr | linearsvr", optional: true, default: "decisiontree"}
+  - {name: n_neighbors, type: Integer, description: "Number of neighbors (for KNN). Used only when model_name=knn", optional: true, default: "5"}
+  - {name: dt_max_depth, type: Integer, description: "Max depth for DecisionTree (None for automatic). Used only when model_name=decisiontree", optional: true, default: "5"}
+  - {name: n_estimators, type: Integer, description: "Number of estimators (for tree ensembles)", optional: true, default: "100"}
+  - {name: min_samples_leaf, type: Integer, description: "min_samples_leaf for tree models", optional: true, default: "1"}
+  - {name: n_jobs, type: Integer, description: "n_jobs for parallel models (-1 for all cores)", optional: true, default: "-1"}
+  - {name: use_scaler, type: String, description: "true/false. If true, apply StandardScaler for SVM/linear models", optional: true, default: "true"}
+  - {name: svm_kernel, type: String, description: "kernel for SVC/SVR (rbf|linear|poly|sigmoid)", optional: true, default: "rbf"}
+  - {name: svm_C, type: Float, description: "C parameter for SVMs", optional: true, default: "1.0"}
+  - {name: svm_gamma, type: String, description: "gamma for SVC/SVR ('scale','auto' or float)", optional: true, default: "scale"}
+  - {name: svm_nu, type: Float, description: "nu parameter for NuSVC (0<nu<=1). Used only for nusvc", optional: true, default: "0.5"}
+  - {name: svm_probability, type: String, description: "true/false: enable probability=True for SVC (slower)", optional: true, default: "false"}
+  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "48"}
+
+outputs:
+  - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
+
+implementation:
+  container:
+    image: kumar2004/mobius:1.0
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import os
+        import sys
+        import requests
+        import time
+
+        parser = argparse.ArgumentParser(description="Trigger ML pipeline")
+        parser.add_argument('--bearer_token', required=True)
+        parser.add_argument('--domain', required=True)
+        parser.add_argument('--pipeline_id', required=True)
+        parser.add_argument('--experiment_id', required=True)
+        parser.add_argument('--model_type', default="")
+        parser.add_argument('--target_column', default="")
+        parser.add_argument('--preprocessor_metadata_cdn', default="")
+        parser.add_argument('--feature_selector_cdn', default="")
+        parser.add_argument('--pca_cdn', default="")
+        parser.add_argument('--preprocessor_cdn', default="")
+        parser.add_argument('--x_train_cdn', default="")
+        parser.add_argument('--y_train_cdn', default="")
+        parser.add_argument('--test_data_cdn', default="")
+        parser.add_argument('--model_id', default="")
+        parser.add_argument('--project_id', default="")
+        parser.add_argument('--execution_id', type=int)
+        parser.add_argument('--model_name', default="decisiontree")
+        parser.add_argument('--n_neighbors', type=int, default=5)
+        parser.add_argument('--dt_max_depth', type=int, default=5)
+        parser.add_argument('--n_estimators', type=int, default=100)
+        parser.add_argument('--min_samples_leaf', type=int, default=1)
+        parser.add_argument('--n_jobs', type=int, default=-1)
+        parser.add_argument('--use_scaler', default="true")
+        parser.add_argument('--svm_kernel', default="rbf")
+        parser.add_argument('--svm_C', type=float, default=1.0)
+        parser.add_argument('--svm_gamma', default="scale")
+        parser.add_argument('--svm_nu', type=float, default=0.5)
+        parser.add_argument('--svm_probability', default="false")
+        parser.add_argument('--random_state', type=int, default=48)
+        parser.add_argument('--trigger_response', required=True)
+        args = parser.parse_args()
+
+        # Read bearer token
+        with open(args.bearer_token, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+
+        # Construct URL - exactly like the working curl
+        url = (
+            f"{args.domain.rstrip('/')}"
+            f"/bob-service-test/v1.0/pipeline/trigger/ml"
+            f"?pipelineId={args.pipeline_id}"
+        )
+
+        # Build parameters object - only include non-empty values
+        parameters = {}
+        
+        if args.model_type:
+            parameters["model_type"] = args.model_type
+        if args.target_column:
+            parameters["target_column"] = args.target_column
+        if args.preprocessor_metadata_cdn:
+            parameters["preprocessor_metadata_cdn"] = args.preprocessor_metadata_cdn
+        if args.feature_selector_cdn:
+            parameters["feature_selector_cdn"] = args.feature_selector_cdn
+        if args.pca_cdn:
+            parameters["pca_cdn"] = args.pca_cdn
+        if args.preprocessor_cdn:
+            parameters["preprocessor_cdn"] = args.preprocessor_cdn
+        if args.x_train_cdn:
+            parameters["x_train_cdn"] = args.x_train_cdn
+        if args.y_train_cdn:
+            parameters["y_train_cdn"] = args.y_train_cdn
+        if args.test_data_cdn:
+            parameters["test_data_cdn"] = args.test_data_cdn
+        if args.model_id:
+            parameters["model_id"] = args.model_id
+        if args.project_id:
+            parameters["project_id"] = args.project_id
+        if args.execution_id != 0:
+            parameters["execution_id"] = args.execution_id
+        
+        # Add new model parameters
+        if args.model_name:
+            parameters["model_name"] = args.model_name
+        if args.n_neighbors:
+            parameters["n_neighbors"] = args.n_neighbors
+        if args.dt_max_depth:
+            parameters["dt_max_depth"] = args.dt_max_depth
+        if args.n_estimators:
+            parameters["n_estimators"] = args.n_estimators
+        if args.min_samples_leaf:
+            parameters["min_samples_leaf"] = args.min_samples_leaf
+        if args.n_jobs:
+            parameters["n_jobs"] = args.n_jobs
+        if args.use_scaler:
+            parameters["use_scaler"] = args.use_scaler
+        if args.svm_kernel:
+            parameters["svm_kernel"] = args.svm_kernel
+        if args.svm_C:
+            parameters["svm_C"] = args.svm_C
+        if args.svm_gamma:
+            parameters["svm_gamma"] = args.svm_gamma
+        if args.svm_nu:
+            parameters["svm_nu"] = args.svm_nu
+        if args.svm_probability:
+            parameters["svm_probability"] = args.svm_probability
+        if args.random_state:
+            parameters["random_state"] = args.random_state
+
+        # Build payload - exactly matching the working curl structure
+        payload = {
+            "pipelineType": "ML",
+            "containerResources": {},
+            "experimentId": args.experiment_id,
+            "enableCaching": True,
+            "parameters": parameters,
+            "version": 1
+        }
+
+        # Headers - exactly matching the working curl
+        headers = {
+            "accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        # Print debug information
+        print(f"[DEBUG] Triggering pipeline at: {url}")
+        print(f"[DEBUG] Pipeline ID: {args.pipeline_id}")
+        print(f"[DEBUG] Experiment ID: {args.experiment_id}")
+        print(f"[DEBUG] Execution ID: {args.execution_id} (type: {type(args.execution_id).__name__})")
+        print(f"[DEBUG] Payload: {json.dumps(payload, indent=2)}")
+        
+        # Make the request with retry logic
+        max_retries = 2
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"[INFO] Attempt {attempt + 1} of {max_retries}")
+                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+                
+                if not resp.ok:
+                    error_detail = ""
+                    try:
+                        error_json = resp.json()
+                        error_detail = json.dumps(error_json, indent=2)
+                    except:
+                        error_detail = resp.text
+                    
+                    print(f"[ERROR] Trigger failed with status {resp.status_code}", file=sys.stderr)
+                    print(f"[ERROR] Response: {error_detail}", file=sys.stderr)
+                    
+                    if resp.status_code == 404:
+                        print("[ERROR] Pipeline not found. Please verify:", file=sys.stderr)
+                        print(f"  - Pipeline ID is correct: {args.pipeline_id}", file=sys.stderr)
+                    elif resp.status_code == 401 or resp.status_code == 403:
+                        print("[ERROR] Authentication/Authorization failed", file=sys.stderr)
+                    
+                    # If this is not the last attempt, retry
+                    if attempt < max_retries - 1:
+                        print(f"[INFO] Retrying in {retry_delay} seconds...", file=sys.stderr)
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        resp.raise_for_status()
+
+                # Write response
+                response_text = resp.text
+                os.makedirs(os.path.dirname(args.trigger_response), exist_ok=True)
+                with open(args.trigger_response, "w", encoding="utf-8") as f:
+                    f.write(response_text)
+
+                print("[SUCCESS] Pipeline triggered successfully")
+                print(response_text)
+                break  # Success, exit the retry loop
+                
+            except requests.exceptions.RequestException as e:
+                print(f"[ERROR] Request failed: {str(e)}", file=sys.stderr)
+                
+                # If this is not the last attempt, retry
+                if attempt < max_retries - 1:
+                    print(f"[INFO] Retrying in {retry_delay} seconds...", file=sys.stderr)
+                    time.sleep(retry_delay)
+                else:
+                    # Last attempt failed, raise the exception
+                    raise
+
+    args:
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --pipeline_id
+      - {inputValue: pipeline_id}
+      - --experiment_id
+      - {inputValue: experiment_id}
+      - --model_type
+      - {inputValue: model_type}
+      - --target_column
+      - {inputValue: target_column}
+      - --preprocessor_metadata_cdn
+      - {inputValue: preprocessor_metadata_cdn}
+      - --feature_selector_cdn
+      - {inputValue: feature_selector_cdn}
+      - --pca_cdn
+      - {inputValue: pca_cdn}
+      - --preprocessor_cdn
+      - {inputValue: preprocessor_cdn}
+      - --x_train_cdn
+      - {inputValue: x_train_cdn}
+      - --y_train_cdn
+      - {inputValue: y_train_cdn}
+      - --test_data_cdn
+      - {inputValue: test_data_cdn}
+      - --model_id
+      - {inputValue: model_id}
+      - --project_id
+      - {inputValue: project_id}
+      - --execution_id
+      - {inputValue: execution_id}
+      - --model_name
+      - {inputValue: model_name}
+      - --n_neighbors
+      - {inputValue: n_neighbors}
+      - --dt_max_depth
+      - {inputValue: dt_max_depth}
+      - --n_estimators
+      - {inputValue: n_estimators}
+      - --min_samples_leaf
+      - {inputValue: min_samples_leaf}
+      - --n_jobs
+      - {inputValue: n_jobs}
+      - --use_scaler
+      - {inputValue: use_scaler}
+      - --svm_kernel
+      - {inputValue: svm_kernel}
+      - --svm_C
+      - {inputValue: svm_C}
+      - --svm_gamma
+      - {inputValue: svm_gamma}
+      - --svm_nu
+      - {inputValue: svm_nu}
+      - --svm_probability
+      - {inputValue: svm_probability}
+      - --random_state
+      - {inputValue: random_state}
+      - --trigger_response
+      - {outputPath: trigger_response}
