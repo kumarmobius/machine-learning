@@ -168,11 +168,11 @@ implementation:
             logger.info("TARGET DISTRIBUTION ANALYSIS")
             try:
                 value_counts = y.value_counts(dropna=False)
-                logger.info(f"Value counts:\n{value_counts.to_string()}")
+                logger.info(f"Value counts:{value_counts.to_string()}")
                 logger.info(f"Unique classes: {int(y.nunique())}")
                 if args.model_type == "classification":
                     dist_pct = y.value_counts(dropna=False, normalize=True) * 100
-                    logger.info(f"Class distribution %:\n{dist_pct.round(2).to_string()}")
+                    logger.info(f"Class distribution %:{dist_pct.round(2).to_string()}")
             except Exception as e:
                 logger.warning(f"Could not analyze target distribution: {e}")
             
