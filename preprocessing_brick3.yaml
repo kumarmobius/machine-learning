@@ -1,4 +1,4 @@
-name: Feature Selection v5.1
+name: Feature Selection v6
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Brick 2"}
   - {name: train_y, type: Dataset, description: "Target labels from Brick 2"}
@@ -203,12 +203,12 @@ implementation:
                 return X.reindex(columns=self.selected_features, fill_value=0.0)
         
             def save(self, path: str) -> None:
-                with gzip.open(path, "wb") as f:
+                with open(path, "wb") as f:  # Changed from gzip.open
                     cloudpickle.dump(self, f)
-        
+            
             @staticmethod
             def load(path: str) -> "FeatureSelector":
-                with gzip.open(path, "rb") as f:
+                with open(path, "rb") as f:  # Changed from gzip.open
                     return cloudpickle.load(f)
 
         # Main execution
@@ -303,7 +303,7 @@ implementation:
                     'selected_features': list(X_selected.columns),
                     'transform': lambda self, X: X
                 })()
-                with gzip.open(args.feature_selector, "wb") as f:
+                with open(args.feature_selector, "wb") as f:
                     cloudpickle.dump(dummy_fs, f)
                 print(f"[INFO] Saved dummy feature_selector to: {args.feature_selector}")
             
