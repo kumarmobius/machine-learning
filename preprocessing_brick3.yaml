@@ -1,4 +1,4 @@
-name: Feature Selection v6.1
+name: Feature Selection v5.1
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Brick 2"}
   - {name: train_y, type: Dataset, description: "Target labels from Brick 2"}
@@ -27,7 +27,6 @@ implementation:
         from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
         from sklearn.inspection import permutation_importance
         import cloudpickle
-        import joblib
         
         # Helper functions
         def ensure_dir_for(p):
@@ -204,12 +203,13 @@ implementation:
                 return X.reindex(columns=self.selected_features, fill_value=0.0)
         
             def save(self, path: str) -> None:
-                joblib.dump(self, path, compress=3)
-
-            
+                with gzip.open(path, "wb") as f:
+                    cloudpickle.dump(self, f)
+        
             @staticmethod
             def load(path: str) -> "FeatureSelector":
-                return joblib.load(path)
+                with gzip.open(path, "rb") as f:
+                    return cloudpickle.load(f)
 
         # Main execution
         parser=argparse.ArgumentParser()
@@ -303,7 +303,8 @@ implementation:
                     'selected_features': list(X_selected.columns),
                     'transform': lambda self, X: X
                 })()
-                joblib.dump(dummy_fs, args.feature_selector, compress=3)
+                with gzip.open(args.feature_selector, "wb") as f:
+                    cloudpickle.dump(dummy_fs, f)
                 print(f"[INFO] Saved dummy feature_selector to: {args.feature_selector}")
             
             # Pass-through preprocessor
