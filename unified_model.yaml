@@ -1,4 +1,4 @@
-name: Convert to Unified Pipeline v1.1
+name: Convert to Unified Pipeline v1.2
 description: "Converts separate pickle files (preprocessor, feature_selector, pca, model) into a single unified pipeline"
 inputs:
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor pickle file"}
@@ -345,9 +345,20 @@ implementation:
                 print(f" Unified Pipeline object created: {type(unified_pipeline)}")
 
                 # Save unified pipeline
+                # Save unified pipeline using cloudpickle (handles custom classes)
                 print(f"Saving unified pipeline to: {args.unified_pipeline}")
                 ensure_dir_for(args.unified_pipeline)
-                joblib.dump(unified_pipeline, args.unified_pipeline, compress=3)
+                
+                # Use cloudpickle to handle custom __main__ classes
+                try:
+                    import cloudpickle
+                    with open(args.unified_pipeline, 'wb') as f:
+                        cloudpickle.dump(unified_pipeline, f)
+                    print("✓ Saved with cloudpickle (recommended for custom classes)")
+                except ImportError:
+                    # Fallback to joblib if cloudpickle not available
+                    print("⚠ cloudpickle not available, trying joblib...")
+                    joblib.dump(unified_pipeline, args.unified_pipeline, compress=3)
                 
                 file_size = os.path.getsize(args.unified_pipeline)
                 print(f"✓ Pipeline saved successfully ({file_size / 1024 / 1024:.2f} MB)")
