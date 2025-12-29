@@ -1,4 +1,4 @@
-name: Data Cleaning v1.4
+name: Data Cleaning v1.5
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Target column(s), comma-separated for multi-output"}
@@ -6,6 +6,7 @@ inputs:
   - {name: unique_threshold, type: Float, description: "Drop columns with unique % above this (ID columns)", optional: true, default: "0.95"}
   - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
+  - {name: drop_column, type: String, description: "Comma-separated list of columns to drop (optional)", optional: true, default: ""}
 outputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features parquet"}
   - {name: cleaned_y, type: Dataset, description: "Target labels parquet"}
@@ -40,15 +41,15 @@ implementation:
 
         def read_with_pandas(path):
 
-        
+            
             path = str(path)
             # if directory: prefer files with known dataset extensions, else fallback to largest file
             if os.path.isdir(path):
-                entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
+                entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith('.')]
                 files = [p for p in entries if os.path.isfile(p)]
                 if not files:
                     raise ValueError("No files in dir: " + path)
-        
+
                 # prefer these extensions in this order
                 prefer_exts = ['.parquet', '.pq', '.csv', '.json', '.ndjson', '.gz', '.zip',
                                '.xlsx', '.xls', '.feather', '.feather.parquet', '.sav', '.sas7bdat']
@@ -67,12 +68,12 @@ implementation:
                     chosen = max(files, key=lambda p: os.path.getsize(p))
                 path = chosen
                 print("[INFO] Selected file from dir:", path)
-        
+
             if not os.path.exists(path) or not os.path.isfile(path):
                 raise ValueError("Input path not found: " + str(path))
-        
+
             ext = os.path.splitext(path)[1].lower()
-        
+
             # handle compressed csv/json (.gz) and zip containers
             if ext == ".gz":
                 try:
@@ -88,7 +89,7 @@ implementation:
                 except Exception:
                     # fallback to binary open + try encodings
                     pass
-        
+
             if ext == ".zip":
                 with zipfile.ZipFile(path, "r") as z:
                     members = [n for n in z.namelist() if not n.endswith("/")]
@@ -104,7 +105,7 @@ implementation:
                         else:
                             with z.open(member) as fh2:
                                 return pd.read_csv(io.TextIOWrapper(fh2, encoding="utf-8"))
-        
+
             # Excel support
             if ext in (".xlsx", ".xls"):
                 try:
@@ -113,18 +114,18 @@ implementation:
                 except Exception as e:
                     # give more informative error
                     raise ValueError(f"Failed to read Excel file {path}: {e}")
-        
+
             # parquet
             if ext in (".parquet", ".pq"):
                 return pd.read_parquet(path)
-        
+
             # feather (if available)
             if ext in (".feather",):
                 try:
                     return pd.read_feather(path)
                 except Exception:
                     pass
-        
+
             # If extension suggests text-like or unknown: try a sequence of attempts with multiple encodings/parsers
             attempts = []
             # try JSON (lines and normal)
@@ -136,23 +137,23 @@ implementation:
                 attempts.append(("json", lambda: pd.read_json(path)))
             except Exception:
                 pass
-        
+
             # try CSV with several encodings and engine fallback
             encodings = ['utf-8', 'latin1', 'cp1252', 'utf-16']
             for enc in encodings:
                 def make_csv_fn(e=enc):
                     return lambda: pd.read_csv(path, encoding=e)
                 attempts.append((f"csv_{enc}", make_csv_fn()))
-        
+
             # csv with python engine (more tolerant)
             for enc in encodings:
                 def make_csv_py(e=enc):
                     return lambda: pd.read_csv(path, encoding=e, engine="python", error_bad_lines=False)
                 attempts.append((f"csv_py_{enc}", make_csv_py()))
-        
+
             # finally try parquet read as last resort
             attempts.append(("parquet_try", lambda: pd.read_parquet(path)))
-        
+
             last_exc = None
             for name, fn in attempts:
                 try:
@@ -163,7 +164,7 @@ implementation:
                 except Exception as e:
                     last_exc = e
                     # continue to next attempt
-        
+
             # If nothing worked, raise clearer error describing attempts
             raise ValueError(f"Unsupported or unreadable format: {path}. Last error: {last_exc}")
 
@@ -287,6 +288,7 @@ implementation:
         parser.add_argument('--unique_threshold', type=float, default=0.95)
         parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
         parser.add_argument('--preview_rows', type=int, default=20)
+        parser.add_argument('--drop_column', type=str, default='')
         parser.add_argument('--cleaned_X', type=str, required=True)
         parser.add_argument('--cleaned_y', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
@@ -323,6 +325,20 @@ implementation:
             y_raw = df[target_cols].copy()
             X_raw = df.drop(columns=target_cols).copy()
             print(f"[INFO] X: {X_raw.shape}, y: {y_raw.shape}")
+
+            # Drop user-specified columns (if any)
+            print("[STEP 4.1/10] Dropping user-specified columns...")
+            dropped_user_cols = []
+            if args.drop_column and args.drop_column.strip():
+                to_drop = [c.strip() for c in args.drop_column.split(',') if c.strip()]
+                for c in to_drop:
+                    if c in X_raw.columns:
+                        X_raw = X_raw.drop(columns=[c])
+                        dropped_user_cols.append(c)
+                if dropped_user_cols:
+                    print(f"[INFO] Dropped user-specified columns: {dropped_user_cols}")
+                else:
+                    print("[INFO] No matching user-specified columns found to drop")
             
             # Drop high-missing columns
             print(f"[STEP 5/10] Dropping columns >{args.missing_threshold*100}% missing...")
@@ -400,6 +416,7 @@ implementation:
                 'dropped_missing_cols': cols_to_drop_missing,
                 'dropped_unique_cols': cols_to_drop_unique,
                 'dropped_rows_missing_y': dropped_y,
+                'dropped_user_columns': dropped_user_cols,
                 'missing_report': missing_report,
                 'unique_report': unique_report,
                 'conversion_report': conv_report,
@@ -434,6 +451,8 @@ implementation:
       - {inputValue: numeric_detection_threshold}
       - --preview_rows
       - {inputValue: preview_rows}
+      - --drop_column
+      - {inputValue: drop_column}
       - --cleaned_X
       - {outputPath: cleaned_X}
       - --cleaned_y
