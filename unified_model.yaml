@@ -1,4 +1,4 @@
-name: Convert to Unified Pipeline v1.0
+name: Convert to Unified Pipeline v1.1
 description: "Converts separate pickle files (preprocessor, feature_selector, pca, model) into a single unified pipeline"
 inputs:
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor pickle file"}
@@ -380,7 +380,7 @@ implementation:
                 print(f"Pipeline file: {args.unified_pipeline}")
                 print(f"Metadata file: {args.pipeline_metadata}")
                 print(f"File size: {file_size / 1024 / 1024:.2f} MB")
-                print(f Pipeline flow: {' → '.join([name for name, _ in pipeline_steps])}")
+                print(f"Pipeline flow: {' → '.join([name for name, _ in pipeline_steps])}")
                 print(" Usage Example:")
                 print("   import joblib")
                 print("   import pandas as pd")
