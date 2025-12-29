@@ -1,10 +1,9 @@
-name: Convert to Unified Pipeline v1.2
-description: "Converts separate pickle files (preprocessor, feature_selector, pca, model) into a single unified pipeline"
+name: Convert to Unified Pipeline v2
 inputs:
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor pickle file"}
   - {name: feature_selector, type: Data, description: "Fitted FeatureSelector pickle file", optional: true}
   - {name: pca, type: Data, description: "Fitted PCA pickle file", optional: true}
-  - {name: model_pickle, type: Model, description: "Trained model pickle file"}
+  - {name: model_pickle, type: Model, description: "Trained model pickle file (can be dict for multi-target)"}
   - {name: preprocess_metadata, type: Data, description: "Preprocessing metadata JSON file"}
   - {name: model_type, type: String, description: "classification or regression"}
 outputs:
@@ -34,7 +33,6 @@ implementation:
             if not os.path.exists(path):
                 return None
             
-            # Check file size
             file_size = os.path.getsize(path)
             if file_size == 0:
                 print(f"Warning: {path} is empty (0 bytes)")
@@ -42,7 +40,7 @@ implementation:
             
             print(f"Loading {path} ({file_size / 1024:.2f} KB)...")
             
-            # Try joblib first (most common)
+            # Try joblib first
             try:
                 obj = joblib.load(path)
                 print(f"  ✓ Loaded with joblib: {type(obj)}")
@@ -80,10 +78,10 @@ implementation:
             except Exception as e:
                 print(f"  ✗ pickle failed: {e}")
             
-            raise ValueError(f"Could not load pickle from {path} with any method")
+            raise ValueError(f"Could not load pickle from {path}")
 
         # ============================================================================
-        # WRAPPER CLASSES - Make components sklearn-compatible
+        # WRAPPER CLASSES
         # ============================================================================
 
         class PreprocessorWrapper(BaseEstimator, TransformerMixin):            
@@ -93,23 +91,20 @@ implementation:
                 print(f"    PreprocessorWrapper initialized (target: {target_column})")
             
             def fit(self, X, y=None):
-                # Already fitted during training, just return self
                 return self
             
             def transform(self, X):
                 print(f"    Preprocessing: input shape {X.shape}")
                 
-                # If X is just features, add dummy target for preprocessing
                 if self.target_column and self.target_column not in X.columns:
                     X_with_target = X.copy()
-                    X_with_target[self.target_column] = 0  # Dummy target for transform
+                    X_with_target[self.target_column] = 0
                     
                     try:
                         transformed = self.preprocessor.transform(X_with_target, training_mode=False)
                     except TypeError:
                         transformed = self.preprocessor.transform(X_with_target)
                     
-                    # Remove target if it's in output
                     if isinstance(transformed, pd.DataFrame) and self.target_column in transformed.columns:
                         transformed = transformed.drop(columns=[self.target_column])
                 else:
@@ -118,7 +113,6 @@ implementation:
                     except TypeError:
                         transformed = self.preprocessor.transform(X)
                 
-                # Ensure DataFrame output
                 if not isinstance(transformed, pd.DataFrame):
                     try:
                         cols = (getattr(self.preprocessor, "feature_names_out", None) or 
@@ -146,7 +140,6 @@ implementation:
                 if hasattr(self.feature_selector, 'transform'):
                     result = self.feature_selector.transform(X)
                 else:
-                    # Manual selection using feature list
                     if isinstance(X, pd.DataFrame):
                         result = X.reindex(columns=self.selected_features, fill_value=0.0)
                     else:
@@ -166,7 +159,6 @@ implementation:
             def transform(self, X):
                 print(f"    PCA: input shape {X.shape}")
                 
-                # Extract transformer from Pipeline if needed
                 from sklearn.pipeline import Pipeline as SKPipeline
                 pca_obj = self.pca_transformer
                 
@@ -178,14 +170,12 @@ implementation:
                             print(f"    PCA: Using step '{nm}': {type(step)}")
                             break
                 
-                # Apply transformation
                 X_arr = X.values if isinstance(X, pd.DataFrame) else np.asarray(X)
                 X_pca = pca_obj.transform(X_arr)
                 
                 if X_pca.ndim == 1:
                     X_pca = X_pca.reshape(-1, 1)
                 
-                # Create DataFrame with PC names
                 ncomp = X_pca.shape[1]
                 pca_cols = [f"PC{i+1}" for i in range(ncomp)]
                 result = pd.DataFrame(X_pca, columns=pca_cols)
@@ -196,30 +186,73 @@ implementation:
         class ModelWrapper(BaseEstimator):            
             def __init__(self, model):
                 self.model = model
+                self.is_dict = isinstance(model, dict)
                 print(f"    ModelWrapper initialized: {type(model)}")
+                if self.is_dict:
+                    print(f"    Dict model with {len(model)} targets: {list(model.keys())}")
             
             def fit(self, X, y=None):
                 return self
             
             def predict(self, X):
                 X_arr = X.values if isinstance(X, pd.DataFrame) else X
-                predictions = self.model.predict(X_arr)
-                print(f"    Model Prediction: {len(predictions)} predictions made")
-                return predictions
+                
+                if self.is_dict:
+                    # Handle dict of models (multi-target)
+                    predictions = {}
+                    for target_name, estimator in self.model.items():
+                        if hasattr(estimator, 'predict'):
+                            pred = estimator.predict(X_arr)
+                            predictions[target_name] = pred
+                        else:
+                            raise ValueError(f"Estimator for '{target_name}' has no predict method")
+                    
+                    # Convert dict to DataFrame or array
+                    if len(predictions) == 1:
+                        # Single target in dict - return as 1D array
+                        result = list(predictions.values())[0]
+                    else:
+                        # Multiple targets - return as 2D array
+                        result = np.column_stack(list(predictions.values()))
+                    
+                    print(f"    Model Prediction: {len(result)} predictions made for {len(predictions)} target(s)")
+                    return result
+                else:
+                    # Handle single model
+                    if hasattr(self.model, 'predict'):
+                        predictions = self.model.predict(X_arr)
+                        print(f"    Model Prediction: {len(predictions)} predictions made")
+                        return predictions
+                    else:
+                        raise AttributeError(f"Model {type(self.model)} has no predict method")
             
             def predict_proba(self, X):
-                if hasattr(self.model, 'predict_proba'):
-                    X_arr = X.values if isinstance(X, pd.DataFrame) else X
-                    return self.model.predict_proba(X_arr)
+                X_arr = X.values if isinstance(X, pd.DataFrame) else X
+                
+                if self.is_dict:
+                    # Handle dict of models
+                    probas = {}
+                    for target_name, estimator in self.model.items():
+                        if hasattr(estimator, 'predict_proba'):
+                            probas[target_name] = estimator.predict_proba(X_arr)
+                    
+                    if not probas:
+                        raise AttributeError("No models in dict support predict_proba")
+                    
+                    return probas
                 else:
-                    raise AttributeError("Model does not support predict_proba")
+                    # Handle single model
+                    if hasattr(self.model, 'predict_proba'):
+                        return self.model.predict_proba(X_arr)
+                    else:
+                        raise AttributeError("Model does not support predict_proba")
 
         # ============================================================================
-        # MAIN EXECUTION
+        # MAIN
         # ============================================================================
 
         def main():
-            parser = argparse.ArgumentParser(description="Convert separate pickles to unified pipeline")
+            parser = argparse.ArgumentParser()
             parser.add_argument('--preprocessor', type=str, required=True)
             parser.add_argument('--feature_selector', type=str, default="")
             parser.add_argument('--pca', type=str, default="")
@@ -232,11 +265,10 @@ implementation:
 
             try:
                 print("=" * 80)
-                print("CONVERTING TO UNIFIED PIPELINE")
+                print("CONVERTING TO UNIFIED PIPELINE v1.2")
                 print("=" * 80)
                 print(f"Model Type: {args.model_type}")
                 print(f"Output: {args.unified_pipeline}")
-                print("")
 
                 # Load metadata
                 print("[STEP 1/6] Loading preprocessing metadata...")
@@ -245,166 +277,122 @@ implementation:
                 
                 target_col = metadata.get('target_columns', ['target'])[0]
                 print(f"  Target column: {target_col}")
-                print(f"  Metadata keys: {list(metadata.keys())}")
 
-                # Load preprocessor (REQUIRED)
+                # Load preprocessor
                 print("[STEP 2/6] Loading preprocessor...")
                 preprocessor = load_pickle_any(args.preprocessor)
                 if preprocessor is None:
-                    raise ValueError("Preprocessor is required but could not be loaded")
-                print(f"  ✓ Preprocessor loaded successfully")
+                    raise ValueError("Preprocessor required but not loaded")
+                print(f"  ✓ Preprocessor loaded")
 
-                # Load feature selector (OPTIONAL)
+                # Load feature selector
                 print("[STEP 3/6] Loading feature selector...")
                 feature_selector = None
                 if args.feature_selector and os.path.exists(args.feature_selector):
                     try:
                         feature_selector = load_pickle_any(args.feature_selector)
-                        if feature_selector is not None:
-                            if hasattr(feature_selector, 'selected_features'):
-                                n_features = len(feature_selector.selected_features)
-                                print(f"  ✓ Feature selector loaded ({n_features} features)")
-                            else:
-                                print(f"  ✓ Feature selector loaded (no selected_features attr)")
-                        else:
-                            print(f"  ⚠ Feature selector is None, skipping")
+                        if feature_selector and hasattr(feature_selector, 'selected_features'):
+                            print(f"  ✓ Feature selector loaded ({len(feature_selector.selected_features)} features)")
                     except Exception as e:
-                        print(f"  ⚠ Could not load feature selector: {e}")
+                        print(f"  ⚠ Could not load: {e}")
                 else:
-                    print("  ⊗ No feature selector provided")
+                    print("  ⊗ Not provided")
 
-                # Load PCA (OPTIONAL)
+                # Load PCA
                 print("[STEP 4/6] Loading PCA...")
                 pca_transformer = None
                 if args.pca and os.path.exists(args.pca):
-                    file_size = os.path.getsize(args.pca)
-                    if file_size > 0:
+                    if os.path.getsize(args.pca) > 0:
                         try:
                             pca_transformer = load_pickle_any(args.pca)
-                            if pca_transformer is not None:
-                                print(f"  ✓ PCA loaded successfully")
-                            else:
-                                print(f"  ⚠ PCA is None, skipping")
+                            if pca_transformer:
+                                print(f"  ✓ PCA loaded")
                         except Exception as e:
-                            print(f"  ⚠ Could not load PCA: {e}")
-                    else:
-                        print(f"  ⊗ PCA file is empty (0 bytes), skipping")
+                            print(f"  ⚠ Could not load: {e}")
                 else:
-                    print("  ⊗ No PCA provided")
+                    print("  ⊗ Not provided")
 
-                # Load model (REQUIRED)
+                # Load model
                 print("[STEP 5/6] Loading model...")
                 model = load_pickle_any(args.model_pickle)
                 if model is None:
-                    raise ValueError("Model is required but could not be loaded")
-                print(f"  ✓ Model loaded successfully")
+                    raise ValueError("Model required but not loaded")
+                print(f"  ✓ Model loaded")
 
-                # Build unified pipeline
+                # Build pipeline
                 print("[STEP 6/6] Building unified pipeline...")
                 print("-" * 80)
                 
                 pipeline_steps = []
                 
-                # Step 1: Preprocessor (REQUIRED)
-                pipeline_steps.append(
-                    ('preprocessor', PreprocessorWrapper(preprocessor, target_column=target_col))
-                )
+                pipeline_steps.append(('preprocessor', PreprocessorWrapper(preprocessor, target_column=target_col)))
                 print("  [1] Preprocessor ✓")
                 
-                # Step 2: Feature Selector (OPTIONAL)
-                if feature_selector is not None:
-                    pipeline_steps.append(
-                        ('feature_selector', FeatureSelectorWrapper(feature_selector))
-                    )
+                if feature_selector:
+                    pipeline_steps.append(('feature_selector', FeatureSelectorWrapper(feature_selector)))
                     print("  [2] Feature Selector ✓")
                 else:
-                    print("  [2] Feature Selector ⊗ (skipped)")
+                    print("  [2] Feature Selector ⊗")
                 
-                # Step 3: PCA (OPTIONAL)
-                if pca_transformer is not None:
-                    pipeline_steps.append(
-                        ('pca', PCAWrapper(pca_transformer))
-                    )
+                if pca_transformer:
+                    pipeline_steps.append(('pca', PCAWrapper(pca_transformer)))
                     print("  [3] PCA ✓")
                 else:
-                    print("  [3] PCA ⊗ (skipped)")
+                    print("  [3] PCA ⊗")
                 
-                # Step 4: Model (REQUIRED)
-                pipeline_steps.append(
-                    ('model', ModelWrapper(model))
-                )
+                pipeline_steps.append(('model', ModelWrapper(model)))
                 print("  [4] Model ✓")
 
                 print("-" * 80)
-                print(f"Pipeline architecture ({len(pipeline_steps)} steps):")
-                for i, (step_name, _) in enumerate(pipeline_steps, 1):
-                    print(f"  {i}. {step_name}")
-
-                # Create sklearn Pipeline
                 unified_pipeline = Pipeline(pipeline_steps)
-                print(f" Unified Pipeline object created: {type(unified_pipeline)}")
+                print(f"✓ Pipeline created with {len(pipeline_steps)} steps")
 
-                # Save unified pipeline
-                # Save unified pipeline using cloudpickle (handles custom classes)
-                print(f"Saving unified pipeline to: {args.unified_pipeline}")
+                # Save with cloudpickle
+                print(f"Saving to: {args.unified_pipeline}")
                 ensure_dir_for(args.unified_pipeline)
                 
-                # Use cloudpickle to handle custom __main__ classes
                 try:
                     import cloudpickle
                     with open(args.unified_pipeline, 'wb') as f:
                         cloudpickle.dump(unified_pipeline, f)
-                    print("✓ Saved with cloudpickle (recommended for custom classes)")
+                    print("✓ Saved with cloudpickle")
                 except ImportError:
-                    # Fallback to joblib if cloudpickle not available
-                    print("⚠ cloudpickle not available, trying joblib...")
+                    print("⚠ cloudpickle not available, using joblib...")
                     joblib.dump(unified_pipeline, args.unified_pipeline, compress=3)
+                    print("✓ Saved with joblib")
                 
                 file_size = os.path.getsize(args.unified_pipeline)
-                print(f"✓ Pipeline saved successfully ({file_size / 1024 / 1024:.2f} MB)")
+                print(f"✓ File size: {file_size / 1024 / 1024:.2f} MB")
 
-                # Create pipeline metadata
+                # Save metadata
                 pipeline_meta = {
                     'created_at': datetime.utcnow().isoformat() + 'Z',
                     'model_type': args.model_type,
                     'target_column': target_col,
                     'pipeline_steps': [name for name, _ in pipeline_steps],
-                    'has_preprocessor': True,
                     'has_feature_selector': feature_selector is not None,
                     'has_pca': pca_transformer is not None,
-                    'has_model': True,
-                    'n_features_selected': len(feature_selector.selected_features) if feature_selector and hasattr(feature_selector, 'selected_features') else None,
-                    'original_metadata': metadata,
-                    'file_size_mb': round(file_size / 1024 / 1024, 2)
+                    'is_dict_model': isinstance(model, dict),
+                    'n_targets': len(model) if isinstance(model, dict) else 1,
+                    'file_size_mb': round(file_size / 1024 / 1024, 2),
+                    'original_metadata': metadata
                 }
 
-                print(f"Saving pipeline metadata to: {args.pipeline_metadata}")
                 ensure_dir_for(args.pipeline_metadata)
                 with open(args.pipeline_metadata, 'w') as f:
                     json.dump(pipeline_meta, f, indent=2)
-                print(f"✓ Metadata saved")
 
-                # Summary
                 print("=" * 80)
                 print("SUCCESS: UNIFIED PIPELINE CREATED!")
                 print("=" * 80)
-                print(f"Pipeline file: {args.unified_pipeline}")
-                print(f"Metadata file: {args.pipeline_metadata}")
-                print(f"File size: {file_size / 1024 / 1024:.2f} MB")
-                print(f"Pipeline flow: {' → '.join([name for name, _ in pipeline_steps])}")
-                print(" Usage Example:")
-                print("   import joblib")
-                print("   import pandas as pd")
-                print("")
-                print(f"   # Load the unified pipeline")
-                print(f"   pipeline = joblib.load('{os.path.basename(args.unified_pipeline)}')")
-                print("")
-                print(f"   # Make predictions on raw data (with '{target_col}' column)")
-                print("   raw_data = pd.read_csv('your_data.csv')")
-                print(f"   X_test = raw_data.drop(columns=['{target_col}'])  # Remove target")
-                print("   predictions = pipeline.predict(X_test)")
-                print("")
-                print("   # That's it! No need to manually preprocess, select features, or apply PCA!")
+                print(f" File: {args.unified_pipeline}")
+                print(f" Size: {file_size / 1024 / 1024:.2f} MB")
+                print(f"Flow: {' → '.join([n for n, _ in pipeline_steps])}")
+                print(" Usage:")
+                print("   import cloudpickle")
+                print("   with open('model.pkl', 'rb') as f:")
+                print("       pipeline = cloudpickle.load(f)")
+                print("   predictions = pipeline.predict(raw_data)")
                 print("=" * 80)
 
             except Exception as e:
