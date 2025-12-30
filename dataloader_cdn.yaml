@@ -1,4 +1,4 @@
-name: Data loader with cdn v3.1
+name: Data loader with cdn v4
 inputs:
   - {name: cdn_url, type: String, description: 'CDN URL to download dataset file (CSV, JSON, or Parquet)'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
@@ -6,8 +6,7 @@ inputs:
   - {name: model_type, type: String, default: "classification", description: 'Type of model (classification or regression)'}
 outputs:
   - {name: train_set, type: Dataset}
-  - {name: test_x, type: Dataset}
-  - {name: test_y, type: Dataset}
+  - {name: test_data, type: Dataset}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:vtest4
@@ -41,8 +40,7 @@ implementation:
                             help='Single column name or comma-separated columns, e.g. "c1,c2,c3"')
         parser.add_argument('--model_type', type=str, default="classification")
         parser.add_argument('--train_set', type=str, required=True)
-        parser.add_argument('--test_x', type=str, required=True)
-        parser.add_argument('--test_y', type=str, required=True)
+        parser.add_argument('--test_data', type=str, required=True)
         args = parser.parse_args()
 
         # --------- Logging ----------
@@ -216,15 +214,8 @@ implementation:
         # Reset indices
         train_df = train_df.reset_index(drop=True)
         test_df = test_df.reset_index(drop=True)
-        # train_y/test_y can be Series (single target) or DataFrame (multi-target)
-        if isinstance(train_y, (pd.Series,)):
-            train_y = train_y.reset_index(drop=True)
-            test_y = test_y.reset_index(drop=True)
-            train_y_df = pd.DataFrame({target_cols[0]: train_y})
-            test_y_df = pd.DataFrame({target_cols[0]: test_y})
-        else:
-            train_y_df = train_y.reset_index(drop=True)
-            test_y_df = test_y.reset_index(drop=True)
+        train_set_df = train_df.copy()
+        test_data_df = test_df.copy()
 
         # If classification and single target, print train/test distributions and check match
         if args.model_type.lower() == "classification" and len(target_cols) == 1:
@@ -232,11 +223,11 @@ implementation:
             logger.info("CLASS DISTRIBUTION VERIFICATION")
             logger.info("="*80)
 
-            logger.info("TRAIN SET CLASS DISTRIBUTION:%s", train_y_df[target_cols[0]].value_counts(dropna=False).sort_index().to_string())
-            logger.info("TEST SET CLASS DISTRIBUTION:%s", test_y_df[target_cols[0]].value_counts(dropna=False).sort_index().to_string())
+            logger.info("TRAIN SET CLASS DISTRIBUTION:%s", train_set_df[target_cols[0]].value_counts(dropna=False).sort_index().to_string())
+            logger.info("TEST SET CLASS DISTRIBUTION:%s", test_data_df[target_cols[0]].value_counts(dropna=False).sort_index().to_string())
 
-            train_pct = train_y_df[target_cols[0]].value_counts(normalize=True, dropna=False).sort_index()
-            test_pct = test_y_df[target_cols[0]].value_counts(normalize=True, dropna=False).sort_index()
+            train_pct = train_set_df[target_cols[0]].value_counts(normalize=True, dropna=False).sort_index()
+            test_pct = test_data_df[target_cols[0]].value_counts(normalize=True, dropna=False).sort_index()
             all_idx = train_pct.index.union(test_pct.index)
             train_pct = train_pct.reindex(all_idx, fill_value=0)
             test_pct = test_pct.reindex(all_idx, fill_value=0)
@@ -248,25 +239,14 @@ implementation:
                 logger.info("Train/test distributions are well matched.")
             logger.info("="*80)
 
-        # === Create outputs ===
-        # test_x_df -> drop all target columns
-        test_x_df = test_df.drop(columns=target_cols, errors="ignore")
-        train_set_df = train_df.copy()
-        # ensure train_set contains target columns (they are present in train_df since we split full df)
-        # test_y_df already created above as DataFrame
-
         # === Diagnostics for splits ===
         logger.info("===== TRAIN SET =====")
         logger.info("Shape: %s", train_set_df.shape)
         logger.info("%s", train_set_df.head(3).to_string())
 
-        logger.info("===== TEST X (features only) =====")
-        logger.info("Shape: %s", test_x_df.shape)
-        logger.info("%s", test_x_df.head(3).to_string())
-
-        logger.info("===== TEST Y (target only) =====")
-        logger.info("Shape: %s", test_y_df.shape)
-        logger.info("%s", test_y_df.head(10).to_string(index=False))
+        logger.info("===== TEST DATA (all columns) =====")
+        logger.info("Shape: %s", test_data_df.shape)
+        logger.info("%s", test_data_df.head(3).to_string())
 
         # === Save Parquet Outputs ===
         def safe_to_parquet(df_obj, path):
@@ -280,8 +260,7 @@ implementation:
                 df_obj.to_csv(csv_path, index=False)
 
         safe_to_parquet(train_set_df, args.train_set)
-        safe_to_parquet(test_x_df, args.test_x)
-        safe_to_parquet(test_y_df, args.test_y)
+        safe_to_parquet(test_data_df, args.test_data)
 
         logger.info("Finished processing and saved outputs.")
     args:
@@ -295,7 +274,5 @@ implementation:
       - {inputValue: model_type}
       - --train_set
       - {outputPath: train_set}
-      - --test_x
-      - {outputPath: test_x}
-      - --test_y
-      - {outputPath: test_y}
+      - --test_data
+      - {outputPath: test_data}
