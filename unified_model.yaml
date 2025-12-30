@@ -1,4 +1,4 @@
-name: Convert to Unified Pipeline v2
+name: Convert to Unified Pipeline v2.1
 inputs:
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor pickle file"}
   - {name: feature_selector, type: Data, description: "Fitted FeatureSelector pickle file", optional: true}
@@ -234,7 +234,15 @@ implementation:
                     probas = {}
                     for target_name, estimator in self.model.items():
                         if hasattr(estimator, 'predict_proba'):
-                            probas[target_name] = estimator.predict_proba(X_arr)
+                            try:
+                                probas[target_name] = estimator.predict_proba(X_arr)
+                            except AttributeError as e:
+                                print(f"  predict_proba not available for {target_name}: {e}")
+                                # Fallback: use decision_function if available
+                                if hasattr(estimator, 'decision_function'):
+                                    probas[target_name] = estimator.decision_function(X_arr)
+                                else:
+                                    raise AttributeError(f"Neither predict_proba nor decision_function available for {target_name}")
                     
                     if not probas:
                         raise AttributeError("No models in dict support predict_proba")
@@ -243,7 +251,16 @@ implementation:
                 else:
                     # Handle single model
                     if hasattr(self.model, 'predict_proba'):
-                        return self.model.predict_proba(X_arr)
+                        try:
+                            return self.model.predict_proba(X_arr)
+                        except AttributeError as e:
+                            print(f"     predict_proba failed: {e}")
+                            # Fallback to decision_function
+                            if hasattr(self.model, 'decision_function'):
+                                print("    Using decision_function as fallback")
+                                return self.model.decision_function(X_arr)
+                            else:
+                                raise AttributeError(f"Neither predict_proba nor decision_function available: {e}")
                     else:
                         raise AttributeError("Model does not support predict_proba")
 
