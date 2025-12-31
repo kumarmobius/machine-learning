@@ -1,4 +1,5 @@
-name: Convert to Unified Pipeline v2.1
+name: Convert to Unified Pipeline v2.2
+description: "Converts separate pickle files (preprocessor, feature_selector, pca, model) into a single unified pipeline"
 inputs:
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor pickle file"}
   - {name: feature_selector, type: Data, description: "Fitted FeatureSelector pickle file", optional: true}
@@ -83,6 +84,45 @@ implementation:
         # ============================================================================
         # WRAPPER CLASSES
         # ============================================================================
+
+        class DataCleaningWrapper(BaseEstimator, TransformerMixin):            
+            def __init__(self, cleaning_metadata):
+                self.cleaning_metadata = cleaning_metadata
+                # Extract which columns to keep
+                self.columns_to_keep = cleaning_metadata.get('column_names', [])
+                print(f"    DataCleaningWrapper initialized")
+                print(f"    Columns to keep: {len(self.columns_to_keep)}")
+                if self.columns_to_keep:
+                    print(f"    Column names: {self.columns_to_keep[:5]}{'...' if len(self.columns_to_keep) > 5 else ''}")
+            
+            def fit(self, X, y=None):
+                return self
+            
+            def transform(self, X):
+                print(f"    Data Cleaning: input shape {X.shape}")
+                print(f"    Input columns: {list(X.columns)[:5]}{'...' if len(X.columns) > 5 else ''}")
+                
+                if not self.columns_to_keep:
+                    print("     No column filtering metadata - passing through")
+                    return X
+                
+                # Check which columns are present
+                available_cols = set(X.columns)
+                required_cols = set(self.columns_to_keep)
+                
+                missing_cols = required_cols - available_cols
+                extra_cols = available_cols - required_cols
+                
+                if missing_cols:
+                    print(f"     Missing columns (will be filled with 0): {missing_cols}")
+                if extra_cols:
+                    print(f"     Extra columns (will be dropped): {extra_cols}")
+                
+                # Keep only the columns that were used in training (in same order)
+                result = X.reindex(columns=self.columns_to_keep, fill_value=0)
+                
+                print(f"    Data Cleaning: output shape {result.shape}")
+                return result
 
         class PreprocessorWrapper(BaseEstimator, TransformerMixin):            
             def __init__(self, preprocessor, target_column=None):
@@ -236,16 +276,13 @@ implementation:
                         if hasattr(estimator, 'predict_proba'):
                             try:
                                 probas[target_name] = estimator.predict_proba(X_arr)
-                            except AttributeError as e:
-                                print(f"  predict_proba not available for {target_name}: {e}")
-                                # Fallback: use decision_function if available
+                            except (AttributeError, ValueError) as e:
+                                print(f"     predict_proba failed for {target_name}: {e}")
                                 if hasattr(estimator, 'decision_function'):
                                     probas[target_name] = estimator.decision_function(X_arr)
-                                else:
-                                    raise AttributeError(f"Neither predict_proba nor decision_function available for {target_name}")
                     
                     if not probas:
-                        raise AttributeError("No models in dict support predict_proba")
+                        raise AttributeError("No models in dict support predict_proba or decision_function")
                     
                     return probas
                 else:
@@ -253,14 +290,12 @@ implementation:
                     if hasattr(self.model, 'predict_proba'):
                         try:
                             return self.model.predict_proba(X_arr)
-                        except AttributeError as e:
+                        except (AttributeError, ValueError) as e:
                             print(f"     predict_proba failed: {e}")
-                            # Fallback to decision_function
                             if hasattr(self.model, 'decision_function'):
                                 print("    Using decision_function as fallback")
                                 return self.model.decision_function(X_arr)
-                            else:
-                                raise AttributeError(f"Neither predict_proba nor decision_function available: {e}")
+                            raise
                     else:
                         raise AttributeError("Model does not support predict_proba")
 
@@ -381,7 +416,18 @@ implementation:
                 file_size = os.path.getsize(args.unified_pipeline)
                 print(f"✓ File size: {file_size / 1024 / 1024:.2f} MB")
 
-                # Save metadata
+                # Save metadata with training schema
+                training_schema = {}
+                if hasattr(preprocessor, 'global_metadata'):
+                    training_schema = {
+                        'feature_columns': preprocessor.global_metadata.get('feature_columns', []),
+                        'target_column': preprocessor.global_metadata.get('target_col', target_col),
+                        'categorical_columns': preprocessor.global_metadata.get('categorical_cols', []),
+                        'numeric_columns': preprocessor.global_metadata.get('numeric_cols', []),
+                        'n_features_in': len(preprocessor.global_metadata.get('feature_columns', [])),
+                        'n_features_out': preprocessor.global_metadata.get('n_features_out', None)
+                    }
+                
                 pipeline_meta = {
                     'created_at': datetime.utcnow().isoformat() + 'Z',
                     'model_type': args.model_type,
@@ -392,6 +438,8 @@ implementation:
                     'is_dict_model': isinstance(model, dict),
                     'n_targets': len(model) if isinstance(model, dict) else 1,
                     'file_size_mb': round(file_size / 1024 / 1024, 2),
+                    'training_schema': training_schema,
+                    'selected_features': feature_selector.selected_features if feature_selector and hasattr(feature_selector, 'selected_features') else None,
                     'original_metadata': metadata
                 }
 
@@ -402,8 +450,8 @@ implementation:
                 print("=" * 80)
                 print("SUCCESS: UNIFIED PIPELINE CREATED!")
                 print("=" * 80)
-                print(f" File: {args.unified_pipeline}")
-                print(f" Size: {file_size / 1024 / 1024:.2f} MB")
+                print(f"File: {args.unified_pipeline}")
+                print(f"Size: {file_size / 1024 / 1024:.2f} MB")
                 print(f"Flow: {' → '.join([n for n, _ in pipeline_steps])}")
                 print(" Usage:")
                 print("   import cloudpickle")
