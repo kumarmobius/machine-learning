@@ -1,4 +1,4 @@
-name: Stacking and Voting V9 Enhanced
+name: Stacking and Voting V10
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -123,7 +123,7 @@ implementation:
             CatBoostRegressor = None
       
         def load_parquet_df(path):
-            return pd.read_csv(path)
+            return pd.read_parquet(path) 
       
         def ensure_dir_for(p):
             d = os.path.dirname(p)
