@@ -1,4 +1,4 @@
-name: Update Schema Row v10
+name: Update Schema Row v9
 inputs:
   - { name: schema_id, type: String }
   - { name: schema_json, type: String, description: "JSON object or array of objects to insert" }
@@ -67,12 +67,10 @@ implementation:
         # Determine if single row or multiple rows
         if isinstance(schema_data, list):
             rows = schema_data
-            is_multiple_rows = len(rows) > 1
         else:
             rows = [schema_data]
-            is_multiple_rows = False
 
-        print(f"[INFO] Processing {len(rows)} row(s) - Multiple rows mode: {is_multiple_rows}")
+        print(f"[INFO] Processing {len(rows)} row(s)")
 
         # Process each row
         processed_rows = []
@@ -80,15 +78,10 @@ implementation:
             # Start with the data from schema_json
             processed_row = dict(row)
             
-            # Handle execution_id: increment for multiple rows, keep same for single row
-            if is_multiple_rows:
-                processed_row["execution_id"] = args.execution_id + idx
-                print(f"[DEBUG] Row {idx + 1}: execution_id incremented to {args.execution_id + idx}")
-            else:
-                processed_row["execution_id"] = args.execution_id
-                print(f"[DEBUG] Row {idx + 1}: execution_id kept as {args.execution_id}")
+            # Always add execution_id
+            processed_row["execution_id"] = args.execution_id
             
-            # Conditionally add other fields if they're not -1 (these remain the same for all rows)
+            # Conditionally add other fields if they're not -1
             if not should_skip(args.model_id):
                 processed_row["model_id"] = args.model_id
             
@@ -102,7 +95,7 @@ implementation:
                 processed_row["tenant_id"] = tenant_id_value
             
             processed_rows.append(processed_row)
-            print(f"[DEBUG] Row {idx + 1} final data: {json.dumps(processed_row, indent=2)}")
+            print(f"[DEBUG] Row {idx + 1}: {json.dumps(processed_row, indent=2)}")
 
         # Setup HTTP session with retry logic
         headers = {
