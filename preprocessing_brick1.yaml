@@ -1,4 +1,4 @@
-name: Data Cleaning v1.5
+name: Data Cleaning v1.6
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Target column(s), comma-separated for multi-output"}
@@ -40,8 +40,6 @@ implementation:
             return False
 
         def read_with_pandas(path):
-
-            
             path = str(path)
             # if directory: prefer files with known dataset extensions, else fallback to largest file
             if os.path.isdir(path):
@@ -225,13 +223,65 @@ implementation:
                     report['skipped'].append({'col':col,'parsable_fraction':frac})
             return df, report
 
-        def detect_and_extract_dates(df, exclude_cols=None):
+        def _get_date_granularity(dt_series, col_name):
+            col_lower = col_name.lower()
+            
+            # Check if it has time information (not all midnight)
+            valid_dates = dt_series.dropna()
+            if len(valid_dates) > 0:
+                has_time = (valid_dates.dt.hour != 0).any() or (valid_dates.dt.minute != 0).any()
+                if has_time:
+                    return 3  # timestamp with time
+                
+                # Check if day varies (date level) vs all same day (month level)
+                has_day_variation = valid_dates.dt.day.nunique() > 1
+                if has_day_variation:
+                    return 2  # date level
+                else:
+                    return 1  # month level only
+            
+            # Fallback to name-based heuristic
+            if 'timestamp' in col_lower or 'datetime' in col_lower:
+                return 3
+            elif 'date' in col_lower:
+                return 2
+            elif 'month' in col_lower or 'year' in col_lower:
+                return 1
+            
+            return 2  # default to date level
+
+        def _are_dates_duplicate(dt1, dt2):
+            # Align by index
+            valid_mask = dt1.notna() & dt2.notna()
+            if valid_mask.sum() == 0:
+                return False
+            
+            dt1_valid = dt1[valid_mask]
+            dt2_valid = dt2[valid_mask]
+            
+            # Compare year, month, day - consider them duplicates if at least 95% match
+            match_rate = (
+                (dt1_valid.dt.year == dt2_valid.dt.year) &
+                (dt1_valid.dt.month == dt2_valid.dt.month) &
+                (dt1_valid.dt.day == dt2_valid.dt.day)
+            ).mean()
+            
+            return match_rate >= 0.95
+
+        def detect_and_deduplicate_dates(df, exclude_cols=None):
             df = df.copy()
-            report = {'date_columns': [], 'skipped': [], 'patterns_found': {}}
+            report = {
+                'date_columns': [], 
+                'skipped': [], 
+                'duplicate_dates_dropped': [],
+                'patterns_found': {}
+            }
             exclude_cols = set(exclude_cols or [])
             cand = [c for c in df.columns if c not in exclude_cols and 
                     (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
             
+            # Step 1: Parse all candidate date columns
+            parsed_dates = {}
             for col in cand:
                 ser = df[col].astype(object)
                 sample = ser.dropna().astype(str).head(500)
@@ -248,35 +298,100 @@ implementation:
                     try:
                         full = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True)
                         
-                        # CRITICAL FIX: Check if conversion actually resulted in datetime dtype
                         if not pd.api.types.is_datetime64_any_dtype(full):
                             report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': 'conversion_failed'})
                             continue
                         
-                        # Also check if we have any valid dates
                         if full.notna().sum() == 0:
                             report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': 'no_valid_dates'})
                             continue
                         
-                        df[col + "_orig"] = df[col]
-                        df[col] = full
-                        df[col + "_year"] = df[col].dt.year.astype('Int64')
-                        df[col + "_month"] = df[col].dt.month.astype('Int64')
-                        df[col + "_day"] = df[col].dt.day.astype('Int64')
-                        df[col + "_dayofweek"] = df[col].dt.dayofweek.astype('Int64')
-                        df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
-                        df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
-                        df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
-                        df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
-                        df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
-                        df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
-                        df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                        parsed_dates[col] = {
+                            'datetime': full,
+                            'parsable_fraction': frac,
+                            'granularity': _get_date_granularity(full, col)
+                        }
                         
-                        report['date_columns'].append({'col': col, 'parsable_fraction': frac})
-                        print(f"[INFO] Detected datetime in '{col}' ({frac*100:.1f}% valid)")
                     except Exception as e:
                         report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': str(e)})
                         continue
+            
+            if not parsed_dates:
+                return df, report
+            
+            # Step 2: Group duplicate date columns (same date values)
+            date_groups = []
+            processed = set()
+            
+            for col1 in parsed_dates.keys():
+                if col1 in processed:
+                    continue
+                
+                group = [col1]
+                dt1 = parsed_dates[col1]['datetime']
+                
+                for col2 in parsed_dates.keys():
+                    if col2 == col1 or col2 in processed:
+                        continue
+                    
+                    dt2 = parsed_dates[col2]['datetime']
+                    
+                    # Check if dates are identical (same year, month, day)
+                    if _are_dates_duplicate(dt1, dt2):
+                        group.append(col2)
+                        processed.add(col2)
+                
+                processed.add(col1)
+                date_groups.append(group)
+            
+            # Step 3: For each group, keep the best column and drop others
+            cols_to_drop = []
+            for group in date_groups:
+                if len(group) > 1:
+                    # Sort by granularity (higher = more detailed)
+                    best_col = max(group, key=lambda c: parsed_dates[c]['granularity'])
+                    duplicates = [c for c in group if c != best_col]
+                    cols_to_drop.extend(duplicates)
+                    
+                    report['duplicate_dates_dropped'].append({
+                        'kept': best_col,
+                        'dropped': duplicates,
+                        'reason': 'identical_date_values'
+                    })
+                    print(f"[INFO] Date deduplication: keeping '{best_col}', dropping {duplicates}")
+            
+            # Drop duplicate date columns from dataframe
+            if cols_to_drop:
+                df = df.drop(columns=cols_to_drop)
+                # Also remove from parsed_dates so we don't process them
+                for col in cols_to_drop:
+                    del parsed_dates[col]
+            
+            # Step 4: Extract features from remaining unique date columns
+            for col, data in parsed_dates.items():
+                full = data['datetime']
+                frac = data['parsable_fraction']
+                
+                try:
+                    df[col + "_orig"] = df[col]
+                    df[col] = full
+                    df[col + "_year"] = df[col].dt.year.astype('Int64')
+                    df[col + "_month"] = df[col].dt.month.astype('Int64')
+                    df[col + "_day"] = df[col].dt.day.astype('Int64')
+                    df[col + "_dayofweek"] = df[col].dt.dayofweek.astype('Int64')
+                    df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
+                    df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
+                    df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
+                    df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
+                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                    
+                    report['date_columns'].append({'col': col, 'parsable_fraction': frac})
+                    print(f"[INFO] Detected datetime in '{col}' ({frac*100:.1f}% valid)")
+                except Exception as e:
+                    report['skipped'].append({'col': col, 'parsable_fraction': frac, 'reason': str(e)})
+                    continue
 
             return df, report
 
@@ -296,7 +411,7 @@ implementation:
 
         try:
             print("="*80)
-            print("BRICK 1: DATA CLEANING")
+            print("BRICK 1: DATA CLEANING v1.6 (with date deduplication)")
             print("="*80)
             
             target_cols = [t.strip() for t in args.target_column.split(',')] if ',' in args.target_column else [args.target_column.strip()]
@@ -378,10 +493,12 @@ implementation:
             )
             print(f"[INFO] Converted {len(conv_report['converted'])} columns")
             
-            # Extract dates
-            print(f"[STEP 8/10] Extracting date features...")
-            X_dates, date_report = detect_and_extract_dates(X_conv, exclude_cols=target_cols)
-            print(f"[INFO] Detected {len(date_report['date_columns'])} date columns")
+            # Extract dates with deduplication
+            print(f"[STEP 8/10] Extracting date features (with deduplication)...")
+            X_dates, date_report = detect_and_deduplicate_dates(X_conv, exclude_cols=target_cols)
+            print(f"[INFO] Detected {len(date_report['date_columns'])} unique date columns")
+            if date_report['duplicate_dates_dropped']:
+                print(f"[INFO] Removed {sum(len(d['dropped']) for d in date_report['duplicate_dates_dropped'])} duplicate date columns")
             
             # Drop _orig columns
             cols_orig = [c for c in X_dates.columns if c.endswith('_orig')]
@@ -408,6 +525,7 @@ implementation:
             
             metadata = {
                 'timestamp': datetime.utcnow().isoformat()+'Z',
+                'version': '1.6',
                 'target_columns': target_cols,
                 'n_targets': len(target_cols),
                 'original_shape': {'rows': before, 'cols': len(df.columns)},
