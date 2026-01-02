@@ -1,16 +1,17 @@
-name: Evaluate Model v14.5
+name: Evaluate Model v15.0
 inputs:
-  - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed) containing both features and target"}
-  - {name: target_column, type: String, description: "Target column in y_test if multi-column", optional: true, default: ""}
-  - {name: preprocessor, type: Data, description: "Path to saved Preprocessor (cloudpickle or joblib). .gz supported"}
-  - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector (cloudpickle or joblib). Optional", optional: true}
-  - {name: pca, type: Data, description: "Path to saved PCA / dimensionality transformer (joblib/cloudpickle). Optional. If provided, PCA.transform will be applied AFTER preprocessing (and after feature selection if provided).", optional: true}
-  - {name: model_pickle, type: Model, description: "Path to saved model (joblib/pickle)"}
+  - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
+  - {name: target_column, type: String, description: "Target column name"}
+  - {name: cleaning_metadata, type: Data, description: "JSON metadata from Data Cleaning brick"}  # NEW INPUT
+  - {name: preprocessor, type: Data, description: "Path to saved Preprocessor"}
+  - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector", optional: true}
+  - {name: pca, type: Data, description: "Path to saved PCA transformer", optional: true}
+  - {name: model_pickle, type: Model, description: "Path to saved model"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
-  - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time containing label_mapping for classification", optional: true}
+  - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time", optional: true}
 outputs:
-  - {name: metrics_json, type: String, description: "Evaluation metrics JSON (minimal fields)"}
-  - {name: predictions, type: String, description: "Parquet with y_true and y_pred (and proba if available)"}
+  - {name: metrics_json, type: String, description: "Evaluation metrics JSON"}
+  - {name: predictions, type: String, description: "Parquet with predictions"}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:vtest4
@@ -19,77 +20,273 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, io, gzip, zipfile, traceback, numbers, logging
-        import pandas as pd, numpy as np, joblib, cloudpickle
+        import argparse, os, sys, json, io, gzip, zipfile, traceback, re
+        import pandas as pd, numpy as np, joblib, cloudpickle, logging
         from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, 
-                                      r2_score, mean_squared_error, mean_absolute_error, 
-                                      confusion_matrix, roc_auc_score)
-        from scipy import stats
+                                      r2_score, mean_squared_error, confusion_matrix)
         from datetime import datetime
 
-        # Setup Logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         logger = logging.getLogger(__name__)
 
-        def is_likely_json(sample_bytes):
-            if not sample_bytes: return False
-            try: txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
-            except Exception: return False
-            if not txt: return False
-            if txt[0] in ("{","["): return True
-            if "{" in txt or "[" in txt: return True
-            return False
+        # ============================================
+        # DATA CLEANING FUNCTIONS (replicate from cleaning brick)
+        # ============================================
+        
+        def detect_and_deduplicate_dates(df, exclude_cols=None):
+            df = df.copy()
+            report = {'date_columns': [], 'skipped': [], 'duplicate_dates_dropped': []}
+            exclude_cols = set(exclude_cols or [])
+            cand = [c for c in df.columns if c not in exclude_cols and 
+                    (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
+            
+            # Parse all date columns
+            parsed_dates = {}
+            for col in cand:
+                ser = df[col].astype(object)
+                sample = ser.dropna().astype(str).head(500)
+                if sample.empty: 
+                    continue
+                
+                try:
+                    parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True)
+                    frac = parsed.notna().mean()
+                except Exception:
+                    continue
+                
+                if frac >= 0.6:
+                    try:
+                        full = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True)
+                        
+                        if not pd.api.types.is_datetime64_any_dtype(full):
+                            continue
+                        if full.notna().sum() == 0:
+                            continue
+                        
+                        parsed_dates[col] = {
+                            'datetime': full,
+                            'parsable_fraction': frac,
+                            'granularity': _get_date_granularity(full, col)
+                        }
+                    except Exception:
+                        continue
+            
+            if not parsed_dates:
+                return df, report
+            
+            # Group duplicates
+            date_groups = []
+            processed = set()
+            
+            for col1 in parsed_dates.keys():
+                if col1 in processed:
+                    continue
+                group = [col1]
+                dt1 = parsed_dates[col1]['datetime']
+                
+                for col2 in parsed_dates.keys():
+                    if col2 == col1 or col2 in processed:
+                        continue
+                    dt2 = parsed_dates[col2]['datetime']
+                    if _are_dates_duplicate(dt1, dt2):
+                        group.append(col2)
+                        processed.add(col2)
+                
+                processed.add(col1)
+                date_groups.append(group)
+            
+            # Keep best from each group
+            cols_to_drop = []
+            for group in date_groups:
+                if len(group) > 1:
+                    best_col = max(group, key=lambda c: parsed_dates[c]['granularity'])
+                    duplicates = [c for c in group if c != best_col]
+                    cols_to_drop.extend(duplicates)
+                    report['duplicate_dates_dropped'].append({
+                        'kept': best_col,
+                        'dropped': duplicates
+                    })
+                    logger.info(f"Keeping '{best_col}', dropping {duplicates}")
+            
+            if cols_to_drop:
+                df = df.drop(columns=cols_to_drop)
+                for col in cols_to_drop:
+                    del parsed_dates[col]
+            
+            # Extract date features
+            for col, data in parsed_dates.items():
+                full = data['datetime']
+                try:
+                    df[col + "_orig"] = df[col]
+                    df[col] = full
+                    df[col + "_year"] = df[col].dt.year.astype('Int64')
+                    df[col + "_month"] = df[col].dt.month.astype('Int64')
+                    df[col + "_day"] = df[col].dt.day.astype('Int64')
+                    df[col + "_dayofweek"] = df[col].dt.dayofweek.astype('Int64')
+                    df[col + "_quarter"] = df[col].dt.quarter.astype('Int64')
+                    df[col + "_month_sin"] = np.sin(2 * np.pi * df[col].dt.month / 12)
+                    df[col + "_month_cos"] = np.cos(2 * np.pi * df[col].dt.month / 12)
+                    df[col + "_day_sin"] = np.sin(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_day_cos"] = np.cos(2 * np.pi * df[col].dt.dayofweek / 7)
+                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype('Int64')
+                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                    report['date_columns'].append({'col': col})
+                    logger.info(f"Extracted features from '{col}'")
+                except Exception as e:
+                    logger.warning(f"Failed to extract from '{col}': {e}")
+            
+            return df, report
 
+        def _get_date_granularity(dt_series, col_name):
+            valid_dates = dt_series.dropna()
+            if len(valid_dates) > 0:
+                has_time = (valid_dates.dt.hour != 0).any() or (valid_dates.dt.minute != 0).any()
+                if has_time:
+                    return 3
+                has_day_variation = valid_dates.dt.day.nunique() > 1
+                return 2 if has_day_variation else 1
+            col_lower = col_name.lower()
+            if 'timestamp' in col_lower:
+                return 3
+            elif 'date' in col_lower:
+                return 2
+            return 1
+
+        def _are_dates_duplicate(dt1, dt2):
+            valid_mask = dt1.notna() & dt2.notna()
+            if valid_mask.sum() == 0:
+                return False
+            dt1_valid = dt1[valid_mask]
+            dt2_valid = dt2[valid_mask]
+            match_rate = (
+                (dt1_valid.dt.year == dt2_valid.dt.year) &
+                (dt1_valid.dt.month == dt2_valid.dt.month) &
+                (dt1_valid.dt.day == dt2_valid.dt.day)
+            ).mean()
+            return match_rate >= 0.95
+
+        def convert_object_columns_advanced(df, detect_threshold=0.6):
+            df = df.copy()
+            report = {'converted': [], 'skipped': []}
+            
+            CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
+            
+            def parse_alphanumeric_to_numeric(s):
+                if pd.isna(s):
+                    return np.nan
+                orig = str(s).strip()
+                if orig == '' or orig.lower() in {'nan', 'none', 'null', 'na'}:
+                    return np.nan
+                tmp = re.sub(CURRENCY_SYMBOLS_REGEX, '', orig)
+                if tmp.strip().endswith('%'):
+                    try:
+                        return float(tmp.strip().rstrip('%').replace(',', '').replace(' ', '')) / 100.0
+                    except Exception:
+                        pass
+                tmp = tmp.replace(',', '').replace(' ', '')
+                try:
+                    return float(tmp)
+                except Exception:
+                    return np.nan
+            
+            obj_cols = [c for c in df.columns if df[c].dtype == 'object' or str(df[c].dtype).startswith('string')]
+            
+            for col in obj_cols:
+                ser = df[col].astype(object)
+                total_non_null = ser.notna().sum()
+                if total_non_null == 0:
+                    continue
+                
+                parsed = ser.map(parse_alphanumeric_to_numeric)
+                frac = parsed.notna().sum() / float(total_non_null)
+                
+                if frac >= detect_threshold:
+                    df[col + "_orig"] = df[col]
+                    df[col] = parsed
+                    report['converted'].append({'col': col, 'parsable_fraction': frac})
+            
+            return df, report
+
+        def apply_cleaning_to_test(test_df, target_col, cleaning_meta):
+            logger.info("=" * 80)
+            logger.info("APPLYING DATA CLEANING TO TEST DATA")
+            logger.info("=" * 80)
+            
+            df = test_df.copy()
+            target_cols = [target_col] if isinstance(target_col, str) else target_col
+            
+            # Separate target
+            y = df[target_cols].copy()
+            X = df.drop(columns=target_cols)
+            logger.info(f"Original X shape: {X.shape}")
+            
+            # Get expected final columns from training
+            expected_cols = set(cleaning_meta.get('column_names', []))
+            logger.info(f"Expected {len(expected_cols)} columns from training")
+            
+            # Step 1: Detect and deduplicate dates
+            logger.info("Step 1: Detecting and deduplicating date columns...")
+            X, date_report = detect_and_deduplicate_dates(X, exclude_cols=target_cols)
+            
+            if date_report['duplicate_dates_dropped']:
+                for dup in date_report['duplicate_dates_dropped']:
+                    logger.info(f"  Kept: {dup['kept']}, Dropped: {dup['dropped']}")
+            
+            # Step 2: Convert object to numeric
+            logger.info("Step 2: Converting object columns to numeric...")
+            X, conv_report = convert_object_columns_advanced(X, detect_threshold=0.6)
+            logger.info(f"  Converted {len(conv_report['converted'])} columns")
+            
+            # Step 3: Drop _orig columns
+            orig_cols = [c for c in X.columns if c.endswith('_orig')]
+            if orig_cols:
+                X = X.drop(columns=orig_cols)
+                logger.info(f"Step 3: Dropped {len(orig_cols)} _orig columns")
+            
+            # Step 4: Align with training columns
+            logger.info("Step 4: Aligning with training columns...")
+            current_cols = set(X.columns)
+            missing_cols = expected_cols - current_cols
+            extra_cols = current_cols - expected_cols
+            
+            if missing_cols:
+                logger.warning(f"  Missing {len(missing_cols)} columns, adding with zeros:")
+                logger.warning(f"    {list(missing_cols)[:5]}...")
+                for col in missing_cols:
+                    X[col] = 0.0
+            
+            if extra_cols:
+                logger.warning(f"  Extra {len(extra_cols)} columns, dropping:")
+                logger.warning(f"    {list(extra_cols)[:5]}...")
+                X = X.drop(columns=list(extra_cols))
+            
+            # Reorder to match training
+            X = X[list(expected_cols)]
+            
+            logger.info(f"Final cleaned X shape: {X.shape}")
+            logger.info("=" * 80)
+            
+            return X, y
+
+        # ============================================
+        # HELPER FUNCTIONS
+        # ============================================
+        
         def read_with_pandas(path):
+            # (same as your existing read_with_pandas function)
             if os.path.isdir(path):
                 entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
                 files=[p for p in entries if os.path.isfile(p)]
-                if not files: raise ValueError("No files in dir: "+path)
                 path = max(files, key=lambda p: os.path.getsize(p))
-                logger.info(f"Directory input. Picked file: {path}")
             ext=os.path.splitext(path)[1].lower()
-            if ext==".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
-                try:
-                    with gzip.open(path,"rt",encoding="utf-8",errors="ignore") as fh:
-                        sample=fh.read(8192); fh.seek(0)
-                        if is_likely_json(sample.encode() if isinstance(sample,str) else sample):
-                            fh.seek(0)
-                            try: return pd.read_json(fh, lines=True)
-                            except Exception: fh.seek(0); return pd.read_csv(fh)
-                        fh.seek(0); return pd.read_csv(fh)
-                except Exception: pass
-            if ext==".zip":
-                with zipfile.ZipFile(path,"r") as z:
-                    members=[n for n in z.namelist() if not n.endswith("/")]
-                    member=max(members, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
-                    with z.open(member) as fh:
-                        sample=fh.read(8192)
-                        if is_likely_json(sample):
-                            with z.open(member) as fh2:
-                                return pd.read_json(io.TextIOWrapper(fh2,encoding="utf-8"), lines=True)
-                        else:
-                            with z.open(member) as fh2:
-                                return pd.read_csv(io.TextIOWrapper(fh2,encoding="utf-8"))
+            if ext in (".parquet", ".pq"):
+                return pd.read_parquet(path)
+            if ext == ".csv":
+                return pd.read_csv(path)
             try:
-                if ext==".csv": return pd.read_csv(path)
-                if ext in (".tsv",".tab"): return pd.read_csv(path, sep="\t")
-                if ext in (".json",".ndjson",".jsonl"):
-                    try: return pd.read_json(path, lines=True)
-                    except ValueError: return pd.read_json(path)
-                if ext in (".xls",".xlsx"): return pd.read_excel(path)
-                if ext in (".parquet",".pq"): return pd.read_parquet(path, engine="auto")
-                if ext==".feather": return pd.read_feather(path)
-                if ext==".orc": return pd.read_orc(path)
-            except Exception: pass
-            try: return pd.read_parquet(path, engine="auto")
-            except Exception: pass
-            try: return pd.read_csv(path)
-            except Exception: pass
-            raise ValueError("Unsupported format: " + path)
+                return pd.read_parquet(path)
+            except Exception:
+                return pd.read_csv(path)
 
         def ensure_dir_for(p):
             d=os.path.dirname(p)
@@ -97,542 +294,181 @@ implementation:
                 os.makedirs(d, exist_ok=True)
 
         def load_pickle_any(path):
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"File not found: {path}")
-            
-            # Try gzipped cloudpickle
             try:
                 with gzip.open(path, "rb") as f:
-                    obj = cloudpickle.load(f)
-                    logger.debug(f"Loaded {path} using gzipped cloudpickle")
-                    return obj
+                    return cloudpickle.load(f)
             except Exception:
                 pass
-            
-            # Try regular cloudpickle
             try:
                 with open(path, "rb") as f:
-                    obj = cloudpickle.load(f)
-                    logger.debug(f"Loaded {path} using cloudpickle")
-                    return obj
+                    return cloudpickle.load(f)
             except Exception:
                 pass
-            
-            # Try joblib
-            try:
-                obj = joblib.load(path)
-                logger.debug(f"Loaded {path} using joblib")
-                return obj
-            except Exception as e:
-                raise ValueError(f"Could not load pickle from {path}: {e}")
+            return joblib.load(path)
 
-        #fadfF
-        def fix_knn_targets(model):
-            from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
-            from sklearn.ensemble import VotingRegressor, VotingClassifier
-            
-            fixed_count = 0
-            
-            def fix_estimator(est, name=""):
-                nonlocal fixed_count
-                if isinstance(est, (KNeighborsRegressor, KNeighborsClassifier)):
-                    if hasattr(est, '_y') and est._y is not None:
-                        try:
-                            if hasattr(est._y, 'dtype'):
-                                if est._y.dtype == object or (est._y.dtype.kind in ('U', 'S', 'O')):
-                                    logger.info(f"Fixing {name} KNN targets from {est._y.dtype} to numeric")
-                                    if est._y.ndim == 1:
-                                        est._y = pd.to_numeric(pd.Series(est._y), errors='coerce').fillna(0).values.astype(np.float64)
-                                    else:
-                                        est._y = np.array([[float(val) if isinstance(val, (int, float, str)) else 0.0 for val in row] for row in est._y], dtype=np.float64)
-                                    logger.info(f"Successfully converted KNN targets to {est._y.dtype}")
-                                    fixed_count += 1
-                            elif isinstance(est._y, (list, tuple)):
-                                logger.info(f"Fixing {name} KNN targets from list/tuple to numeric")
-                                est._y = np.array([float(x) if isinstance(x, (int, float, str)) else 0.0 for x in est._y], dtype=np.float64)
-                                logger.info(f"Successfully converted KNN targets to {est._y.dtype}")
-                                fixed_count += 1
-                        except Exception as e:
-                            logger.warning(f"Could not fix KNN targets for {name}: {e}")
-                elif isinstance(est, (VotingRegressor, VotingClassifier)):
-                    logger.info(f"Checking VotingRegressor/Classifier: {name}")
-                    if hasattr(est, 'estimators_'):
-                        for idx, sub_est in enumerate(est.estimators_):
-                            estimator_name = f"estimator_{idx}"
-                            if hasattr(est, 'named_estimators_'):
-                                try:
-                                    estimator_name = list(est.named_estimators_.keys())[idx]
-                                except Exception:
-                                    pass
-                            fix_estimator(sub_est, f"{name}.{estimator_name}")
-                    elif hasattr(est, 'estimators'):
-                        for estimator_name, sub_est in est.estimators:
-                            fix_estimator(sub_est, f"{name}.{estimator_name}")
-                return est
-            
-            if isinstance(model, dict):
-                for key in model:
-                    logger.info(f"Checking model dict key: {key}")
-                    model[key] = fix_estimator(model[key], key)
-            else:
-                model = fix_estimator(model, "model")
-            
-            if fixed_count > 0:
-                logger.info(f"Fixed {fixed_count} KNN estimator(s)")
-            else:
-                logger.info("No KNN target fixes needed")
-            
-            return model
-
+        # ============================================
+        # MAIN FUNCTION
+        # ============================================
+        
         def main():
-            parser = argparse.ArgumentParser(description="Evaluate Model v14.2 - Production")
+            parser = argparse.ArgumentParser()
             parser.add_argument("--test_data", type=str, required=True)
-            parser.add_argument("--target_column", type=str, default="")
+            parser.add_argument("--target_column", type=str, required=True)
+            parser.add_argument("--cleaning_metadata", type=str, required=True)  # NEW
             parser.add_argument("--preprocessor", type=str, required=True)
-            parser.add_argument("--feature_selector", type=str, required=False, default="")
-            parser.add_argument("--pca", type=str, required=False, default="")
+            parser.add_argument("--feature_selector", type=str, default="")
+            parser.add_argument("--pca", type=str, default="")
             parser.add_argument("--model_pickle", type=str, required=True)
             parser.add_argument("--model_type", type=str, default="classification")
-            parser.add_argument("--preprocess_metadata", type=str, required=False, default="")
+            parser.add_argument("--preprocess_metadata", type=str, default="")
             parser.add_argument("--metrics_json", type=str, required=True)
             parser.add_argument("--predictions", type=str, required=True)
             args = parser.parse_args()
 
             try:
                 logger.info("=" * 80)
-                logger.info("EVALUATION STARTED - Production v14.2")
+                logger.info("EVALUATION STARTED - v15.0 with Cleaning")
                 logger.info("=" * 80)
 
-                task = str(args.model_type).strip().lower()
-                target_col = str(args.target_column or "").strip()
+                task = args.model_type.strip().lower()
+                target_col = args.target_column.strip()
                 
-                logger.info(f"Task: {task}")
-                logger.info(f"Test data: {args.test_data}")
-                logger.info(f"Target column: {target_col if target_col else '(must be provided)'}")
-
+                # Load cleaning metadata
+                logger.info("Loading cleaning metadata...")
+                with open(args.cleaning_metadata, 'r') as f:
+                    cleaning_meta = json.load(f)
+                logger.info(f"  Expected columns: {len(cleaning_meta.get('column_names', []))}")
+                
+                # Load test data (RAW)
+                logger.info("Loading raw test data...")
+                test_df_raw = read_with_pandas(args.test_data)
+                logger.info(f"  Raw shape: {test_df_raw.shape}")
+                
+                # Apply cleaning transformations
+                X_cleaned, y = apply_cleaning_to_test(test_df_raw, target_col, cleaning_meta)
+                
                 # Load preprocessor
                 logger.info("Loading preprocessor...")
                 pre = load_pickle_any(args.preprocessor)
-                logger.info("Preprocessor loaded successfully")
-
+                
                 # Load feature selector
                 fs = None
                 if args.feature_selector and os.path.exists(args.feature_selector):
                     logger.info("Loading feature selector...")
                     fs = load_pickle_any(args.feature_selector)
-                    logger.info("Feature selector loaded")
-                else:
-                    logger.info("No feature selector provided")
-
-                # Load PCA with proper None/empty checks
-                logger.info("Checking PCA artifact...")
+                
+                # Load PCA
                 pca_obj = None
-                if args.pca:
-                    if os.path.exists(args.pca):
-                        file_size = os.path.getsize(args.pca)
-                        if file_size == 0:
-                            logger.info("PCA file is empty (0 bytes) - skipping PCA")
-                        else:
-                            try:
-                                logger.info(f"Loading PCA ({file_size} bytes)...")
-                                pca_obj = load_pickle_any(args.pca)
-                                if pca_obj is None:
-                                    logger.info("PCA loaded but is None - skipping PCA")
-                                else:
-                                    logger.info(f"PCA loaded: {type(pca_obj)}")
-                            except Exception as e:
-                                logger.warning(f"Failed to load PCA: {e}")
-                    else:
-                        logger.info("PCA path provided but file doesn't exist")
-                else:
-                    logger.info("No PCA path provided")
-
+                if args.pca and os.path.exists(args.pca):
+                    size = os.path.getsize(args.pca)
+                    if size > 0:
+                        try:
+                            pca_obj = load_pickle_any(args.pca)
+                            if pca_obj is not None:
+                                logger.info(f"PCA loaded: {type(pca_obj)}")
+                        except Exception as e:
+                            logger.warning(f"PCA load failed: {e}")
+                
                 # Load model
                 logger.info("Loading model...")
-                try:
-                    model = joblib.load(args.model_pickle)
-                except Exception:
-                    model = load_pickle_any(args.model_pickle)
-                logger.info(f"Model loaded: {type(model)}")
-
-                # FIX: Apply KNN target fix
-                logger.info("=" * 80)
-                logger.info("CHECKING AND FIXING MODEL TARGETS")
-                logger.info("=" * 80)
-                model = fix_knn_targets(model)
-                logger.info("=" * 80)
-
-                model_name_str = None
-                try:
-                    model_name_str = (getattr(model, "name", None) or 
-                                    getattr(model, "model_name", None) or 
-                                    model.__class__.__name__)
-                except Exception:
-                    model_name_str = str(type(model))
-
-                # Load test data
-                logger.info("Loading test data...")
-                test_df = read_with_pandas(args.test_data)
-                logger.info(f"Test data shape: {test_df.shape}")
-                logger.info(f"Columns: {list(test_df.columns)[:10]}{'...' if len(test_df.columns)>10 else ''}")
+                model = load_pickle_any(args.model_pickle)
+                logger.info(f"  Model type: {type(model)}")
                 
-                if not target_col:
-                    raise ValueError("--target_column is required")
-
-                # Split features and target
-                y_raw, y_multi_df, y, X_raw = None, None, None, None
-                
-                if ',' in target_col:
-                    target_cols = [c.strip() for c in target_col.split(',')]
-                    missing = [c for c in target_cols if c not in test_df.columns]
-                    if missing:
-                        raise ValueError(f"Target columns {missing} not found")
-                    y_multi_df = test_df[target_cols].copy()
-                    y = y_multi_df
-                    X_raw = test_df.drop(columns=target_cols)
-                    logger.info(f"Multi-target: {len(target_cols)} targets")
-                else:
-                    if target_col not in test_df.columns:
-                        raise ValueError(f"Target '{target_col}' not found")
-                    y_raw = test_df[target_col].copy()
-                    # Ensure target is numeric for regression
-                    if task == "regression":
-                        y_raw = pd.to_numeric(y_raw, errors='coerce')
-                        logger.info(f"Target converted to numeric: {y_raw.dtype}")
-                    y = y_raw
-                    X_raw = test_df.drop(columns=[target_col])
-                    logger.info(f"Single target: {target_col}")
-                
-                if len(y) == 0:
-                    raise ValueError("Test data has 0 rows")
-                
-                logger.info(f"X_raw shape: {X_raw.shape}")
-
-                # Load metadata
-                label_mapping = None
-                if args.preprocess_metadata and os.path.exists(args.preprocess_metadata):
-                    try:
-                        with open(args.preprocess_metadata, "r") as f:
-                            meta = json.load(f)
-                        label_mapping = meta.get("label_mapping")
-                        if label_mapping:
-                            logger.info(f"Label mapping loaded: {label_mapping}")
-                    except Exception as e:
-                        logger.warning(f"Could not read metadata: {e}")
-
                 # Reconstruct for preprocessing
                 logger.info("=" * 80)
                 logger.info("PREPROCESSING")
                 logger.info("=" * 80)
                 
-                try:
-                    target_col_name = pre.global_metadata.get('target_col', target_col)
-                    if not target_col_name:
-                        target_col_name = target_col if target_col else 'target'
-                except Exception:
-                    target_col_name = target_col if target_col else 'target'
+                # Add target back temporarily
+                test_full = X_cleaned.copy()
+                test_full[target_col] = y.values
                 
-                logger.info(f"Target column for preprocessing: {target_col_name}")
-
-                test_full = X_raw.copy()
-                if y_raw is not None:
-                    test_full[target_col_name] = y_raw.values
-                    logger.info(f"Added target column '{target_col_name}'")
-                
-                logger.info(f"Reconstructed test_full shape: {test_full.shape}")
-
                 # Apply preprocessor
                 logger.info("Applying preprocessor...")
-                try:
-                    Xp_full = pre.transform(test_full, training_mode=False)
-                except TypeError:
-                    Xp_full = pre.transform(test_full)
+                Xp_full = pre.transform(test_full, training_mode=False) if hasattr(pre.transform, '__code__') and 'training_mode' in pre.transform.__code__.co_varnames else pre.transform(test_full)
                 
-                logger.info(f"After preprocessing: {getattr(Xp_full, 'shape', 'unknown')}")
+                if isinstance(Xp_full, pd.DataFrame):
+                    Xp = Xp_full.drop(columns=[target_col], errors='ignore')
+                else:
+                    Xp = pd.DataFrame(Xp_full)
                 
-                if isinstance(Xp_full, (pd.DataFrame, pd.Series)):
-                    Xp_df = Xp_full.copy()
-                else:
-                    try:
-                        cols = (getattr(pre, "feature_names_out", None) or 
-                               getattr(pre, "output_columns", None) or
-                               [f"f{i}" for i in range(Xp_full.shape[1])])
-                        Xp_df = pd.DataFrame(Xp_full, columns=list(cols))
-                    except Exception:
-                        Xp_df = pd.DataFrame(Xp_full)
-
-                if target_col_name in Xp_df.columns:
-                    logger.info(f"Removing target '{target_col_name}' from features")
-                    Xp = Xp_df.drop(columns=[target_col_name])
-                else:
-                    Xp = Xp_df
-
-                logger.info(f"Final Xp shape: {Xp.shape}")
-
+                logger.info(f"  After preprocessing: {Xp.shape}")
+                
                 # Apply feature selector
                 if fs is not None:
                     logger.info("Applying feature selector...")
                     if hasattr(fs, "selected_features"):
-                        want_cols = list(fs.selected_features)
-                        logger.info(f"Selecting {len(want_cols)} features")
-                        Xs = Xp.reindex(columns=want_cols, fill_value=0.0)
+                        Xs = Xp.reindex(columns=list(fs.selected_features), fill_value=0.0)
                     else:
                         Xs = fs.transform(Xp)
-                    logger.info(f"After feature selection: {Xs.shape}")
+                    logger.info(f"  After selection: {Xs.shape}")
                 else:
                     Xs = Xp
-
-                # Apply PCA only if pca_obj is not None
+                
+                # Apply PCA
                 if pca_obj is not None:
-                    logger.info("=" * 80)
-                    logger.info("APPLYING PCA TRANSFORMATION")
-                    logger.info("=" * 80)
-                    
-                    try:
-                        # Extract transformer from Pipeline if needed
-                        from sklearn.pipeline import Pipeline
-                        if isinstance(pca_obj, Pipeline):
-                            logger.info("Extracting transformer from Pipeline...")
-                            pca_transformer = None
-                            for nm, step in reversed(pca_obj.steps):
-                                if hasattr(step, "transform"):
-                                    pca_transformer = step
-                                    logger.info(f"Using step '{nm}': {type(step)}")
-                                    break
-                            if not pca_transformer:
-                                pca_transformer = pca_obj
-                        else:
-                            pca_transformer = pca_obj
-                        
-                        if not hasattr(pca_transformer, "transform"):
-                            logger.warning("PCA has no transform() - skipping")
-                        else:
-                            logger.info(f"Applying PCA: {type(pca_transformer)}")
-                            Xs_arr = Xs.values if isinstance(Xs, pd.DataFrame) else np.asarray(Xs)
-                            logger.info(f"Input to PCA: {Xs_arr.shape}")
-                            
-                            Xs_pca = pca_transformer.transform(Xs_arr)
-                            logger.info(f"Output from PCA: {Xs_pca.shape}")
-                            
-                            if Xs_pca.ndim == 1:
-                                Xs_pca = Xs_pca.reshape(-1, 1)
-                            
-                            ncomp = Xs_pca.shape[1]
-                            pca_cols = [f"PC{i+1}" for i in range(ncomp)]
-                            Xs = pd.DataFrame(Xs_pca, columns=pca_cols)
-                            
-                            logger.info(f"PCA applied successfully: {Xs.shape}")
-                            logger.info(f"Columns: {list(Xs.columns)[:10]}{'...' if ncomp>10 else ''}")
-                    except Exception as e:
-                        logger.error(f"PCA failed: {e}")
-                        logger.error("Continuing without PCA")
-                        traceback.print_exc()
-                    logger.info("=" * 80)
-                else:
-                    logger.info("PCA skipped (None or not provided)")
-
+                    logger.info("Applying PCA...")
+                    Xs_arr = Xs.values if isinstance(Xs, pd.DataFrame) else np.asarray(Xs)
+                    Xs_pca = pca_obj.transform(Xs_arr)
+                    Xs = pd.DataFrame(Xs_pca, columns=[f"PC{i+1}" for i in range(Xs_pca.shape[1])])
+                    logger.info(f"  After PCA: {Xs.shape}")
+                
                 # Make predictions
                 logger.info("=" * 80)
                 logger.info("MAKING PREDICTIONS")
                 logger.info("=" * 80)
-
-                def aggregate_preds_list(preds_stack, task):
-                    arr = np.vstack(preds_stack)
-                    if task == "regression":
-                        return np.mean(arr, axis=0)
-                    mode_res = stats.mode(arr, axis=0, keepdims=False)
-                    return mode_res.mode if hasattr(mode_res, "mode") else mode_res[0]
-
-                def predict_for_obj(obj, Xs, task):
-                    if hasattr(obj, "predict"):
-                        return np.asarray(obj.predict(Xs)).ravel()
-                    if isinstance(obj, dict):
-                        preds = [np.asarray(est.predict(Xs)).ravel() 
-                                for nm, est in obj.items() if hasattr(est, "predict")]
-                        if not preds:
-                            raise ValueError("No usable estimators in dict")
-                        return aggregate_preds_list(preds, task)
-                    raise ValueError(f"Unsupported model: {type(obj)}")
-
-                is_model_dict = isinstance(model, dict)
-                preds_df, ytrue_df = None, None
-
-                if is_model_dict:
-                    target_names = list(model.keys())
-                    logger.info(f"Model dict with targets: {target_names}")
-                    all_preds, all_ytrue = {}, {}
-                    
-                    for tgt in target_names:
-                        logger.info(f"Predicting: {tgt}")
-                        yhat = predict_for_obj(model[tgt], Xs, task)
-                        all_preds[tgt] = yhat
-                        
-                        if y_multi_df is not None and tgt in y_multi_df.columns:
-                            all_ytrue[tgt] = y_multi_df[tgt].values
-                        elif isinstance(y, pd.Series):
-                            all_ytrue[tgt] = y.values
-                        elif isinstance(y, pd.DataFrame) and tgt in y.columns:
-                            all_ytrue[tgt] = y[tgt].values
-                        else:
-                            all_ytrue[tgt] = np.full(len(yhat), np.nan)
-                    
-                    preds_df = pd.DataFrame({f"y_pred_{t}": all_preds[t] for t in target_names})
-                    ytrue_df = pd.DataFrame({f"y_true_{t}": all_ytrue[t] for t in target_names})
-                else:
-                    logger.info(f"Single model: {type(model)}")
-                    raw_pred = np.asarray(model.predict(Xs))
-                    
-                    if raw_pred.ndim == 1:
-                        preds_df = pd.DataFrame({"y_pred": raw_pred})
-                        if isinstance(y, pd.Series):
-                            ytrue_df = pd.DataFrame({"y_true": y.values})
-                        elif isinstance(y, pd.DataFrame) and y.shape[1] == 1:
-                            ytrue_df = pd.DataFrame({"y_true": y.iloc[:,0].values})
-                        else:
-                            ytrue_df = pd.DataFrame({"y_true": np.full(len(raw_pred), np.nan)})
-                    elif raw_pred.ndim == 2:
-                        n_targets = raw_pred.shape[1]
-                        try:
-                            tgt_names = (getattr(model, "target_names", None) or 
-                                       getattr(model, "targets", None) or
-                                       [f"target_{i}" for i in range(n_targets)])
-                            if len(tgt_names) != n_targets:
-                                tgt_names = [f"target_{i}" for i in range(n_targets)]
-                        except Exception:
-                            tgt_names = [f"target_{i}" for i in range(n_targets)]
-                        
-                        preds_df = pd.DataFrame({f"y_pred_{tgt_names[i]}": raw_pred[:, i] 
-                                                for i in range(n_targets)})
-                        
-                        if y_multi_df is not None and y_multi_df.shape[1] == n_targets:
-                            ytrue_df = pd.DataFrame({f"y_true_{tgt_names[i]}": y_multi_df.iloc[:, i].values 
-                                                    for i in range(n_targets)})
-                        elif isinstance(y, pd.DataFrame) and y.shape[1] == n_targets:
-                            ytrue_df = pd.DataFrame({f"y_true_{tgt_names[i]}": y.iloc[:, i].values 
-                                                    for i in range(n_targets)})
-                        else:
-                            ytrue_df = pd.DataFrame({f"y_true_{tgt_names[i]}": np.full(len(raw_pred), np.nan) 
-                                                    for i in range(n_targets)})
-                    else:
-                        raise ValueError("Unsupported prediction shape")
-
-                logger.info(f"Predictions shape: {preds_df.shape}")
-                logger.info(f"Ground truth shape: {ytrue_df.shape}")
-
+                
+                y_pred = model.predict(Xs)
+                logger.info(f"  Predictions: {len(y_pred)}")
+                
                 # Compute metrics
                 logger.info("Computing metrics...")
-                metrics_rows = []
-
-                def get_ytrue_for_target(tname):
-                    ycol = f"y_true_{tname}"
-                    if ycol in ytrue_df.columns:
-                        return ytrue_df[ycol].values
-                    if "y_true" in ytrue_df.columns and preds_df.shape[1] == 1:
-                        return ytrue_df["y_true"].values
-                    return None
-
-                for pcol in preds_df.columns:
-                    if pcol == "y_pred" and preds_df.shape[1] == 1:
-                        tname = ""
-                    else:
-                        tname = pcol.replace("y_pred_", "")
-                    
-                    model_name_val = f"{model_name_str}:{tname}" if tname else model_name_str
-                    ypred_vals = preds_df[pcol].values
-                    ytrue_vals = get_ytrue_for_target(tname)
-
-                    row = {
-                        "model_name": model_name_val,
-                        "model_type": task
-                    }
-
-                    if task == "regression":
-                        if ytrue_vals is None:
-                            row.update({"r2_score": None, "mse": None, "rmse_score": None})
-                        else:
-                            try:
-                                ytrue_num = pd.to_numeric(ytrue_vals, errors="coerce")
-                                valid_mask = ~np.isnan(ytrue_num)
-                                if valid_mask.sum() > 0:
-                                    ytrue_f = ytrue_num[valid_mask]
-                                    ypred_f = np.asarray(ypred_vals)[valid_mask].astype(float)
-                                    mse_val = float(mean_squared_error(ytrue_f, ypred_f))
-                                    row.update({
-                                        "r2_score": round(float(r2_score(ytrue_f, ypred_f)), 6),
-                                        "mse": round(mse_val, 6),
-                                        "rmse_score": round(float(np.sqrt(mse_val)), 6)
-                                    })
-                                else:
-                                    row.update({"r2_score": None, "mse": None, "rmse_score": None})
-                            except Exception:
-                                row.update({"r2_score": None, "mse": None, "rmse_score": None})
-                    else:
-                        row.update({
-                            "accuracy": None,
-                            "precision_score": None,
-                            "recall": None,
-                            "f1_score": None,
-                            "roc_auc": None,
-                            "loss": None,
-                            "confusion_matrix": []
+                metrics = {"model_name": str(type(model).__name__), "model_type": task}
+                
+                if task == "regression":
+                    y_true_num = pd.to_numeric(y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y, errors='coerce')
+                    valid_mask = ~np.isnan(y_true_num)
+                    if valid_mask.sum() > 0:
+                        yt = y_true_num[valid_mask]
+                        yp = y_pred[valid_mask]
+                        mse_val = mean_squared_error(yt, yp)
+                        metrics.update({
+                            "r2_score": round(float(r2_score(yt, yp)), 6),
+                            "mse": round(float(mse_val), 6),
+                            "rmse_score": round(float(np.sqrt(mse_val)), 6)
                         })
-
-                        if ytrue_vals is not None:
-                            try:
-                                ytrue_arr = np.asarray(ytrue_vals)
-                                ypred_arr = np.asarray(ypred_vals)
-                                n = min(len(ytrue_arr), len(ypred_arr))
-                                ytrue_arr, ypred_arr = ytrue_arr[:n], ypred_arr[:n]
-
-                                try:
-                                    cm = confusion_matrix(ytrue_arr, ypred_arr)
-                                    row["confusion_matrix"] = cm.tolist()
-                                except Exception:
-                                    pass
-
-                                row["accuracy"] = round(float(accuracy_score(ytrue_arr, ypred_arr)), 6)
-                                row["precision_score"] = round(float(precision_score(ytrue_arr, ypred_arr, 
-                                                                average="weighted", zero_division=0)), 6)
-                                row["recall"] = round(float(recall_score(ytrue_arr, ypred_arr, 
-                                                          average="weighted", zero_division=0)), 6)
-                                row["f1_score"] = round(float(f1_score(ytrue_arr, ypred_arr, 
-                                                            average="weighted", zero_division=0)), 6)
-                            except Exception:
-                                pass
-
-                    metrics_rows.append(row)
-
-                logger.info(f"Computed metrics for {len(metrics_rows)} target(s)")
-                logger.info(f"Metrics preview: {json.dumps(metrics_rows[0], indent=2) if metrics_rows else '{}'}")
-
+                else:
+                    y_true_arr = y.values.ravel() if isinstance(y, pd.DataFrame) else y.values
+                    metrics.update({
+                        "accuracy": round(float(accuracy_score(y_true_arr, y_pred)), 6),
+                        "precision_score": round(float(precision_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
+                        "recall": round(float(recall_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
+                        "f1_score": round(float(f1_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6)
+                    })
+                
+                logger.info(f"  Metrics: {json.dumps(metrics, indent=2)}")
+                
                 # Save outputs
-                logger.info(f"Saving metrics to: {args.metrics_json}")
                 ensure_dir_for(args.metrics_json)
                 with open(args.metrics_json, "w") as f:
-                    json.dump(metrics_rows, f, indent=2)
-
-                out_df = pd.concat([ytrue_df.reset_index(drop=True), 
-                                   preds_df.reset_index(drop=True)], axis=1)
+                    json.dump([metrics], f, indent=2)
                 
-                logger.info(f"Saving predictions to: {args.predictions}")
+                y_true_vals = y.iloc[:, 0].values if isinstance(y, pd.DataFrame) else y.values
+                out_df = pd.DataFrame({
+                    "y_true": y_true_vals,
+                    "y_pred": y_pred
+                })
+                
                 ensure_dir_for(args.predictions)
                 out_df.to_parquet(args.predictions, index=False)
                 
                 logger.info("=" * 80)
-                logger.info("SUCCESS: Evaluation completed")
-                logger.info("=" * 80)
-                logger.info(f"Samples evaluated: {len(Xs)}")
-                logger.info(f"Metrics: {args.metrics_json}")
-                logger.info(f"Predictions: {args.predictions}")
+                logger.info("SUCCESS")
                 logger.info("=" * 80)
 
             except Exception as e:
-                logger.error("=" * 80)
-                logger.error("EVALUATION FAILED")
-                logger.error("=" * 80)
-                logger.error(f"Error: {e}")
-                logger.error("Traceback:", exc_info=True)
-                logger.error("=" * 80)
+                logger.error(f"EVALUATION FAILED: {e}")
+                traceback.print_exc()
                 sys.exit(1)
 
         if __name__ == "__main__":
@@ -642,6 +478,8 @@ implementation:
       - {inputPath: test_data}
       - --target_column
       - {inputValue: target_column}
+      - --cleaning_metadata
+      - {inputPath: cleaning_metadata}  # NEW
       - --preprocessor
       - {inputPath: preprocessor}
       - --feature_selector
