@@ -1,4 +1,4 @@
-name: Evaluate Model v15.0
+name: Evaluate Model v15.1
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -418,52 +418,127 @@ implementation:
                 logger.info("MAKING PREDICTIONS")
                 logger.info("=" * 80)
                 
-                y_pred = model.predict(Xs)
-                logger.info(f"  Predictions: {len(y_pred)}")
+                is_model_dict = isinstance(model, dict)
                 
-                # Compute metrics
-                logger.info("Computing metrics...")
-                metrics = {"model_name": str(type(model).__name__), "model_type": task}
-                
-                if task == "regression":
-                    y_true_num = pd.to_numeric(y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y, errors='coerce')
-                    valid_mask = ~np.isnan(y_true_num)
-                    if valid_mask.sum() > 0:
-                        yt = y_true_num[valid_mask]
-                        yp = y_pred[valid_mask]
-                        mse_val = mean_squared_error(yt, yp)
-                        metrics.update({
-                            "r2_score": round(float(r2_score(yt, yp)), 6),
-                            "mse": round(float(mse_val), 6),
-                            "rmse_score": round(float(np.sqrt(mse_val)), 6)
-                        })
+                if is_model_dict:
+                    # Multi-target model (dict of models)
+                    target_names = list(model.keys())
+                    logger.info(f"  Model dict with {len(target_names)} targets: {target_names}")
+                    
+                    all_preds = {}
+                    all_ytrue = {}
+                    
+                    for tgt in target_names:
+                        logger.info(f"  Predicting for target: {tgt}")
+                        yhat = np.asarray(model[tgt].predict(Xs)).ravel()
+                        all_preds[tgt] = yhat
+                        
+                        # Get corresponding y_true
+                        if isinstance(y, pd.DataFrame) and tgt in y.columns:
+                            all_ytrue[tgt] = y[tgt].values
+                        elif isinstance(y, pd.Series) and tgt == target_col:
+                            all_ytrue[tgt] = y.values
+                        else:
+                            all_ytrue[tgt] = y.values if len(y) == len(yhat) else np.full(len(yhat), np.nan)
+                    
+                    # Compute metrics for each target
+                    logger.info("Computing metrics for each target...")
+                    metrics_list = []
+                    
+                    for tgt in target_names:
+                        y_pred = all_preds[tgt]
+                        y_true_vals = all_ytrue[tgt]
+                        
+                        model_name = f"{type(model[tgt]).__name__}:{tgt}"
+                        metrics = {"model_name": model_name, "model_type": task, "target": tgt}
+                        
+                        if task == "regression":
+                            y_true_num = pd.to_numeric(y_true_vals, errors='coerce')
+                            valid_mask = ~np.isnan(y_true_num)
+                            if valid_mask.sum() > 0:
+                                yt = y_true_num[valid_mask]
+                                yp = y_pred[valid_mask]
+                                mse_val = mean_squared_error(yt, yp)
+                                metrics.update({
+                                    "r2_score": round(float(r2_score(yt, yp)), 6),
+                                    "mse": round(float(mse_val), 6),
+                                    "rmse_score": round(float(np.sqrt(mse_val)), 6)
+                                })
+                        else:
+                            metrics.update({
+                                "accuracy": round(float(accuracy_score(y_true_vals, y_pred)), 6),
+                                "precision_score": round(float(precision_score(y_true_vals, y_pred, average="weighted", zero_division=0)), 6),
+                                "recall": round(float(recall_score(y_true_vals, y_pred, average="weighted", zero_division=0)), 6),
+                                "f1_score": round(float(f1_score(y_true_vals, y_pred, average="weighted", zero_division=0)), 6)
+                            })
+                        
+                        metrics_list.append(metrics)
+                        logger.info(f"  {tgt}: R²={metrics.get('r2_score', 'N/A')}, RMSE={metrics.get('rmse_score', 'N/A')}")
+                    
+                    # Save outputs
+                    ensure_dir_for(args.metrics_json)
+                    with open(args.metrics_json, "w") as f:
+                        json.dump(metrics_list, f, indent=2)
+                    
+                    # Create predictions dataframe with all targets
+                    pred_cols = {f"y_pred_{tgt}": all_preds[tgt] for tgt in target_names}
+                    true_cols = {f"y_true_{tgt}": all_ytrue[tgt] for tgt in target_names}
+                    out_df = pd.DataFrame({**true_cols, **pred_cols})
+                    
                 else:
-                    y_true_arr = y.values.ravel() if isinstance(y, pd.DataFrame) else y.values
-                    metrics.update({
-                        "accuracy": round(float(accuracy_score(y_true_arr, y_pred)), 6),
-                        "precision_score": round(float(precision_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
-                        "recall": round(float(recall_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
-                        "f1_score": round(float(f1_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6)
+                    # Single model
+                    logger.info(f"  Single model: {type(model).__name__}")
+                    y_pred = np.asarray(model.predict(Xs)).ravel()
+                    logger.info(f"  Predictions: {len(y_pred)}")
+                    
+                    # Compute metrics
+                    logger.info("Computing metrics...")
+                    metrics = {"model_name": str(type(model).__name__), "model_type": task}
+                    
+                    if task == "regression":
+                        y_true_num = pd.to_numeric(y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y, errors='coerce')
+                        valid_mask = ~np.isnan(y_true_num)
+                        if valid_mask.sum() > 0:
+                            yt = y_true_num[valid_mask]
+                            yp = y_pred[valid_mask]
+                            mse_val = mean_squared_error(yt, yp)
+                            metrics.update({
+                                "r2_score": round(float(r2_score(yt, yp)), 6),
+                                "mse": round(float(mse_val), 6),
+                                "rmse_score": round(float(np.sqrt(mse_val)), 6)
+                            })
+                    else:
+                        y_true_arr = y.values.ravel() if isinstance(y, pd.DataFrame) else y.values
+                        metrics.update({
+                            "accuracy": round(float(accuracy_score(y_true_arr, y_pred)), 6),
+                            "precision_score": round(float(precision_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
+                            "recall": round(float(recall_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
+                            "f1_score": round(float(f1_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6)
+                        })
+                    
+                    logger.info(f"  Metrics: {json.dumps(metrics, indent=2)}")
+                    
+                    # Save outputs
+                    ensure_dir_for(args.metrics_json)
+                    with open(args.metrics_json, "w") as f:
+                        json.dump([metrics], f, indent=2)
+                    
+                    y_true_vals = y.iloc[:, 0].values if isinstance(y, pd.DataFrame) else y.values
+                    out_df = pd.DataFrame({
+                        "y_true": y_true_vals,
+                        "y_pred": y_pred
                     })
                 
-                logger.info(f"  Metrics: {json.dumps(metrics, indent=2)}")
-                
-                # Save outputs
-                ensure_dir_for(args.metrics_json)
-                with open(args.metrics_json, "w") as f:
-                    json.dump([metrics], f, indent=2)
-                
-                y_true_vals = y.iloc[:, 0].values if isinstance(y, pd.DataFrame) else y.values
-                out_df = pd.DataFrame({
-                    "y_true": y_true_vals,
-                    "y_pred": y_pred
-                })
-                
+                # Save predictions parquet (outside if/else)
                 ensure_dir_for(args.predictions)
                 out_df.to_parquet(args.predictions, index=False)
                 
                 logger.info("=" * 80)
                 logger.info("SUCCESS")
+                logger.info("=" * 80)
+                logger.info(f"Samples evaluated: {len(Xs)}")
+                logger.info(f"Metrics saved: {args.metrics_json}")
+                logger.info(f"Predictions saved: {args.predictions}")
                 logger.info("=" * 80)
 
             except Exception as e:
