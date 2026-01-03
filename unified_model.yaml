@@ -1,4 +1,4 @@
-name: Convert to Unified Pipeline v3.0
+name: Convert to Unified Pipeline v3.1
 description: "Converts separate components into a single all-in-one pipeline that handles raw data"
 inputs:
   - {name: cleaning_metadata, type: Data, description: "JSON metadata from Data Cleaning brick"}  # NEW
@@ -554,7 +554,7 @@ implementation:
                 print(f"Size: {file_size / 1024 / 1024:.2f} MB")
                 print(f"Flow: {' → '.join([n for n, _ in pipeline_steps])}")
                 print()
-                print("💡 USAGE (Raw Data → Predictions):")
+                print("USAGE (Raw Data → Predictions):")
                 print("   import cloudpickle")
                 print("   with open('pipeline.pkl', 'rb') as f:")
                 print("       pipeline = cloudpickle.load(f)")
