@@ -1,4 +1,4 @@
-name: Evaluate Model v15.1
+name: Evaluate Model v15.2
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -430,7 +430,18 @@ implementation:
                     
                     for tgt in target_names:
                         logger.info(f"  Predicting for target: {tgt}")
-                        yhat = np.asarray(model[tgt].predict(Xs)).ravel()
+                        # Handle nested dict structure
+                        model_obj = model[tgt]
+                        if isinstance(model_obj, dict):
+                            # If still a dict, try to get the actual model
+                            if 'model' in model_obj:
+                                model_obj = model_obj['model']
+                            else:
+                                # Try first value if dict has one item
+                                model_obj = list(model_obj.values())[0] if len(model_obj) == 1 else model_obj
+                        
+                        logger.info(f"    Model type for {tgt}: {type(model_obj)}")
+                        yhat = np.asarray(model_obj.predict(Xs)).ravel()
                         all_preds[tgt] = yhat
                         
                         # Get corresponding y_true
