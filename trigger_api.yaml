@@ -1,4 +1,4 @@
-name: Stacking and Voting Pipeline Trigger
+name: Stacking and Voting Pipeline Trigger v1
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -69,6 +69,7 @@ inputs:
   - {name: feature_selector_cdn, type: String, optional: true, default: ""}
   - {name: pca_cdn, type: String, optional: true, default: ""}
   - {name: preprocessor_cdn, type: String, optional: true, default: ""}
+  - {name: cleaning_metadata_cdn, type: String, optional: true, default: ""}
   - {name: x_train_cdn, type: String, optional: true, default: ""}
   - {name: y_train_cdn, type: String, optional: true, default: ""}
   - {name: test_data_cdn, type: String, optional: true, default: ""}
@@ -162,6 +163,7 @@ implementation:
         # Other existing inputs
         parser.add_argument('--target_column', default="")
         parser.add_argument('--preprocessor_metadata_cdn', default="")
+        parser.add_argument('--cleaning_metadata_cdn', default="")
         parser.add_argument('--feature_selector_cdn', default="")
         parser.add_argument('--pca_cdn', default="")
         parser.add_argument('--preprocessor_cdn', default="")
@@ -270,6 +272,8 @@ implementation:
             parameters["y_train_cdn"] = args.y_train_cdn
         if args.test_data_cdn:
             parameters["test_data_cdn"] = args.test_data_cdn
+        if args.cleaning_metadata_cdn:
+            parameters["cleaning_metadata_cdn"] = args.cleaning_metadata_cdn
         if args.model_id:
             parameters["model_id"] = args.model_id
         if args.project_id:
@@ -464,6 +468,8 @@ implementation:
       - {inputValue: x_train_cdn}
       - --y_train_cdn
       - {inputValue: y_train_cdn}
+      - --cleaning_metadata_cdn
+      - {inputValue: cleaning_metadata_cdn}
       - --test_data_cdn
       - {inputValue: test_data_cdn}
       - --model_id
