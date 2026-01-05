@@ -1,4 +1,4 @@
-name: ML Artifacts Downloader v7
+name: ML Artifacts Downloader v6
 description: Downloads ML artifacts from CDN URLs and saves them locally
 
 inputs:
@@ -167,4 +167,7 @@ implementation:
       - {outputPath: preprocessor_local}
       - --x_train_local
       - {outputPath: x_train_local}
-      - --y
+      - --y_train_local
+      - {outputPath: y_train_local}
+      - --test_data_local
+      - {outputPath: test_data_local}
