@@ -1,4 +1,4 @@
-name: Evaluate Model v15.2
+name: Evaluate Model v15.3
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -461,7 +461,7 @@ implementation:
                         y_true_vals = all_ytrue[tgt]
                         
                         model_name = f"{type(model[tgt]).__name__}:{tgt}"
-                        metrics = {"model_name": model_name, "model_type": task, "target": tgt}
+                        metrics = {"model_name": model_name, "model_type": task}
                         
                         if task == "regression":
                             y_true_num = pd.to_numeric(y_true_vals, errors='coerce')
