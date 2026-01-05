@@ -6,7 +6,7 @@ inputs:
   - {name: unique_threshold, type: Float, description: "Drop columns with unique % above this (ID columns)", optional: true, default: "0.95"}
   - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
-  - {name: drop_column, type: String, description: "Comma-separated list of columns to drop (optional)", optional: true, default: ""}
+  - {name: use_column, type: String, description: "Comma-separated list of columns to use (if empty, use all columns)", optional: true, default: ""}
 outputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features parquet"}
   - {name: cleaned_y, type: Dataset, description: "Target labels parquet"}
@@ -403,7 +403,7 @@ implementation:
         parser.add_argument('--unique_threshold', type=float, default=0.95)
         parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
         parser.add_argument('--preview_rows', type=int, default=20)
-        parser.add_argument('--drop_column', type=str, default='')
+        parser.add_argument('--use_column', type=str, default='')
         parser.add_argument('--cleaned_X', type=str, required=True)
         parser.add_argument('--cleaned_y', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
@@ -441,19 +441,27 @@ implementation:
             X_raw = df.drop(columns=target_cols).copy()
             print(f"[INFO] X: {X_raw.shape}, y: {y_raw.shape}")
 
-            # Drop user-specified columns (if any)
-            print("[STEP 4.1/10] Dropping user-specified columns...")
-            dropped_user_cols = []
-            if args.drop_column and args.drop_column.strip():
-                to_drop = [c.strip() for c in args.drop_column.split(',') if c.strip()]
-                for c in to_drop:
-                    if c in X_raw.columns:
-                        X_raw = X_raw.drop(columns=[c])
-                        dropped_user_cols.append(c)
-                if dropped_user_cols:
-                    print(f"[INFO] Dropped user-specified columns: {dropped_user_cols}")
+            # Filter to user-specified columns (if any)
+            print("[STEP 4.1/10] Filtering to user-specified columns...")
+            kept_user_cols = []
+            missing_user_cols = []
+            all_columns_before_filter = list(X_raw.columns)
+            
+            if args.use_column and args.use_column.strip():
+                to_use = [c.strip() for c in args.use_column.split(',') if c.strip()]
+                kept_user_cols = [c for c in to_use if c in X_raw.columns]
+                missing_user_cols = [c for c in to_use if c not in X_raw.columns]
+                
+                if kept_user_cols:
+                    X_raw = X_raw[kept_user_cols]
+                    print(f"[INFO] Kept {len(kept_user_cols)} user-specified columns: {kept_user_cols}")
+                    if missing_user_cols:
+                        print(f"[WARNING] Columns not found: {missing_user_cols}")
                 else:
-                    print("[INFO] No matching user-specified columns found to drop")
+                    print(f"[ERROR] None of the specified columns found in dataset", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print("[INFO] No column filtering - using all columns")
             
             # Drop high-missing columns
             print(f"[STEP 5/10] Dropping columns >{args.missing_threshold*100}% missing...")
@@ -534,7 +542,9 @@ implementation:
                 'dropped_missing_cols': cols_to_drop_missing,
                 'dropped_unique_cols': cols_to_drop_unique,
                 'dropped_rows_missing_y': dropped_y,
-                'dropped_user_columns': dropped_user_cols,
+                'user_specified_columns': kept_user_cols if kept_user_cols else 'all',
+                'missing_user_columns': missing_user_cols,
+                'all_columns_before_filter': all_columns_before_filter,
                 'missing_report': missing_report,
                 'unique_report': unique_report,
                 'conversion_report': conv_report,
@@ -569,8 +579,8 @@ implementation:
       - {inputValue: numeric_detection_threshold}
       - --preview_rows
       - {inputValue: preview_rows}
-      - --drop_column
-      - {inputValue: drop_column}
+      - --use_column
+      - {inputValue: use_column}
       - --cleaned_X
       - {outputPath: cleaned_X}
       - --cleaned_y
