@@ -1,8 +1,8 @@
-name: Evaluate Model v15.2
+name: Evaluate Model v15.4
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
-  - {name: cleaning_metadata, type: Data, description: "JSON metadata from Data Cleaning brick"}  # NEW INPUT
+  - {name: cleaning_metadata, type: Data, description: "JSON metadata from Data Cleaning brick"}
   - {name: preprocessor, type: Data, description: "Path to saved Preprocessor"}
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector", optional: true}
   - {name: pca, type: Data, description: "Path to saved PCA transformer", optional: true}
@@ -30,7 +30,7 @@ implementation:
         logger = logging.getLogger(__name__)
 
         # ============================================
-        # DATA CLEANING FUNCTIONS (replicate from cleaning brick)
+        # DATA CLEANING FUNCTIONS
         # ============================================
         
         def detect_and_deduplicate_dates(df, exclude_cols=None):
@@ -40,7 +40,6 @@ implementation:
             cand = [c for c in df.columns if c not in exclude_cols and 
                     (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
             
-            # Parse all date columns
             parsed_dates = {}
             for col in cand:
                 ser = df[col].astype(object)
@@ -74,7 +73,6 @@ implementation:
             if not parsed_dates:
                 return df, report
             
-            # Group duplicates
             date_groups = []
             processed = set()
             
@@ -95,7 +93,6 @@ implementation:
                 processed.add(col1)
                 date_groups.append(group)
             
-            # Keep best from each group
             cols_to_drop = []
             for group in date_groups:
                 if len(group) > 1:
@@ -113,7 +110,6 @@ implementation:
                 for col in cols_to_drop:
                     del parsed_dates[col]
             
-            # Extract date features
             for col, data in parsed_dates.items():
                 full = data['datetime']
                 try:
@@ -215,16 +211,13 @@ implementation:
             df = test_df.copy()
             target_cols = [target_col] if isinstance(target_col, str) else target_col
             
-            # Separate target
             y = df[target_cols].copy()
             X = df.drop(columns=target_cols)
             logger.info(f"Original X shape: {X.shape}")
             
-            # Get expected final columns from training
             expected_cols = set(cleaning_meta.get('column_names', []))
             logger.info(f"Expected {len(expected_cols)} columns from training")
             
-            # Step 1: Detect and deduplicate dates
             logger.info("Step 1: Detecting and deduplicating date columns...")
             X, date_report = detect_and_deduplicate_dates(X, exclude_cols=target_cols)
             
@@ -232,18 +225,15 @@ implementation:
                 for dup in date_report['duplicate_dates_dropped']:
                     logger.info(f"  Kept: {dup['kept']}, Dropped: {dup['dropped']}")
             
-            # Step 2: Convert object to numeric
             logger.info("Step 2: Converting object columns to numeric...")
             X, conv_report = convert_object_columns_advanced(X, detect_threshold=0.6)
             logger.info(f"  Converted {len(conv_report['converted'])} columns")
             
-            # Step 3: Drop _orig columns
             orig_cols = [c for c in X.columns if c.endswith('_orig')]
             if orig_cols:
                 X = X.drop(columns=orig_cols)
                 logger.info(f"Step 3: Dropped {len(orig_cols)} _orig columns")
             
-            # Step 4: Align with training columns
             logger.info("Step 4: Aligning with training columns...")
             current_cols = set(X.columns)
             missing_cols = expected_cols - current_cols
@@ -260,7 +250,6 @@ implementation:
                 logger.warning(f"    {list(extra_cols)[:5]}...")
                 X = X.drop(columns=list(extra_cols))
             
-            # Reorder to match training
             X = X[list(expected_cols)]
             
             logger.info(f"Final cleaned X shape: {X.shape}")
@@ -273,7 +262,6 @@ implementation:
         # ============================================
         
         def read_with_pandas(path):
-            # (same as your existing read_with_pandas function)
             if os.path.isdir(path):
                 entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
                 files=[p for p in entries if os.path.isfile(p)]
@@ -306,6 +294,36 @@ implementation:
                 pass
             return joblib.load(path)
 
+        def unwrap_model(obj, max_depth=10):
+            """Recursively unwrap nested dicts to find the actual model object."""
+            if max_depth <= 0:
+                return obj
+            
+            # If it has predict method, it's a model
+            if hasattr(obj, 'predict'):
+                return obj
+            
+            # If it's a dict, try to unwrap
+            if isinstance(obj, dict):
+                # Common keys that might contain the model
+                for key in ['model', 'estimator', 'best_estimator_', 'final_estimator']:
+                    if key in obj:
+                        return unwrap_model(obj[key], max_depth - 1)
+                
+                # If dict has only one item, unwrap that
+                if len(obj) == 1:
+                    return unwrap_model(list(obj.values())[0], max_depth - 1)
+                
+                # Try each value until we find one with predict
+                for val in obj.values():
+                    if hasattr(val, 'predict'):
+                        return val
+                    unwrapped = unwrap_model(val, max_depth - 1)
+                    if hasattr(unwrapped, 'predict'):
+                        return unwrapped
+            
+            return obj
+
         # ============================================
         # MAIN FUNCTION
         # ============================================
@@ -314,7 +332,7 @@ implementation:
             parser = argparse.ArgumentParser()
             parser.add_argument("--test_data", type=str, required=True)
             parser.add_argument("--target_column", type=str, required=True)
-            parser.add_argument("--cleaning_metadata", type=str, required=True)  # NEW
+            parser.add_argument("--cleaning_metadata", type=str, required=True)
             parser.add_argument("--preprocessor", type=str, required=True)
             parser.add_argument("--feature_selector", type=str, default="")
             parser.add_argument("--pca", type=str, default="")
@@ -327,37 +345,31 @@ implementation:
 
             try:
                 logger.info("=" * 80)
-                logger.info("EVALUATION STARTED - v15.0 with Cleaning")
+                logger.info("EVALUATION STARTED - v15.4 with Model Unwrapping")
                 logger.info("=" * 80)
 
                 task = args.model_type.strip().lower()
                 target_col = args.target_column.strip()
                 
-                # Load cleaning metadata
                 logger.info("Loading cleaning metadata...")
                 with open(args.cleaning_metadata, 'r') as f:
                     cleaning_meta = json.load(f)
                 logger.info(f"  Expected columns: {len(cleaning_meta.get('column_names', []))}")
                 
-                # Load test data (RAW)
                 logger.info("Loading raw test data...")
                 test_df_raw = read_with_pandas(args.test_data)
                 logger.info(f"  Raw shape: {test_df_raw.shape}")
                 
-                # Apply cleaning transformations
                 X_cleaned, y = apply_cleaning_to_test(test_df_raw, target_col, cleaning_meta)
                 
-                # Load preprocessor
                 logger.info("Loading preprocessor...")
                 pre = load_pickle_any(args.preprocessor)
                 
-                # Load feature selector
                 fs = None
                 if args.feature_selector and os.path.exists(args.feature_selector):
                     logger.info("Loading feature selector...")
                     fs = load_pickle_any(args.feature_selector)
                 
-                # Load PCA
                 pca_obj = None
                 if args.pca and os.path.exists(args.pca):
                     size = os.path.getsize(args.pca)
@@ -369,21 +381,17 @@ implementation:
                         except Exception as e:
                             logger.warning(f"PCA load failed: {e}")
                 
-                # Load model
                 logger.info("Loading model...")
                 model = load_pickle_any(args.model_pickle)
                 logger.info(f"  Model type: {type(model)}")
                 
-                # Reconstruct for preprocessing
                 logger.info("=" * 80)
                 logger.info("PREPROCESSING")
                 logger.info("=" * 80)
                 
-                # Add target back temporarily
                 test_full = X_cleaned.copy()
                 test_full[target_col] = y.values
                 
-                # Apply preprocessor
                 logger.info("Applying preprocessor...")
                 Xp_full = pre.transform(test_full, training_mode=False) if hasattr(pre.transform, '__code__') and 'training_mode' in pre.transform.__code__.co_varnames else pre.transform(test_full)
                 
@@ -394,7 +402,6 @@ implementation:
                 
                 logger.info(f"  After preprocessing: {Xp.shape}")
                 
-                # Apply feature selector
                 if fs is not None:
                     logger.info("Applying feature selector...")
                     if hasattr(fs, "selected_features"):
@@ -405,7 +412,6 @@ implementation:
                 else:
                     Xs = Xp
                 
-                # Apply PCA
                 if pca_obj is not None:
                     logger.info("Applying PCA...")
                     Xs_arr = Xs.values if isinstance(Xs, pd.DataFrame) else np.asarray(Xs)
@@ -413,15 +419,13 @@ implementation:
                     Xs = pd.DataFrame(Xs_pca, columns=[f"PC{i+1}" for i in range(Xs_pca.shape[1])])
                     logger.info(f"  After PCA: {Xs.shape}")
                 
-                # Make predictions
                 logger.info("=" * 80)
                 logger.info("MAKING PREDICTIONS")
                 logger.info("=" * 80)
                 
-                is_model_dict = isinstance(model, dict)
+                is_model_dict = isinstance(model, dict) and not hasattr(model, 'predict')
                 
                 if is_model_dict:
-                    # Multi-target model (dict of models)
                     target_names = list(model.keys())
                     logger.info(f"  Model dict with {len(target_names)} targets: {target_names}")
                     
@@ -430,21 +434,17 @@ implementation:
                     
                     for tgt in target_names:
                         logger.info(f"  Predicting for target: {tgt}")
-                        # Handle nested dict structure
-                        model_obj = model[tgt]
-                        if isinstance(model_obj, dict):
-                            # If still a dict, try to get the actual model
-                            if 'model' in model_obj:
-                                model_obj = model_obj['model']
-                            else:
-                                # Try first value if dict has one item
-                                model_obj = list(model_obj.values())[0] if len(model_obj) == 1 else model_obj
                         
-                        logger.info(f"    Model type for {tgt}: {type(model_obj)}")
+                        # Unwrap nested structure
+                        model_obj = unwrap_model(model[tgt])
+                        logger.info(f"    Unwrapped model type: {type(model_obj).__name__}")
+                        
+                        if not hasattr(model_obj, 'predict'):
+                            raise ValueError(f"Could not find predict method for target {tgt}. Type: {type(model_obj)}")
+                        
                         yhat = np.asarray(model_obj.predict(Xs)).ravel()
                         all_preds[tgt] = yhat
                         
-                        # Get corresponding y_true
                         if isinstance(y, pd.DataFrame) and tgt in y.columns:
                             all_ytrue[tgt] = y[tgt].values
                         elif isinstance(y, pd.Series) and tgt == target_col:
@@ -452,7 +452,6 @@ implementation:
                         else:
                             all_ytrue[tgt] = y.values if len(y) == len(yhat) else np.full(len(yhat), np.nan)
                     
-                    # Compute metrics for each target
                     logger.info("Computing metrics for each target...")
                     metrics_list = []
                     
@@ -460,7 +459,8 @@ implementation:
                         y_pred = all_preds[tgt]
                         y_true_vals = all_ytrue[tgt]
                         
-                        model_name = f"{type(model[tgt]).__name__}:{tgt}"
+                        unwrapped = unwrap_model(model[tgt])
+                        model_name = f"{type(unwrapped).__name__}:{tgt}"
                         metrics = {"model_name": model_name, "model_type": task, "target": tgt}
                         
                         if task == "regression":
@@ -470,41 +470,43 @@ implementation:
                                 yt = y_true_num[valid_mask]
                                 yp = y_pred[valid_mask]
                                 mse_val = mean_squared_error(yt, yp)
+                                r2_val = r2_score(yt, yp)
                                 metrics.update({
-                                    "r2_score": round(float(r2_score(yt, yp)), 6),
+                                    "r2_score": round(float(r2_val), 6),
                                     "mse": round(float(mse_val), 6),
                                     "rmse_score": round(float(np.sqrt(mse_val)), 6)
                                 })
+                                logger.info(f"  {tgt}: R²={r2_val:.6f}, RMSE={np.sqrt(mse_val):.6f}")
                         else:
+                            acc = accuracy_score(y_true_vals, y_pred)
                             metrics.update({
-                                "accuracy": round(float(accuracy_score(y_true_vals, y_pred)), 6),
+                                "accuracy": round(float(acc), 6),
                                 "precision_score": round(float(precision_score(y_true_vals, y_pred, average="weighted", zero_division=0)), 6),
                                 "recall": round(float(recall_score(y_true_vals, y_pred, average="weighted", zero_division=0)), 6),
                                 "f1_score": round(float(f1_score(y_true_vals, y_pred, average="weighted", zero_division=0)), 6)
                             })
+                            logger.info(f"  {tgt}: Accuracy={acc:.6f}")
                         
                         metrics_list.append(metrics)
-                        logger.info(f"  {tgt}: R²={metrics.get('r2_score', 'N/A')}, RMSE={metrics.get('rmse_score', 'N/A')}")
                     
-                    # Save outputs
                     ensure_dir_for(args.metrics_json)
                     with open(args.metrics_json, "w") as f:
                         json.dump(metrics_list, f, indent=2)
                     
-                    # Create predictions dataframe with all targets
                     pred_cols = {f"y_pred_{tgt}": all_preds[tgt] for tgt in target_names}
                     true_cols = {f"y_true_{tgt}": all_ytrue[tgt] for tgt in target_names}
                     out_df = pd.DataFrame({**true_cols, **pred_cols})
                     
                 else:
-                    # Single model
-                    logger.info(f"  Single model: {type(model).__name__}")
-                    y_pred = np.asarray(model.predict(Xs)).ravel()
+                    # Single model or dict with predict method
+                    model_obj = unwrap_model(model)
+                    logger.info(f"  Single model: {type(model_obj).__name__}")
+                    
+                    y_pred = np.asarray(model_obj.predict(Xs)).ravel()
                     logger.info(f"  Predictions: {len(y_pred)}")
                     
-                    # Compute metrics
                     logger.info("Computing metrics...")
-                    metrics = {"model_name": str(type(model).__name__), "model_type": task}
+                    metrics = {"model_name": str(type(model_obj).__name__), "model_type": task}
                     
                     if task == "regression":
                         y_true_num = pd.to_numeric(y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y, errors='coerce')
@@ -529,7 +531,6 @@ implementation:
                     
                     logger.info(f"  Metrics: {json.dumps(metrics, indent=2)}")
                     
-                    # Save outputs
                     ensure_dir_for(args.metrics_json)
                     with open(args.metrics_json, "w") as f:
                         json.dump([metrics], f, indent=2)
@@ -540,7 +541,6 @@ implementation:
                         "y_pred": y_pred
                     })
                 
-                # Save predictions parquet (outside if/else)
                 ensure_dir_for(args.predictions)
                 out_df.to_parquet(args.predictions, index=False)
                 
@@ -565,7 +565,7 @@ implementation:
       - --target_column
       - {inputValue: target_column}
       - --cleaning_metadata
-      - {inputPath: cleaning_metadata}  # NEW
+      - {inputPath: cleaning_metadata}
       - --preprocessor
       - {inputPath: preprocessor}
       - --feature_selector
