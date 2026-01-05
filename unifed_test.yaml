@@ -1,0 +1,277 @@
+name: Unified Pipeline Inference v1.0
+description: "Make predictions using unified pipeline on test data"
+inputs:
+  - {name: test_data, type: Dataset, description: "Raw test data file (CSV, Parquet, etc.)"}
+  - {name: target_column, type: String, description: "Target column name (will be dropped if present)", optional: true, default: ""}
+  - {name: unified_pipeline, type: Model, description: "Unified pipeline pickle file"}
+  - {name: pipeline_metadata, type: Data, description: "Pipeline metadata JSON file", optional: true}
+outputs:
+  - {name: predictions, type: Dataset, description: "Predictions parquet file"}
+  - {name: predictions_summary, type: String, description: "Predictions summary JSON"}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, io, gzip, zipfile, traceback
+        import pandas as pd, numpy as np
+        from datetime import datetime
+
+        def ensure_dir_for(p):
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def is_likely_json(sample_bytes):
+            if not sample_bytes: return False
+            try: 
+                txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
+            except Exception: 
+                return False
+            if not txt: return False
+            return txt[0] in ("{", "[") or "{" in txt or "[" in txt
+
+        def read_with_pandas(path):
+            if os.path.isdir(path):
+                entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
+                files = [p for p in entries if os.path.isfile(p)]
+                if not files: 
+                    raise ValueError(f"No files in directory: {path}")
+                path = max(files, key=lambda p: os.path.getsize(p))
+                print(f"[INFO] Directory input - using: {os.path.basename(path)}")
+            ext = os.path.splitext(path)[1].lower()
+            if ext in (".parquet", ".pq"):
+                return pd.read_parquet(path, engine="auto")
+            if ext == ".csv":
+                return pd.read_csv(path)
+            if ext == ".gz" or path.endswith(".csv.gz"):
+                try:
+                    with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
+                        sample = fh.read(8192)
+                        fh.seek(0)
+                        if is_likely_json(sample.encode() if isinstance(sample, str) else sample):
+                            fh.seek(0)
+                            try: 
+                                return pd.read_json(fh, lines=True)
+                            except Exception: 
+                                fh.seek(0)
+                                return pd.read_csv(fh)
+                        fh.seek(0)
+                        return pd.read_csv(fh)
+                except Exception:
+                    pass
+            if ext == ".zip":
+                with zipfile.ZipFile(path, "r") as z:
+                    members = [n for n in z.namelist() if not n.endswith("/")]
+                    member = max(members, key=lambda n: z.getinfo(n).file_size or 0)
+                    with z.open(member) as fh:
+                        sample = fh.read(8192)
+                        if is_likely_json(sample):
+                            with z.open(member) as fh2:
+                                return pd.read_json(io.TextIOWrapper(fh2, encoding="utf-8"), lines=True)
+                        else:
+                            with z.open(member) as fh2:
+                                return pd.read_csv(io.TextIOWrapper(fh2, encoding="utf-8"))
+            if ext in (".json", ".ndjson", ".jsonl"):
+                try: 
+                    return pd.read_json(path, lines=True)
+                except ValueError: 
+                    return pd.read_json(path)
+            if ext in (".xls", ".xlsx"):
+                return pd.read_excel(path)
+            if ext == ".feather":
+                return pd.read_feather(path)
+            try:
+                return pd.read_parquet(path, engine="auto")
+            except Exception:
+                pass
+            try:
+                return pd.read_csv(path)
+            except Exception:
+                pass
+            raise ValueError(f"Unsupported format: {path}")
+
+        def load_pipeline(path):
+            print(f"[STEP] Loading pipeline from: {path}")
+            try:
+                import cloudpickle
+                with open(path, 'rb') as f:
+                    pipeline = cloudpickle.load(f)
+                print(f"[INFO] Loaded with cloudpickle: {type(pipeline)}")
+                return pipeline
+            except Exception as e:
+                print(f"[WARN] cloudpickle failed: {e}")
+            try:
+                import joblib
+                pipeline = joblib.load(path)
+                print(f"[INFO] Loaded with joblib: {type(pipeline)}")
+                return pipeline
+            except Exception as e:
+                print(f"[WARN] joblib failed: {e}")
+            raise ValueError(f"Could not load pipeline from {path}")
+
+        def main():
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--test_data", type=str, required=True)
+            parser.add_argument("--target_column", type=str, default="")
+            parser.add_argument("--unified_pipeline", type=str, required=True)
+            parser.add_argument("--pipeline_metadata", type=str, default="")
+            parser.add_argument("--predictions", type=str, required=True)
+            parser.add_argument("--predictions_summary", type=str, required=True)
+            args = parser.parse_args()
+
+            try:
+                print("=" * 80)
+                print("UNIFIED PIPELINE INFERENCE")
+                print("=" * 80)
+                print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                pipeline_meta = None
+                expected_cols = None
+                if args.pipeline_metadata and os.path.exists(args.pipeline_metadata):
+                    print("[STEP] Loading pipeline metadata...")
+                    with open(args.pipeline_metadata, 'r') as f:
+                        pipeline_meta = json.load(f)
+                    expected_cols = pipeline_meta.get('expected_input_columns', [])
+                    if expected_cols:
+                        print(f"[INFO] Expected input columns: {len(expected_cols)}")
+                        print(f"[INFO] Columns: {expected_cols[:5]}{'...' if len(expected_cols) > 5 else ''}")
+                print("=" * 80)
+                print("STEP 1: LOAD UNIFIED PIPELINE")
+                print("=" * 80)
+                pipeline = load_pipeline(args.unified_pipeline)
+                if hasattr(pipeline, 'steps'):
+                    print(f"[INFO] Pipeline steps ({len(pipeline.steps)}):")
+                    for i, (name, step) in enumerate(pipeline.steps, 1):
+                        print(f"  {i}. {name}: {type(step).__name__}")
+                print("=" * 80)
+                print("STEP 2: LOAD TEST DATA")
+                print("=" * 80)
+                test_data = read_with_pandas(args.test_data)
+                print(f"[INFO] Test data shape: {test_data.shape}")
+                print(f"[INFO] Columns ({len(test_data.columns)}): {list(test_data.columns)[:10]}")
+                if len(test_data.columns) > 10:
+                    print(f"[INFO] ... and {len(test_data.columns) - 10} more")
+                print(f"[INFO] Data types:")
+                for dtype in test_data.dtypes.value_counts().items():
+                    print(f"  {dtype[0]}: {dtype[1]} columns")
+                if expected_cols:
+                    available = set(test_data.columns)
+                    required = set(expected_cols)
+                    missing = required - available
+                    extra = available - required
+                    if missing:
+                        print(f"[WARN] Missing columns: {missing}")
+                    if extra:
+                        print(f"[INFO] Extra columns: {extra}")
+                    if not missing and not extra:
+                        print("[INFO] All expected columns present")
+                target_col = args.target_column.strip()
+                if target_col:
+                    print("=" * 80)
+                    print("STEP 3: REMOVE TARGET COLUMN")
+                    print("=" * 80)
+                    if target_col in test_data.columns:
+                        print(f"[INFO] Target column '{target_col}' found - removing it")
+                        test_data_clean = test_data.drop(columns=[target_col])
+                        print(f"[INFO] Removed. New shape: {test_data_clean.shape}")
+                    else:
+                        print(f"[INFO] Target column '{target_col}' not in data - proceeding without removal")
+                        test_data_clean = test_data.copy()
+                else:
+                    print("=" * 80)
+                    print("STEP 3: NO TARGET COLUMN TO REMOVE")
+                    print("=" * 80)
+                    print("[INFO] No target column specified")
+                    test_data_clean = test_data.copy()
+                print("=" * 80)
+                print("STEP 4: MAKE PREDICTIONS")
+                print("=" * 80)
+                print(f"[INFO] Running prediction on {len(test_data_clean)} samples...")
+                predictions = pipeline.predict(test_data_clean)
+                print(f"[INFO] Predictions complete")
+                print(f"[INFO] Predictions shape: {predictions.shape if hasattr(predictions, 'shape') else len(predictions)}")
+                if predictions.ndim == 1:
+                    pred_df = pd.DataFrame({'prediction': predictions})
+                    print("[INFO] Prediction type: Single target")
+                else:
+                    n_targets = predictions.shape[1]
+                    pred_df = pd.DataFrame(predictions, columns=[f'prediction_{i+1}' for i in range(n_targets)])
+                    print(f"[INFO] Prediction type: Multi-target ({n_targets} targets)")
+                print("=" * 80)
+                print("SAMPLE PREDICTIONS")
+                print("=" * 80)
+                print("[INFO] First 20 predictions:")
+                print(pred_df.head(20).to_string(index=True))
+                print("[INFO] Prediction statistics:")
+                print(pred_df.describe().to_string())
+                if predictions.ndim == 1:
+                    unique_vals = len(np.unique(predictions))
+                    if unique_vals <= 20:
+                        print("[INFO] Prediction distribution:")
+                        value_counts = pd.Series(predictions).value_counts().sort_index()
+                        for val, count in value_counts.items():
+                            pct = (count / len(predictions)) * 100
+                            print(f"  {val}: {count} ({pct:.1f}%)")
+                print("=" * 80)
+                print("STEP 5: SAVE PREDICTIONS")
+                print("=" * 80)
+                pred_df.insert(0, 'sample_id', range(len(pred_df)))
+                print(f"[INFO] Saving predictions to: {args.predictions}")
+                ensure_dir_for(args.predictions)
+                pred_df.to_parquet(args.predictions, index=False)
+                file_size = os.path.getsize(args.predictions)
+                print(f"[INFO] Saved {len(pred_df)} predictions ({file_size / 1024:.2f} KB)")
+                summary = {
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'n_samples': len(predictions),
+                    'prediction_shape': predictions.shape if hasattr(predictions, 'shape') else [len(predictions)],
+                    'is_multi_target': predictions.ndim > 1,
+                    'n_targets': predictions.shape[1] if predictions.ndim > 1 else 1,
+                    'test_data_shape': list(test_data.shape),
+                    'test_data_columns': list(test_data.columns),
+                    'target_column_removed': target_col if target_col and target_col in test_data.columns else None,
+                    'sample_predictions': pred_df.head(10).to_dict('records'),
+                    'statistics': pred_df.describe().to_dict()
+                }
+                if predictions.ndim == 1:
+                    unique_vals = len(np.unique(predictions))
+                    if unique_vals <= 20:
+                        summary['value_counts'] = pd.Series(predictions).value_counts().sort_index().to_dict()
+                print(f"[INFO] Saving summary to: {args.predictions_summary}")
+                ensure_dir_for(args.predictions_summary)
+                with open(args.predictions_summary, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                print("=" * 80)
+                print("SUCCESS: INFERENCE COMPLETE")
+                print("=" * 80)
+                print(f"Samples processed: {len(predictions)}")
+                print(f"Predictions saved: {args.predictions}")
+                print(f"Summary saved: {args.predictions_summary}")
+                print("=" * 80)
+            except Exception as e:
+                print("=" * 80)
+                print("ERROR: INFERENCE FAILED")
+                print("=" * 80)
+                print(f"Error: {e}")
+                traceback.print_exc()
+                print("=" * 80)
+                sys.exit(1)
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --test_data
+      - {inputPath: test_data}
+      - --target_column
+      - {inputValue: target_column}
+      - --unified_pipeline
+      - {inputPath: unified_pipeline}
+      - --pipeline_metadata
+      - {inputPath: pipeline_metadata}
+      - --predictions
+      - {outputPath: predictions}
+      - --predictions_summary
+      - {outputPath: predictions_summary}
