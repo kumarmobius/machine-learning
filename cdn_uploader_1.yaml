@@ -1,6 +1,4 @@
 name: Upload to CDN v6
-description: Uploads datasets and ML artifacts to CDN and generates a schema JSON with CDN URLs
-
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file (CSV or Parquet)"}
   - {name: train_x, type: Dataset, description: "Training features dataset (CSV or Parquet)"}
@@ -164,8 +162,8 @@ implementation:
             "train_x_cdn": upload(ensure_csv(args.train_x), args.train_x_cdn_url),
             "train_y_cdn": upload(ensure_csv(args.train_y), args.train_y_cdn_url),
             "test_data_cdn": upload(ensure_csv(args.test_data), args.test_data_cdn_url),
-            "preprocesser_cdn": upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url),
-            "preprocesser_metadata_cdn": upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url),
+            "preprocessor_cdn": upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url),
+            "preprocessor_metadata_cdn": upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url),
             "cleaning_metadata_cdn": upload(args.cleaning_metadata, args.cleaning_metadata_cdn_url),
             "feature_selector_cdn": upload(args.feature_selector, args.feature_selector_cdn_url),
             "pca_cdn": upload(args.pca_model, args.pca_model_cdn_url),
@@ -173,7 +171,7 @@ implementation:
         }
 
         schema = {
-            "schema_timestamp_epoch": int(time.time()),
+            "timestamp": int(time.time()),
             **cdn_map
         }
 
