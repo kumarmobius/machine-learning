@@ -1,4 +1,4 @@
-name: Evaluate Model v15.4.1
+name: Evaluate Model v15.5
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -209,17 +209,25 @@ implementation:
             logger.info("=" * 80)
             
             df = test_df.copy()
-            target_cols = [target_col] if isinstance(target_col, str) else target_col
             
-            y = df[target_cols].copy()
-            X = df.drop(columns=target_cols)
+            # Handle target column(s)
+            if isinstance(target_col, str):
+                # Single target - extract as Series to avoid 2D array issues
+                y = df[target_col].copy()
+                X = df.drop(columns=[target_col])
+            else:
+                # Multiple targets - keep as DataFrame
+                y = df[target_col].copy()
+                X = df.drop(columns=target_col)
+            
             logger.info(f"Original X shape: {X.shape}")
             
             expected_cols = set(cleaning_meta.get('column_names', []))
             logger.info(f"Expected {len(expected_cols)} columns from training")
             
             logger.info("Step 1: Detecting and deduplicating date columns...")
-            X, date_report = detect_and_deduplicate_dates(X, exclude_cols=target_cols)
+            exclude_cols = [target_col] if isinstance(target_col, str) else target_col
+            X, date_report = detect_and_deduplicate_dates(X, exclude_cols=exclude_cols)
             
             if date_report['duplicate_dates_dropped']:
                 for dup in date_report['duplicate_dates_dropped']:
@@ -344,7 +352,7 @@ implementation:
 
             try:
                 logger.info("=" * 80)
-                logger.info("EVALUATION STARTED - v15.4 with Model Unwrapping")
+                logger.info("EVALUATION STARTED - v15.4.1 Fixed Classification")
                 logger.info("=" * 80)
 
                 task = args.model_type.strip().lower()
@@ -389,7 +397,13 @@ implementation:
                 logger.info("=" * 80)
                 
                 test_full = X_cleaned.copy()
-                test_full[target_col] = y.values
+                
+                # Add target back - handle Series vs DataFrame
+                if isinstance(y, pd.Series):
+                    test_full[target_col] = y
+                else:
+                    for col in y.columns:
+                        test_full[col] = y[col]
                 
                 logger.info("Applying preprocessor...")
                 Xp_full = pre.transform(test_full, training_mode=False) if hasattr(pre.transform, '__code__') and 'training_mode' in pre.transform.__code__.co_varnames else pre.transform(test_full)
@@ -446,10 +460,12 @@ implementation:
                         
                         if isinstance(y, pd.DataFrame) and tgt in y.columns:
                             all_ytrue[tgt] = y[tgt].values
-                        elif isinstance(y, pd.Series) and tgt == target_col:
+                        elif isinstance(y, pd.Series):
                             all_ytrue[tgt] = y.values
                         else:
-                            all_ytrue[tgt] = y.values if len(y) == len(yhat) else np.full(len(yhat), np.nan)
+                            # Fallback
+                            y_vals = y.values if hasattr(y, 'values') else np.array(y)
+                            all_ytrue[tgt] = y_vals.ravel() if len(y_vals.shape) > 1 else y_vals
                     
                     logger.info("Computing metrics for each target...")
                     metrics_list = []
@@ -460,7 +476,7 @@ implementation:
                         
                         unwrapped = unwrap_model(model[tgt])
                         model_name = f"{type(unwrapped).__name__}:{tgt}"
-                        metrics = {"model_name": model_name, "model_type": task, "target": tgt}
+                        metrics = {"model_name": model_name, "model_type": task}
                         
                         if task == "regression":
                             y_true_num = pd.to_numeric(y_true_vals, errors='coerce')
@@ -508,7 +524,10 @@ implementation:
                     metrics = {"model_name": str(type(model_obj).__name__), "model_type": task}
                     
                     if task == "regression":
-                        y_true_num = pd.to_numeric(y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y, errors='coerce')
+                        y_vals = y.values if isinstance(y, (pd.Series, pd.DataFrame)) else np.array(y)
+                        if len(y_vals.shape) > 1:
+                            y_vals = y_vals.ravel()
+                        y_true_num = pd.to_numeric(y_vals, errors='coerce')
                         valid_mask = ~np.isnan(y_true_num)
                         if valid_mask.sum() > 0:
                             yt = y_true_num[valid_mask]
@@ -520,7 +539,8 @@ implementation:
                                 "rmse_score": round(float(np.sqrt(mse_val)), 6)
                             })
                     else:
-                        y_true_arr = y.values.ravel() if isinstance(y, pd.DataFrame) else y.values
+                        y_vals = y.values if isinstance(y, (pd.Series, pd.DataFrame)) else np.array(y)
+                        y_true_arr = y_vals.ravel() if len(y_vals.shape) > 1 else y_vals
                         metrics.update({
                             "accuracy": round(float(accuracy_score(y_true_arr, y_pred)), 6),
                             "precision_score": round(float(precision_score(y_true_arr, y_pred, average="weighted", zero_division=0)), 6),
@@ -534,7 +554,8 @@ implementation:
                     with open(args.metrics_json, "w") as f:
                         json.dump([metrics], f, indent=2)
                     
-                    y_true_vals = y.iloc[:, 0].values if isinstance(y, pd.DataFrame) else y.values
+                    y_vals = y.values if isinstance(y, (pd.Series, pd.DataFrame)) else np.array(y)
+                    y_true_vals = y_vals.ravel() if len(y_vals.shape) > 1 else y_vals
                     out_df = pd.DataFrame({
                         "y_true": y_true_vals,
                         "y_pred": y_pred
