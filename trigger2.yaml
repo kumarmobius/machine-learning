@@ -1,4 +1,4 @@
-name: SVM and KNN Trigger v1
+name: SVM and KNN Trigger
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -7,6 +7,7 @@ inputs:
   - {name: model_type, type: String, optional: true, default: ""}
   - {name: target_column, type: String, optional: true, default: ""}
   - {name: preprocessor_metadata_cdn, type: String, optional: true, default: ""}
+  - {name: cleaning_metadata_cdn, type: String, optional: true, default: ""}
   - {name: feature_selector_cdn, type: String, optional: true, default: ""}
   - {name: pca_cdn, type: String, optional: true, default: ""}
   - {name: preprocessor_cdn, type: String, optional: true, default: ""}
@@ -58,6 +59,7 @@ implementation:
         parser.add_argument('--model_type', default="")
         parser.add_argument('--target_column', default="")
         parser.add_argument('--preprocessor_metadata_cdn', default="")
+        parser.add_argument('--cleaning_metadata_cdn', default="")
         parser.add_argument('--feature_selector_cdn', default="")
         parser.add_argument('--pca_cdn', default="")
         parser.add_argument('--preprocessor_cdn', default="")
@@ -115,6 +117,8 @@ implementation:
             parameters["x_train_cdn"] = args.x_train_cdn
         if args.y_train_cdn:
             parameters["y_train_cdn"] = args.y_train_cdn
+        if args.cleaning_metadata_cdn:
+            parameters["cleaning_metadata_cdn"] = args.cleaning_metadata_cdn
         if args.test_data_cdn:
             parameters["test_data_cdn"] = args.test_data_cdn
         if args.model_id:
@@ -250,6 +254,8 @@ implementation:
       - {inputValue: target_column}
       - --preprocessor_metadata_cdn
       - {inputValue: preprocessor_metadata_cdn}
+      - --cleaning_metadata_cdn
+      - {inputValue: cleaning_metadata_cdn}
       - --feature_selector_cdn
       - {inputValue: feature_selector_cdn}
       - --pca_cdn
