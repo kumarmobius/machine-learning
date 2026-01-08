@@ -1,4 +1,4 @@
-name: Data Cleaning v1.7
+name: Data Cleaning v1.7.1
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Target column(s), comma-separated for multi-output"}
@@ -7,7 +7,7 @@ inputs:
   - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
   - {name: label_conflict_strategy, type: String, description: "Strategy for handling label conflicts: drop, majority, or fail", optional: true, default: "fail"}
-  - {name: conflict_key_cols, type: String, description: "Columns to use for conflict detection (auto or comma-separated)", optional: true, default: "auto"}
+  - {name: , type: String, description: "Columns to use for conflict detection (auto or comma-separated)", optional: true, default: "auto"}
 outputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features parquet"}
   - {name: cleaned_y, type: Dataset, description: "Target labels parquet"}
@@ -396,8 +396,7 @@ implementation:
 
             return df, report
 
-        def detect_and_handle_label_conflicts(X, y, target_cols, strategy='fail', conflict_key_cols='auto'):
-            # """
+        def detect_and_handle_label_conflicts(X, y, target_cols, strategy='fail', ='auto'):
             # Detect and handle label conflicts where identical feature rows have different labels.
             
             # Args:
@@ -405,14 +404,13 @@ implementation:
             #     y: Label dataframe
             #     target_cols: List of target column names
             #     strategy: 'fail', 'drop', or 'majority'
-            #     conflict_key_cols: 'auto' or comma-separated column names
+            #     : 'auto' or comma-separated column names
             
             # Returns:
             #     X_clean, y_clean, conflict_report
-            # """
             report = {
                 'strategy': strategy,
-                'conflict_key_cols_spec': conflict_key_cols,
+                '_spec': ,
                 'total_rows': len(X),
                 'conflicting_rows': 0,
                 'unique_conflict_groups': 0,
@@ -422,17 +420,17 @@ implementation:
             }
             
             # Determine which columns to use for conflict detection
-            if conflict_key_cols.strip().lower() == 'auto':
+            if .strip().lower() == 'auto':
                 key_cols = list(X.columns)
-                report['conflict_key_cols_used'] = 'all_features'
+                report['_used'] = 'all_features'
             else:
-                specified_cols = [c.strip() for c in conflict_key_cols.split(',') if c.strip()]
+                specified_cols = [c.strip() for c in .split(',') if c.strip()]
                 # Validate columns exist
                 missing_cols = [c for c in specified_cols if c not in X.columns]
                 if missing_cols:
                     raise ValueError(f"Conflict key columns not found in features: {missing_cols}")
                 key_cols = specified_cols
-                report['conflict_key_cols_used'] = key_cols
+                report['_used'] = key_cols
             
             print(f"[INFO] Using {len(key_cols)} columns for conflict detection")
             
@@ -556,7 +554,7 @@ implementation:
         parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
         parser.add_argument('--preview_rows', type=int, default=20)
         parser.add_argument('--label_conflict_strategy', type=str, default='fail')
-        parser.add_argument('--conflict_key_cols', type=str, default='auto')
+        parser.add_argument('--', type=str, default='auto')
         parser.add_argument('--cleaned_X', type=str, required=True)
         parser.add_argument('--cleaned_y', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
@@ -570,7 +568,7 @@ implementation:
             target_cols = [t.strip() for t in args.target_column.split(',')] if ',' in args.target_column else [args.target_column.strip()]
             print(f"[INFO] Targets: {target_cols}")
             print(f"[INFO] Label conflict strategy: {args.label_conflict_strategy}")
-            print(f"[INFO] Conflict key columns: {args.conflict_key_cols}")
+            print(f"[INFO] Conflict key columns: {args.}")
             
             # Load data
             print("[STEP 1/10] Loading data...")
@@ -660,7 +658,7 @@ implementation:
             X_final, y_final, conflict_report = detect_and_handle_label_conflicts(
                 X_no_missing, y_no_missing, target_cols, 
                 strategy=args.label_conflict_strategy,
-                conflict_key_cols=args.conflict_key_cols
+                =args.
             )
             
             # Save outputs
@@ -720,8 +718,8 @@ implementation:
       - {inputValue: preview_rows}
       - --label_conflict_strategy
       - {inputValue: label_conflict_strategy}
-      - --conflict_key_cols
-      - {inputValue: conflict_key_cols}
+      - --
+      - {inputValue: }
       - --cleaned_X
       - {outputPath: cleaned_X}
       - --cleaned_y
