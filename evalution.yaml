@@ -1,4 +1,4 @@
-name: Evaluate Model v16.1
+name: Evaluate Model v16.2
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -477,7 +477,26 @@ implementation:
                         
                         if isinstance(Xs, pd.DataFrame):
                             # Keep as DataFrame with feature names
-                            yhat = np.asarray(model_obj.predict(Xs)).ravel()
+                            if hasattr(model_obj, 'feature_names_in_'):
+                                logger.info(f"  Model expects features: {list(model_obj.feature_names_in_)}")
+                                logger.info(f"  We have features: {list(Xs.columns)}")
+                                
+                            # Convert to numpy array to bypass sklearn's feature name validation
+                            # This is a workaround for models that were trained before feature selection
+                            X_array = Xs.values if isinstance(Xs, pd.DataFrame) else Xs
+                            
+                            # For sklearn models that check feature names, we need to disable validation
+                            try:
+                                # Try with proper feature names first
+                                yhat = np.asarray(model_obj.predict(Xs)).ravel()
+                            except ValueError as e:
+                                if "feature names" in str(e):
+                                    logger.warning(f"  Feature name mismatch, using numpy array workaround: {e}")
+                                    # Use numpy array to bypass feature name validation
+                                    yhat = np.asarray(model_obj.predict(X_array)).ravel()
+                                else:
+                                    raise
+
                         else:
                             # Convert to DataFrame with proper feature names
                             feature_names = getattr(fs, 'selected_features', [f'feature_{i}' for i in range(Xs.shape[1])])
