@@ -1,4 +1,4 @@
-name: Feature Selection v5.1
+name: Feature Selection v6
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Brick 2"}
   - {name: train_y, type: Dataset, description: "Target labels from Brick 2"}
@@ -6,6 +6,9 @@ inputs:
   - {name: preprocessor, type: Data, description: "Preprocessor from Brick 2 (pass-through)"}
   - {name: enable_feature_selection, type: String, description: "true/false to enable feature selection", optional: true, default: "false"}
   - {name: model_type, type: String, description: "classification or regression"}
+  - {name: enable_target_corr_filter, type: String, description: "true/false to enable target correlation filter", optional: true, default: "false"}
+  - {name: target_corr_threshold, type: String, description: "Absolute correlation threshold", optional: true, default: "0.01"}
+  - {name: corr_method, type: String, description: "pearson or spearman", optional: true, default: "spearman"}
 outputs:
   - {name: train_X, type: Dataset, description: "Final selected features parquet"}
   - {name: train_y, type: Dataset, description: "Target parquet (pass-through)"}
@@ -26,6 +29,7 @@ implementation:
         from sklearn.feature_selection import mutual_info_classif, mutual_info_regression, VarianceThreshold
         from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
         from sklearn.inspection import permutation_importance
+        from scipy import stats
         import cloudpickle
         
         # Helper functions
@@ -34,7 +38,7 @@ implementation:
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
 
-        # FeatureSelector Class
+        # FeatureSelector Class with enhanced functionality
         class FeatureSelector:
             _VAR_THRESH = 1e-5
             _CORR_THRESH = 0.95
@@ -42,13 +46,20 @@ implementation:
             _PI_REPEATS = 5
             _RANDOM_STATE = 42
         
-            def __init__(self, task):
+            def __init__(self, task, enable_target_corr_filter=False, target_corr_threshold=0.01, corr_method="spearman"):
                 self.task = str(task).lower()
+                self.enable_target_corr_filter = bool(enable_target_corr_filter)
+                self.target_corr_threshold = float(target_corr_threshold)
+                self.corr_method = str(corr_method).lower()
                 self.selected_features = []
                 self._filter_keep_ = []
+                self._target_corr_keep_ = []
                 self._relevance_keep_ = []
                 self._mi_scores_ = pd.Series(dtype=float)
                 self._pi_importance_ = pd.Series(dtype=float)
+                self._target_corr_scores_ = pd.Series(dtype=float)
+                self._target_corr_dropped_ = []
+                self._target_corr_dropped_stats_ = {}
 
             def _auto_k(self, p: int, n_samples: int = None) -> int:
                 if n_samples is None:
@@ -96,6 +107,95 @@ implementation:
                     drop = a if mean_a >= mean_b else b
                     keep.remove(drop)
                 return list(keep)
+        
+            def _target_correlation_filter(self, X: pd.DataFrame, y: pd.Series) -> tuple:
+                #Filter features based on correlation with target
+                if not self.enable_target_corr_filter:
+                    return list(X.columns), pd.Series(), [], {}
+                
+                print(f"[INFO] Applying target correlation filter (threshold={self.target_corr_threshold}, method={self.corr_method})")
+                
+                # Identify numeric columns
+                numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+                if not numeric_cols:
+                    print("[INFO] No numeric features found for correlation filter")
+                    return list(X.columns), pd.Series(), [], {}
+                
+                print(f"[INFO] Computing correlation for {len(numeric_cols)} numeric features")
+                
+                # Prepare y for correlation computation
+                y_series = pd.Series(y).reset_index(drop=True)
+                
+                # Compute correlation scores
+                corr_scores = {}
+                for col in numeric_cols:
+                    x_vals = X[col].reset_index(drop=True)
+                    
+                    if self.task == "regression":
+                        # For regression, compute direct correlation
+                        if self.corr_method == "pearson":
+                            corr, _ = stats.pearsonr(x_vals.dropna(), y_series[x_vals.notna()])
+                        else:  # spearman
+                            corr, _ = stats.spearmanr(x_vals.dropna(), y_series[x_vals.notna()])
+                        corr_scores[col] = abs(corr) if not np.isnan(corr) else 0.0
+                    
+                    elif self.task == "classification":
+                        # For classification, use point-biserial correlation
+                        unique_classes = y_series.unique()
+                        if len(unique_classes) == 2:
+                            # Binary classification - use point-biserial correlation
+                            try:
+                                corr, _ = stats.pointbiserialr(x_vals, y_series.map({unique_classes[0]: 0, unique_classes[1]: 1}))
+                                corr_scores[col] = abs(corr) if not np.isnan(corr) else 0.0
+                            except:
+                                # Fallback: compute absolute mean difference
+                                class0_mean = x_vals[y_series == unique_classes[0]].mean()
+                                class1_mean = x_vals[y_series == unique_classes[1]].mean()
+                                corr_scores[col] = abs(class0_mean - class1_mean)
+                        else:
+                            # Multi-class: use ANOVA F-score as correlation proxy
+                            try:
+                                groups = [x_vals[y_series == cls].dropna() for cls in unique_classes]
+                                if all(len(g) > 0 for g in groups):
+                                    f_stat, _ = stats.f_oneway(*groups)
+                                    corr_scores[col] = abs(f_stat) if not np.isnan(f_stat) else 0.0
+                                else:
+                                    corr_scores[col] = 0.0
+                            except:
+                                corr_scores[col] = 0.0
+                    else:
+                        corr_scores[col] = 0.0
+                
+                # Create correlation scores Series
+                corr_series = pd.Series(corr_scores)
+                
+                # Identify features to keep (correlation >= threshold)
+                keep_features = []
+                dropped_features = []
+                
+                for col in X.columns:
+                    if col in corr_series:
+                        score = corr_series[col]
+                        if score >= self.target_corr_threshold:
+                            keep_features.append(col)
+                        else:
+                            dropped_features.append(col)
+                    else:
+                        # Non-numeric features are kept by default
+                        keep_features.append(col)
+                
+                # Prepare dropped features stats
+                dropped_stats = {}
+                if dropped_features:
+                    dropped_stats = {
+                        'count': len(dropped_features),
+                        'features': dropped_features,
+                        'correlation_scores': {feat: float(corr_series.get(feat, 0.0)) for feat in dropped_features}
+                    }
+                
+                print(f"[INFO] Target correlation filter: kept {len(keep_features)} features, dropped {len(dropped_features)} features")
+                
+                return keep_features, corr_series, dropped_features, dropped_stats
         
             def _mi_scores(self, X: pd.DataFrame, y: pd.Series) -> pd.Series:
                 cols = list(X.columns)
@@ -160,6 +260,7 @@ implementation:
                     y_arr = np.asarray(y).ravel()
         
                 print(f"[INFO] Starting feature selection on {X.shape[1]} features")
+                print(f"[INFO] Target correlation filter enabled: {self.enable_target_corr_filter}")
                 
                 # Step 1: Remove near-zero variance
                 keep1 = self._nzv_keep(X, self._VAR_THRESH)
@@ -168,27 +269,36 @@ implementation:
                 
                 # Step 2: Remove highly correlated
                 keep2 = self._corr_prune_keep(X1, self._CORR_THRESH)
-                Xf = X1[keep2]
-                self._filter_keep_ = list(Xf.columns)
+                X2 = X1[keep2]
+                self._filter_keep_ = list(X2.columns)
                 print(f"[INFO] After correlation filter: {len(keep2)} features")
                 
-                # Step 3: Mutual information ranking
-                mi = self._mi_scores(Xf, y_arr)
+                # Step 3: Target correlation filter (NEW)
+                keep3, corr_scores, dropped_features, dropped_stats = self._target_correlation_filter(X2, y_arr)
+                X3 = X2[keep3]
+                self._target_corr_keep_ = list(X3.columns)
+                self._target_corr_scores_ = corr_scores
+                self._target_corr_dropped_ = dropped_features
+                self._target_corr_dropped_stats_ = dropped_stats
+                print(f"[INFO] After target correlation filter: {len(keep3)} features")
+                
+                # Step 4: Mutual information ranking
+                mi = self._mi_scores(X3, y_arr)
                 self._mi_scores_ = mi.copy()
                 
-                # Step 4: Adaptive k selection
-                k = self._auto_k(Xf.shape[1], n_samples=len(Xf))
-                print(f"[INFO] Adaptive k selection: {k} features (from {Xf.shape[1]} candidates, {len(Xf)} samples)")
+                # Step 5: Adaptive k selection
+                k = self._auto_k(X3.shape[1], n_samples=len(X3))
+                print(f"[INFO] Adaptive k selection: {k} features (from {X3.shape[1]} candidates, {len(X3)} samples)")
                 
                 if self._RELEVANCE == "mrmr":
-                    keep_rel = self._mrmr_greedy(Xf, mi, k)
+                    keep_rel = self._mrmr_greedy(X3, mi, k)
                 else:
                     keep_rel = self._topk_by_series(mi, k)
-                Xr = Xf[keep_rel]
+                Xr = X3[keep_rel]
                 self._relevance_keep_ = list(Xr.columns)
                 print(f"[INFO] After MI ranking: {len(keep_rel)} features")
         
-                # Step 5: Permutation importance
+                # Step 6: Permutation importance
                 print(f"[INFO] Computing permutation importance...")
                 keep_pi, imp = self._permutation_keep(Xr, y_arr)
                 Xb = Xr[keep_pi]
@@ -219,6 +329,9 @@ implementation:
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--enable_feature_selection', type=str, default="true")
         parser.add_argument('--model_type', type=str, required=True)
+        parser.add_argument('--enable_target_corr_filter', type=str, default="false")
+        parser.add_argument('--target_corr_threshold', type=str, default="0.01")
+        parser.add_argument('--corr_method', type=str, default="spearman")
         parser.add_argument('--train_X', type=str, required=True)
         parser.add_argument('--train_y_out', type=str, required=True)
         parser.add_argument('--feature_selector', type=str, required=True)
@@ -233,6 +346,14 @@ implementation:
             
             enable_fs = str(args.enable_feature_selection).lower() in ("1","true","t","yes","y")
             model_type = args.model_type.strip().lower()
+            enable_target_corr = str(args.enable_target_corr_filter).lower() in ("1","true","t","yes","y")
+            target_corr_threshold = float(args.target_corr_threshold)
+            corr_method = args.corr_method.strip().lower()
+            
+            # Validate correlation method
+            if corr_method not in ["pearson", "spearman"]:
+                print(f"[WARNING] Invalid correlation method '{corr_method}', defaulting to 'spearman'")
+                corr_method = "spearman"
             
             # Load engineered data
             print("[STEP 1/8] Loading engineered data...")
@@ -248,13 +369,22 @@ implementation:
             target_cols = eng_meta['target_columns']
             print(f"[INFO] Targets: {target_cols}")
             print(f"[INFO] Model type: {model_type}")
+            print(f"[INFO] Target correlation filter enabled: {enable_target_corr}")
+            if enable_target_corr:
+                print(f"[INFO] Correlation threshold: {target_corr_threshold}")
+                print(f"[INFO] Correlation method: {corr_method}")
             
             # Feature selection (optional)
             if enable_fs:
                 print("[STEP 3/8] Performing feature selection...")
                 print(f"[INFO] Using first target for selection: {target_cols[0]}")
                 
-                fs = FeatureSelector(task=("classification" if model_type=="classification" else "regression"))
+                fs = FeatureSelector(
+                    task=("classification" if model_type=="classification" else "regression"),
+                    enable_target_corr_filter=enable_target_corr,
+                    target_corr_threshold=target_corr_threshold,
+                    corr_method=corr_method
+                )
                 
                 # Use first target for feature selection
                 y_for_fs = y_train[target_cols[0]] if isinstance(y_train, pd.DataFrame) else y_train
@@ -264,13 +394,14 @@ implementation:
                 print(f"[INFO] Selected {len(fs.selected_features)} features from {X_eng.shape[1]}")
                 
                 # Print top features by MI score
-                top_features = fs._mi_scores_.sort_values(ascending=False).head(20)
-                print(f"[INFO] Top 20 features by Mutual Information:")
-                for feat, score in top_features.items():
-                    if feat in fs.selected_features:
-                        print(f"   {feat}: {score:.4f}")
-                    else:
-                        print(f"   {feat}: {score:.4f} (filtered out)")
+                if not fs._mi_scores_.empty:
+                    top_features = fs._mi_scores_.sort_values(ascending=False).head(20)
+                    print(f"[INFO] Top 20 features by Mutual Information:")
+                    for feat, score in top_features.items():
+                        if feat in fs.selected_features:
+                            print(f"   {feat}: {score:.4f}")
+                        else:
+                            print(f"   {feat}: {score:.4f} (filtered out)")
             else:
                 print("[STEP 3/8] Feature selection disabled, using all features...")
                 X_selected = X_eng.copy()
@@ -317,13 +448,19 @@ implementation:
             print("[STEP 8/8] Saving combined metadata...")
             ensure_dir_for(args.preprocess_metadata)
             
-            # Build comprehensive metadata
+            # Build comprehensive metadata with target correlation info
             final_metadata = {
                 'timestamp': datetime.utcnow().isoformat()+'Z',
                 'model_type': model_type,
                 'target_columns': target_cols,
                 'n_targets': len(target_cols),
                 'enable_feature_selection': enable_fs,
+                'enable_target_correlation_filter': enable_target_corr,
+                'target_correlation_settings': {
+                    'threshold': target_corr_threshold,
+                    'method': corr_method,
+                    'enabled': enable_target_corr
+                } if enable_fs else {},
                 'final_shape': {
                     'rows': X_selected.shape[0],
                     'cols': X_selected.shape[1],
@@ -334,9 +471,16 @@ implementation:
                 'feature_selection_stats': {
                     'variance_filtered': len(fs._filter_keep_) if fs else X_eng.shape[1],
                     'correlation_filtered': len(fs._relevance_keep_) if fs else X_eng.shape[1],
+                    'target_correlation_filtered': len(fs._target_corr_keep_) if fs and enable_target_corr else X_eng.shape[1],
                     'mi_top_k': len(fs._relevance_keep_) if fs else X_eng.shape[1],
                     'permutation_filtered': len(fs.selected_features) if fs else X_eng.shape[1]
                 } if fs else {},
+                'target_correlation_results': {
+                    'dropped_features_count': len(fs._target_corr_dropped_) if fs and enable_target_corr else 0,
+                    'dropped_features': fs._target_corr_dropped_ if fs and enable_target_corr else [],
+                    'dropped_features_stats': fs._target_corr_dropped_stats_ if fs and enable_target_corr else {},
+                    'correlation_scores': fs._target_corr_scores_.to_dict() if fs and enable_target_corr and not fs._target_corr_scores_.empty else {}
+                } if fs and enable_target_corr else {},
                 'top_features_mi': fs._mi_scores_.sort_values(ascending=False).head(20).to_dict() if fs else {},
                 'top_features_pi': fs._pi_importance_.sort_values(ascending=False).head(20).to_dict() if fs else {},
                 'engineering_metadata': eng_meta,
@@ -356,6 +500,15 @@ implementation:
             print(f"Reduction: {X_eng.shape[1] - X_selected.shape[1]} features removed")
             print(f"Final dataset shape: {X_selected.shape[0]} rows × {X_selected.shape[1]} features")
             print(f"Target shape: {y_train.shape}")
+            print(f"Target correlation filter enabled: {enable_target_corr}")
+            if enable_target_corr and fs:
+                print(f"Features dropped by target correlation: {len(fs._target_corr_dropped_)}")
+                if fs._target_corr_dropped_:
+                    print(f"Top 5 lowest correlated features dropped:")
+                    dropped_scores = fs._target_corr_scores_.loc[fs._target_corr_dropped_].sort_values()
+                    for feat, score in dropped_scores.head(5).items():
+                        print(f"  - {feat}: {score:.6f}")
+            
             print(f"Outputs saved:")
             print(f"  - train_X: {args.train_X}")
             print(f"  - train_y: {args.train_y_out}")
@@ -367,13 +520,18 @@ implementation:
                 print(f"Feature selection stages:")
                 print(f"  1. Variance filter: {X_eng.shape[1]} → {len(fs._filter_keep_)} features")
                 print(f"  2. Correlation filter: {len(fs._filter_keep_)} → {len(fs._relevance_keep_)} features")
-                print(f"  3. MI ranking: {len(fs._relevance_keep_)} → {len(fs._relevance_keep_)} features")
-                print(f"  4. Permutation importance: {len(fs._relevance_keep_)} → {len(fs.selected_features)} features")
+                if enable_target_corr:
+                    print(f"  3. Target correlation filter: {len(fs._relevance_keep_)} → {len(fs._target_corr_keep_)} features")
+                    print(f"     (dropped {len(fs._target_corr_dropped_)} features)")
+                stage_before_mi = len(fs._target_corr_keep_) if enable_target_corr else len(fs._relevance_keep_)
+                print(f"  4. MI ranking: {stage_before_mi} → {len(fs._relevance_keep_)} features")
+                print(f"  5. Permutation importance: {len(fs._relevance_keep_)} → {len(fs.selected_features)} features")
                 
                 print(f"Top 10 selected features (by MI score):")
-                top_10 = fs._mi_scores_.loc[fs.selected_features].sort_values(ascending=False).head(10)
-                for i, (feat, score) in enumerate(top_10.items(), 1):
-                    print(f"  {i}. {feat}: {score:.4f}")
+                if not fs._mi_scores_.empty:
+                    top_10 = fs._mi_scores_.loc[fs.selected_features].sort_values(ascending=False).head(10)
+                    for i, (feat, score) in enumerate(top_10.items(), 1):
+                        print(f"  {i}. {feat}: {score:.4f}")
             
             print(f"{'='*80}")
             print("SUCCESS: Complete preprocessing pipeline finished!")
@@ -396,6 +554,12 @@ implementation:
       - {inputValue: enable_feature_selection}
       - --model_type
       - {inputValue: model_type}
+      - --enable_target_corr_filter
+      - {inputValue: enable_target_corr_filter}
+      - --target_corr_threshold
+      - {inputValue: target_corr_threshold}
+      - --corr_method
+      - {inputValue: corr_method}
       - --train_X
       - {outputPath: train_X}
       - --train_y_out
