@@ -1,4 +1,4 @@
-name: Evaluate Model v16
+name: Evaluate Model v16.1
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -483,7 +483,7 @@ implementation:
                             feature_names = getattr(fs, 'selected_features', [f'feature_{i}' for i in range(Xs.shape[1])])
                             Xs_df = pd.DataFrame(Xs, columns=feature_names[:Xs.shape[1]])
                             yhat = np.asarray(model_obj.predict(Xs_df)).ravel()
-                                                all_preds[tgt] = yhat
+                        all_preds[tgt] = yhat
                         
                         if isinstance(y, pd.DataFrame) and tgt in y.columns:
                             all_ytrue[tgt] = y[tgt].values
