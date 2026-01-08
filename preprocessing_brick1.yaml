@@ -1,4 +1,4 @@
-name: Data Cleaning v1.7
+name: Data Cleaning v1.8
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Target column(s), comma-separated for multi-output"}
@@ -488,7 +488,7 @@ implementation:
             if strategy == 'fail':
                 error_msg = (
                     f"Label conflict detected! {report['conflicting_rows']} rows with identical features "
-                    f"have different labels across {report['unique_conflict_groups']} unique feature combinations.\n"
+                    f"have different labels across {report['unique_conflict_groups']} unique feature combinations"
                     f"Set label_conflict_strategy to 'drop' or 'majority' to handle conflicts."
                 )
                 raise ValueError(error_msg)
