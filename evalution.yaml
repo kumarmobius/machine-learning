@@ -1,4 +1,4 @@
-name: Evaluate Model v15.5
+name: Evaluate Model v16
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -418,10 +418,30 @@ implementation:
                 if fs is not None:
                     logger.info("Applying feature selector...")
                     if hasattr(fs, "selected_features"):
+                        # Ensure we use the exact features the model was trained on
                         Xs = Xp.reindex(columns=list(fs.selected_features), fill_value=0.0)
+                        # If any selected features are missing, create them with zeros
+                        missing_features = set(fs.selected_features) - set(Xp.columns)
+                        if missing_features:
+                            logger.warning(f"  Creating {len(missing_features)} missing features with zeros")
+                            for feat in missing_features:
+                                Xp[feat] = 0.0
+                            Xs = Xp[list(fs.selected_features)]
                     else:
-                        Xs = fs.transform(Xp)
+                        try:
+                            # Try transform first
+                            Xs = fs.transform(Xp)
+                        except Exception as e:
+                            logger.warning(f"  Transform failed: {e}, trying reindex approach")
+                            # Fallback: if fs has selected_features attribute after loading
+                            if hasattr(fs, 'selected_features'):
+                                Xs = Xp.reindex(columns=list(fs.selected_features), fill_value=0.0)
+                            else:
+                                raise
                     logger.info(f"  After selection: {Xs.shape}")
+                    # Log feature names to debug
+                    if len(fs.selected_features) <= 20:
+                        logger.info(f"  Selected features: {fs.selected_features}")
                 else:
                     Xs = Xp
                 
@@ -455,8 +475,15 @@ implementation:
                         if not hasattr(model_obj, 'predict'):
                             raise ValueError(f"Could not find predict method for target {tgt}. Type: {type(model_obj)}")
                         
-                        yhat = np.asarray(model_obj.predict(Xs)).ravel()
-                        all_preds[tgt] = yhat
+                        if isinstance(Xs, pd.DataFrame):
+                            # Keep as DataFrame with feature names
+                            yhat = np.asarray(model_obj.predict(Xs)).ravel()
+                        else:
+                            # Convert to DataFrame with proper feature names
+                            feature_names = getattr(fs, 'selected_features', [f'feature_{i}' for i in range(Xs.shape[1])])
+                            Xs_df = pd.DataFrame(Xs, columns=feature_names[:Xs.shape[1]])
+                            yhat = np.asarray(model_obj.predict(Xs_df)).ravel()
+                                                all_preds[tgt] = yhat
                         
                         if isinstance(y, pd.DataFrame) and tgt in y.columns:
                             all_ytrue[tgt] = y[tgt].values
