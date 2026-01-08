@@ -1,4 +1,4 @@
-name: Stacking and Voting V10
+name: Stacking and Voting V10.1
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -123,8 +123,29 @@ implementation:
             CatBoostRegressor = None
       
         def load_parquet_df(path):
-            return pd.read_parquet(path) 
-      
+            try:
+                print(f"[INFO] Trying to read as Parquet: {path}")
+                return pd.read_parquet(path)
+            except Exception as e_parquet:
+                print(f"[WARN] Parquet read failed: {e_parquet}")
+        
+            try:
+                print(f"[INFO] Trying to read as CSV: {path}")
+                return pd.read_csv(path)
+            except Exception as e_csv:
+                print(f"[WARN] CSV read failed: {e_csv}")
+        
+            try:
+                print(f"[INFO] Trying to read as Excel: {path}")
+                return pd.read_excel(path)
+            except Exception as e_excel:
+                print(f"[WARN] Excel read failed: {e_excel}")
+        
+            raise ValueError(
+                f"Failed to read dataset '{path}'. "
+                f"Tried Parquet, CSV, and Excel formats."
+            )
+
         def ensure_dir_for(p):
             d = os.path.dirname(p)
             if d and not os.path.exists(d):
