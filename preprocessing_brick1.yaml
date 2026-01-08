@@ -1,4 +1,4 @@
-name: Data Cleaning v1.6
+name: Data Cleaning v1.7
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: target_column, type: String, description: "Target column(s), comma-separated for multi-output"}
@@ -6,7 +6,8 @@ inputs:
   - {name: unique_threshold, type: Float, description: "Drop columns with unique % above this (ID columns)", optional: true, default: "0.95"}
   - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
-  - {name: use_column, type: String, description: "Comma-separated list of columns to use (if empty, use all columns)", optional: true, default: ""}
+  - {name: label_conflict_strategy, type: String, description: "Strategy for handling label conflicts: drop, majority, or fail", optional: true, default: "fail"}
+  - {name: conflict_key_cols, type: String, description: "Columns to use for conflict detection (auto or comma-separated)", optional: true, default: "auto"}
 outputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features parquet"}
   - {name: cleaned_y, type: Dataset, description: "Target labels parquet"}
@@ -395,6 +396,157 @@ implementation:
 
             return df, report
 
+        def detect_and_handle_label_conflicts(X, y, target_cols, strategy='fail', conflict_key_cols='auto'):
+            # """
+            # Detect and handle label conflicts where identical feature rows have different labels.
+            
+            # Args:
+            #     X: Feature dataframe
+            #     y: Label dataframe
+            #     target_cols: List of target column names
+            #     strategy: 'fail', 'drop', or 'majority'
+            #     conflict_key_cols: 'auto' or comma-separated column names
+            
+            # Returns:
+            #     X_clean, y_clean, conflict_report
+            # """
+            report = {
+                'strategy': strategy,
+                'conflict_key_cols_spec': conflict_key_cols,
+                'total_rows': len(X),
+                'conflicting_rows': 0,
+                'unique_conflict_groups': 0,
+                'rows_dropped': 0,
+                'rows_kept': 0,
+                'conflict_examples': []
+            }
+            
+            # Determine which columns to use for conflict detection
+            if conflict_key_cols.strip().lower() == 'auto':
+                key_cols = list(X.columns)
+                report['conflict_key_cols_used'] = 'all_features'
+            else:
+                specified_cols = [c.strip() for c in conflict_key_cols.split(',') if c.strip()]
+                # Validate columns exist
+                missing_cols = [c for c in specified_cols if c not in X.columns]
+                if missing_cols:
+                    raise ValueError(f"Conflict key columns not found in features: {missing_cols}")
+                key_cols = specified_cols
+                report['conflict_key_cols_used'] = key_cols
+            
+            print(f"[INFO] Using {len(key_cols)} columns for conflict detection")
+            
+            # Combine X and y for grouping
+            combined = pd.concat([X[key_cols].reset_index(drop=True), y.reset_index(drop=True)], axis=1)
+            
+            # Make features hashable for grouping
+            X_hashable = X[key_cols].copy()
+            for col in X_hashable.columns:
+                if X_hashable[col].dtype == 'object' or pd.api.types.is_categorical_dtype(X_hashable[col]):
+                    try:
+                        # Try to handle unhashable types
+                        X_hashable[col] = X_hashable[col].apply(
+                            lambda v: json.dumps(v, sort_keys=True) if isinstance(v, (list, dict, set)) else v
+                        )
+                    except:
+                        X_hashable[col] = X_hashable[col].astype(str)
+            
+            # Create a group key from features
+            try:
+                combined['_group_key'] = X_hashable.apply(lambda row: tuple(row), axis=1)
+            except Exception as e:
+                # If tuple approach fails, convert to string
+                combined['_group_key'] = X_hashable.astype(str).apply(lambda row: '|'.join(row), axis=1)
+            
+            # Group by features and check for label conflicts
+            conflicts = []
+            conflict_indices = []
+            
+            for group_key, group_df in combined.groupby('_group_key'):
+                # Check if this group has multiple unique label combinations
+                label_combinations = group_df[target_cols].drop_duplicates()
+                
+                if len(label_combinations) > 1:
+                    conflicts.append({
+                        'group_size': len(group_df),
+                        'unique_labels': len(label_combinations),
+                        'label_values': label_combinations.values.tolist()
+                    })
+                    conflict_indices.extend(group_df.index.tolist())
+            
+            report['conflicting_rows'] = len(conflict_indices)
+            report['unique_conflict_groups'] = len(conflicts)
+            
+            # Store examples (limit to first 10)
+            report['conflict_examples'] = conflicts[:10]
+            
+            if report['conflicting_rows'] == 0:
+                print(f"[INFO] No label conflicts detected")
+                return X, y, report
+            
+            print(f"[WARNING] Detected {report['conflicting_rows']} conflicting rows in {report['unique_conflict_groups']} groups")
+            
+            # Handle conflicts based on strategy
+            if strategy == 'fail':
+                error_msg = (
+                    f"Label conflict detected! {report['conflicting_rows']} rows with identical features "
+                    f"have different labels across {report['unique_conflict_groups']} unique feature combinations.\n"
+                    f"Set label_conflict_strategy to 'drop' or 'majority' to handle conflicts."
+                )
+                raise ValueError(error_msg)
+            
+            elif strategy == 'drop':
+                # Remove all conflicting rows
+                keep_mask = ~combined.index.isin(conflict_indices)
+                X_clean = X[keep_mask].reset_index(drop=True)
+                y_clean = y[keep_mask].reset_index(drop=True)
+                report['rows_dropped'] = report['conflicting_rows']
+                report['rows_kept'] = len(X_clean)
+                print(f"[INFO] Dropped {report['rows_dropped']} conflicting rows")
+                return X_clean, y_clean, report
+            
+            elif strategy == 'majority':
+                # For each conflict group, keep only rows with the majority label
+                keep_indices = []
+                
+                for group_key, group_df in combined.groupby('_group_key'):
+                    label_combinations = group_df[target_cols].drop_duplicates()
+                    
+                    if len(label_combinations) > 1:
+                        # Find majority label(s)
+                        label_counts = group_df.groupby(target_cols).size()
+                        max_count = label_counts.max()
+                        majority_labels = label_counts[label_counts == max_count].index.tolist()
+                        
+                        # If there's a tie, keep the first one alphabetically/numerically
+                        if len(majority_labels) > 1:
+                            majority_label = sorted(majority_labels)[0]
+                        else:
+                            majority_label = majority_labels[0]
+                        
+                        # Keep only rows with majority label
+                        for idx, row in group_df.iterrows():
+                            if len(target_cols) == 1:
+                                if row[target_cols[0]] == majority_label:
+                                    keep_indices.append(idx)
+                            else:
+                                if tuple(row[target_cols]) == majority_label:
+                                    keep_indices.append(idx)
+                    else:
+                        # No conflict in this group, keep all
+                        keep_indices.extend(group_df.index.tolist())
+                
+                keep_mask = combined.index.isin(keep_indices)
+                X_clean = X[keep_mask].reset_index(drop=True)
+                y_clean = y[keep_mask].reset_index(drop=True)
+                report['rows_dropped'] = len(X) - len(X_clean)
+                report['rows_kept'] = len(X_clean)
+                print(f"[INFO] Resolved conflicts using majority voting: kept {report['rows_kept']}, dropped {report['rows_dropped']}")
+                return X_clean, y_clean, report
+            
+            else:
+                raise ValueError(f"Invalid label_conflict_strategy: {strategy}. Must be 'fail', 'drop', or 'majority'")
+
         # Main execution
         parser=argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
@@ -403,7 +555,8 @@ implementation:
         parser.add_argument('--unique_threshold', type=float, default=0.95)
         parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
         parser.add_argument('--preview_rows', type=int, default=20)
-        parser.add_argument('--use_column', type=str, default='')
+        parser.add_argument('--label_conflict_strategy', type=str, default='fail')
+        parser.add_argument('--conflict_key_cols', type=str, default='auto')
         parser.add_argument('--cleaned_X', type=str, required=True)
         parser.add_argument('--cleaned_y', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
@@ -411,11 +564,13 @@ implementation:
 
         try:
             print("="*80)
-            print("BRICK 1: DATA CLEANING v1.6 (with date deduplication)")
+            print("BRICK 1: DATA CLEANING v1.7 (with label conflict detection)")
             print("="*80)
             
             target_cols = [t.strip() for t in args.target_column.split(',')] if ',' in args.target_column else [args.target_column.strip()]
             print(f"[INFO] Targets: {target_cols}")
+            print(f"[INFO] Label conflict strategy: {args.label_conflict_strategy}")
+            print(f"[INFO] Conflict key columns: {args.conflict_key_cols}")
             
             # Load data
             print("[STEP 1/10] Loading data...")
@@ -440,28 +595,6 @@ implementation:
             y_raw = df[target_cols].copy()
             X_raw = df.drop(columns=target_cols).copy()
             print(f"[INFO] X: {X_raw.shape}, y: {y_raw.shape}")
-
-            # Filter to user-specified columns (if any)
-            print("[STEP 4.1/10] Filtering to user-specified columns...")
-            kept_user_cols = []
-            missing_user_cols = []
-            all_columns_before_filter = list(X_raw.columns)
-            
-            if args.use_column and args.use_column.strip():
-                to_use = [c.strip() for c in args.use_column.split(',') if c.strip()]
-                kept_user_cols = [c for c in to_use if c in X_raw.columns]
-                missing_user_cols = [c for c in to_use if c not in X_raw.columns]
-                
-                if kept_user_cols:
-                    X_raw = X_raw[kept_user_cols]
-                    print(f"[INFO] Kept {len(kept_user_cols)} user-specified columns: {kept_user_cols}")
-                    if missing_user_cols:
-                        print(f"[WARNING] Columns not found: {missing_user_cols}")
-                else:
-                    print(f"[ERROR] None of the specified columns found in dataset", file=sys.stderr)
-                    sys.exit(1)
-            else:
-                print("[INFO] No column filtering - using all columns")
             
             # Drop high-missing columns
             print(f"[STEP 5/10] Dropping columns >{args.missing_threshold*100}% missing...")
@@ -519,11 +652,19 @@ implementation:
             dropped_y = int((~keep_mask).sum())
             if dropped_y > 0:
                 print(f"[INFO] Dropping {dropped_y} rows with missing targets")
-            X_final = X_dates.loc[keep_mask].reset_index(drop=True)
-            y_final = y_raw.loc[keep_mask].reset_index(drop=True)
+            X_no_missing = X_dates.loc[keep_mask].reset_index(drop=True)
+            y_no_missing = y_raw.loc[keep_mask].reset_index(drop=True)
+            
+            # Detect and handle label conflicts
+            print(f"[STEP 10/10] Detecting and handling label conflicts...")
+            X_final, y_final, conflict_report = detect_and_handle_label_conflicts(
+                X_no_missing, y_no_missing, target_cols, 
+                strategy=args.label_conflict_strategy,
+                conflict_key_cols=args.conflict_key_cols
+            )
             
             # Save outputs
-            print(f"[STEP 10/10] Saving outputs...")
+            print(f"[STEP 11/10] Saving outputs...")
             ensure_dir_for(args.cleaned_X)
             ensure_dir_for(args.cleaned_y)
             ensure_dir_for(args.cleaning_metadata)
@@ -533,7 +674,7 @@ implementation:
             
             metadata = {
                 'timestamp': datetime.utcnow().isoformat()+'Z',
-                'version': '1.6',
+                'version': '1.7',
                 'target_columns': target_cols,
                 'n_targets': len(target_cols),
                 'original_shape': {'rows': before, 'cols': len(df.columns)},
@@ -542,13 +683,11 @@ implementation:
                 'dropped_missing_cols': cols_to_drop_missing,
                 'dropped_unique_cols': cols_to_drop_unique,
                 'dropped_rows_missing_y': dropped_y,
-                'user_specified_columns': kept_user_cols if kept_user_cols else 'all',
-                'missing_user_columns': missing_user_cols,
-                'all_columns_before_filter': all_columns_before_filter,
                 'missing_report': missing_report,
                 'unique_report': unique_report,
                 'conversion_report': conv_report,
                 'date_report': date_report,
+                'conflict_report': conflict_report,
                 'column_names': list(X_final.columns)
             }
             
@@ -579,8 +718,10 @@ implementation:
       - {inputValue: numeric_detection_threshold}
       - --preview_rows
       - {inputValue: preview_rows}
-      - --use_column
-      - {inputValue: use_column}
+      - --label_conflict_strategy
+      - {inputValue: label_conflict_strategy}
+      - --conflict_key_cols
+      - {inputValue: conflict_key_cols}
       - --cleaned_X
       - {outputPath: cleaned_X}
       - --cleaned_y
