@@ -1,4 +1,4 @@
-name: Imputation and Cleaning v2.1
+name: Imputation and Cleaning v2.2
 inputs:
   - name: cleaned_X
     type: Dataset
@@ -183,9 +183,25 @@ implementation:
             target_cols = cleaning_meta['target_columns']
             
             # Identify column types
+            # Handle datetime columns separately
+            datetime_cols = X.select_dtypes(include=['datetime64', 'datetime']).columns.tolist()
             num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-            cat_cols = [c for c in X.columns if c not in num_cols]
-            print(f"[INFO] Numeric: {len(num_cols)}, Categorical: {len(cat_cols)}")
+            cat_cols = [c for c in X.columns if c not in num_cols and c not in datetime_cols]
+            
+            print(f"[INFO] Numeric: {len(num_cols)}, Categorical: {len(cat_cols)}, Datetime: {len(datetime_cols)}")
+            
+            # Convert datetime columns to numeric (unix timestamp) for processing
+            datetime_config = {}
+            for c in datetime_cols:
+                datetime_config[c] = {
+                    'original_dtype': str(X[c].dtype),
+                    'is_datetime': True
+                }
+                # Convert to unix timestamp (seconds since epoch)
+                X[c] = pd.to_datetime(X[c], errors='coerce').astype('int64') / 10**9
+                num_cols.append(c)  # Treat as numeric after conversion
+            
+            print(f"[INFO] Converted {len(datetime_cols)} datetime columns to numeric")
             
             # Clean inf/nan strings
             print("[STEP 2/6] Cleaning data...")
@@ -254,10 +270,10 @@ implementation:
             
             cat_config = {}
             for c in cat_cols:
-                s = X[c].astype(object)
+                s = X[c].astype(str)  # Convert to string to avoid Timestamp issues
                 cfg = {
-                    'n_unique': int(s.nunique(dropna=True)),
-                    'missing_frac': float(s.isna().mean())
+                    'n_unique': int(pd.Series(s).nunique(dropna=True)),
+                    'missing_frac': float(pd.Series(s).isna().mean())
                 }
                 
                 # Impute missing values
@@ -268,6 +284,8 @@ implementation:
                     elif args.cat_imputer == 'constant':
                         imp = SimpleImputer(strategy='constant', fill_value=args.cat_imputer_constant_value)
                         X[c] = imp.fit_transform(X[[c]].astype(str)).reshape(-1)
+                else:
+                    X[c] = X[c].astype(str)
                 
                 # Collapse rare labels
                 collapsed, rare_set = collapse_rare_labels(X[c], threshold_frac=args.rare_threshold)
@@ -297,6 +315,8 @@ implementation:
                 'target_columns': target_cols,
                 'num_cols': num_cols,
                 'cat_cols': cat_cols,
+                'datetime_cols': list(datetime_config.keys()),
+                'datetime_config': datetime_config,
                 'cat_config': cat_config,
                 'numeric_imputation_methods': col_imputation_methods,
                 'outliers_removed': outliers_removed,
