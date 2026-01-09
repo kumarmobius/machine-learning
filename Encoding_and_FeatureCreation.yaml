@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v4.3
+name: Encoding and Feature Creation v4.4
 inputs:
   - name: imputed_X
     type: Dataset
@@ -106,13 +106,13 @@ implementation:
   container:
     image: gurpreetgandhi/nesy-factory:vtest4
     command:
-    - sh
-    - -c
-    - |
-      # Install feature-engine (other packages should already be in the image)
-      PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location \
-        'feature-engine'
-      exec "$0" "$@"
+      - sh
+      - -c
+      - |
+        # Install feature-engine (other packages should already be in the image)
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location \
+          'feature-engine'
+        exec "$0" "$@"
       - python3
       - -u
       - -c
