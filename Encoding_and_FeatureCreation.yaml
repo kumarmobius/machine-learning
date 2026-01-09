@@ -1,0 +1,397 @@
+name: Encoding and Feature Creation v2.1
+inputs:
+  - name: imputed_X
+    type: Dataset
+    description: "Imputed features from Part 1"
+  
+  - name: aligned_y
+    type: Dataset
+    description: "Aligned targets from Part 1"
+  
+  - name: imputation_config
+    type: Data
+    description: "Config from Part 1 with column info"
+
+  - name: create_interactions
+    type: String
+    description: "'true' or 'false' - Create polynomial interactions"
+    optional: true
+    default: "false"
+  
+  - name: interaction_degree
+    type: Integer
+    description: "Polynomial degree (2 recommended)"
+    optional: true
+    default: "2"
+  
+  - name: max_interaction_features
+    type: Integer
+    description: "Maximum interaction features to create"
+    optional: true
+    default: "15"
+
+outputs:
+  - {name: engineered_X, type: Dataset, description: "Final engineered features"}
+  - {name: train_y, type: Dataset, description: "Final aligned targets"}
+  - {name: preprocessor, type: Data, description: "Fitted preprocessor pickle"}
+  - {name: engineering_metadata, type: Data, description: "Complete metadata JSON"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, traceback, gzip
+        from datetime import datetime
+        from itertools import combinations
+        import pandas as pd, numpy as np
+        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
+        from sklearn.pipeline import Pipeline
+        from sklearn.model_selection import StratifiedKFold, KFold
+        import cloudpickle
+        
+        def ensure_dir_for(p):
+            d=os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def choose_scaler_for_series(s):
+            v=s.dropna()
+            if v.empty or v.std(ddof=0)==0: 
+                return StandardScaler()
+            skew=float(v.skew())
+            kurt=float(v.kurtosis()) if len(v)>3 else 0.0
+            extreme_frac=float(((v - v.mean()).abs() > 3*v.std(ddof=0)).mean())
+            if (v.min()>=0.0 and v.max()<=1.0): 
+                return MinMaxScaler()
+            if abs(skew)>=1.0: 
+                return Pipeline([('power',PowerTransformer(method='yeo-johnson')),('std',StandardScaler())])
+            if extreme_frac>0.01 or abs(kurt)>10: 
+                return RobustScaler()
+            return StandardScaler()
+
+        def choose_categorical_encoder(col, series, target_series=None, model_type='classification'):
+            nunique = series.nunique(dropna=True)
+            if nunique <= 2:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            elif nunique <= 10:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            elif nunique <= 50:
+                if target_series is not None and model_type == 'classification':
+                    return 'target_kfold', None
+                else:
+                    return 'count', None
+            else:
+                if target_series is not None and model_type == 'classification':
+                    return 'target_kfold', None
+                else:
+                    return 'count', None
+
+        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42):
+            X_col = df[col].astype(object).fillna('__NA__')
+            global_mean = float(y.mean())
+            oof = pd.Series(index=df.index, dtype=float)
+            try:
+                kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                splits = list(kf.split(df, y))
+            except:
+                kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                splits = list(kf.split(df))
+            for train_idx, val_idx in splits:
+                train_means = y.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
+                oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
+            counts = X_col.value_counts()
+            smooth_map = {}
+            for cat, cnt in counts.items():
+                if cnt > 0:
+                    cat_mean = float(y[X_col == cat].mean())
+                    alpha = cnt / (cnt + smoothing)
+                    smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
+                else:
+                    smooth_map[cat] = global_mean
+            return oof.fillna(global_mean), smooth_map, global_mean
+
+        def add_polynomial_features(df, numeric_cols, degree=2, max_features=20):
+            if len(numeric_cols) < 2:
+                return df
+            print(f"[INFO] Creating polynomial features (degree={degree})")
+            variances = df[numeric_cols].var().sort_values(ascending=False)
+            top_cols = variances.head(min(5, len(numeric_cols))).index.tolist()
+            new_features = {}
+            interaction_count = 0
+            for col1, col2 in combinations(top_cols, 2):
+                if interaction_count >= max_features:
+                    break
+                new_features[f"{col1}_x_{col2}"] = df[col1] * df[col2]
+                interaction_count += 1
+                if (df[col2] != 0).all():
+                    new_features[f"{col1}_div_{col2}"] = df[col1] / df[col2]
+                    interaction_count += 1
+                if interaction_count >= max_features:
+                    break
+            if degree == 2 and interaction_count < max_features:
+                for col in top_cols[:3]:
+                    if interaction_count >= max_features:
+                        break
+                    new_features[f"{col}_squared"] = df[col] ** 2
+                    interaction_count += 1
+            for name, values in new_features.items():
+                df[name] = values
+            print(f"[INFO] Created {len(new_features)} polynomial features")
+            return df
+
+        class Preprocessor:
+            def __init__(self):
+                self.col_config = {}
+                self.metadata = {}
+                self.imputation_fitted = False
+            
+            def fit(self, df, y=None, config=None, model_type='classification'):
+                self.metadata = config or {}
+                self.metadata['model_type'] = model_type
+                num_cols = self.metadata['num_cols']
+                cat_cols = self.metadata['cat_cols']
+                target_cols = self.metadata['target_columns']
+                
+                # Store imputation info from Part 1
+                self.imputation_fitted = True
+                self.numeric_imputation_methods = self.metadata.get('numeric_imputation_methods', {})
+                
+                # Scale numeric columns
+                print("[INFO] Fitting scalers...")
+                for c in num_cols:
+                    if c in df.columns:
+                        scaler = choose_scaler_for_series(df[c])
+                        scaler.fit(df[[c]].fillna(df[c].median()))
+                        self.col_config[c] = {'scaler': scaler}
+                
+                # Encode categorical columns
+                print("[INFO] Fitting encoders...")
+                for c in cat_cols:
+                    if c not in df.columns or c in target_cols:
+                        continue
+                    
+                    cfg = self.metadata['cat_config'].get(c, {})
+                    s = df[c].astype(object)
+                    enc_type, enc_obj = choose_categorical_encoder(c, s, target_series=y, model_type=model_type)
+                    
+                    if enc_type == 'onehot':
+                        enc_obj.fit(df[[c]].astype(str))
+                        cfg['encoder_type'] = enc_type
+                        cfg['encoder_obj'] = enc_obj
+                        cfg['ohe_columns'] = [f"{c}__{cat}" for cat in enc_obj.categories_[0]]
+                    
+                    elif enc_type == 'target_kfold' and y is not None:
+                        oof, test_map, gmean = fit_target_encoder_kfold(df, c, y, n_splits=5, smoothing=1.0)
+                        cfg['encoder_type'] = enc_type
+                        cfg['oof_encoding'] = oof
+                        cfg['target_mapping'] = test_map
+                        cfg['target_global_mean'] = float(gmean)
+                    
+                    elif enc_type == 'count':
+                        counts = df[c].astype(object).value_counts().to_dict()
+                        cfg['encoder_type'] = enc_type
+                        cfg['count_map'] = counts
+                    
+                    self.col_config[c] = cfg
+                
+                return self
+            
+            def transform(self, df, training_mode=False):
+                df = df.copy()
+                num_cols = self.metadata['num_cols']
+                cat_cols = self.metadata['cat_cols']
+                target_cols = self.metadata['target_columns']
+                
+                # Check if data needs imputation
+                if not self.imputation_fitted:
+                    raise ValueError("This preprocessor expects pre-imputed data. Run Part 1 (Imputation) first!")
+                
+                # Verify no missing values in numeric columns
+                missing_numeric = [c for c in num_cols if c in df.columns and df[c].isna().any()]
+                if missing_numeric and not training_mode:
+                    print(f"[WARNING] Found missing values in: {missing_numeric}. Apply basic imputation...")
+                    for c in missing_numeric:
+                        df[c] = df[c].fillna(df[c].median())
+                
+                # Scale numeric columns
+                print("[INFO] Scaling numeric columns...")
+                for c in num_cols:
+                    if c in df.columns and c in self.col_config:
+                        scaler = self.col_config[c]['scaler']
+                        df[c] = scaler.transform(df[[c]].fillna(df[c].median())).reshape(-1)
+                
+                # Create interactions if training mode
+                if training_mode and self.metadata.get('create_interactions', False):
+                    print("[INFO] Creating interactions...")
+                    current_num = [c for c in df.columns if c in num_cols]
+                    if len(current_num) >= 2:
+                        df = add_polynomial_features(
+                            df, current_num, 
+                            degree=self.metadata.get('interaction_degree', 2),
+                            max_features=self.metadata.get('max_interaction_features', 15)
+                        )
+                
+                # Encode categorical columns
+                print("[INFO] Encoding categorical columns...")
+                for c in cat_cols:
+                    if c not in df.columns or c in target_cols or c not in self.col_config:
+                        continue
+                    
+                    cfg = self.col_config[c]
+                    enc_type = cfg.get('encoder_type')
+                    
+                    if enc_type == 'onehot':
+                        ohe = cfg['encoder_obj']
+                        arr = ohe.transform(df[[c]].astype(str))
+                        df_ohe = pd.DataFrame(arr, columns=cfg['ohe_columns'], index=df.index)
+                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                    
+                    elif enc_type == 'target_kfold':
+                        if training_mode and 'oof_encoding' in cfg:
+                            df[c] = cfg['oof_encoding'].reindex(df.index, fill_value=cfg['target_global_mean']).astype(float)
+                        else:
+                            mapping = cfg.get('target_mapping', {})
+                            gmean = cfg.get('target_global_mean', 0.0)
+                            df[c] = df[c].map(lambda x: mapping.get(x, gmean)).astype(float)
+                    
+                    elif enc_type == 'count':
+                        cnt_map = cfg.get('count_map', {})
+                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0)).astype(float)
+                
+                df.replace([np.inf, -np.inf], np.nan, inplace=True)
+                return df
+            
+            def save(self, path):
+                with gzip.open(path, "wb") as f:
+                    cloudpickle.dump(self, f)
+            
+            @staticmethod
+            def load(path):
+                with gzip.open(path, "rb") as f:
+                    return cloudpickle.load(f)
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--imputed_X', type=str, required=True)
+        parser.add_argument('--aligned_y', type=str, required=True)
+        parser.add_argument('--imputation_config', type=str, required=True)
+        parser.add_argument('--create_interactions', type=str, default="false")
+        parser.add_argument('--interaction_degree', type=int, default=2)
+        parser.add_argument('--max_interaction_features', type=int, default=15)
+        parser.add_argument('--engineered_X', type=str, required=True)
+        parser.add_argument('--train_y', type=str, required=True)
+        parser.add_argument('--preprocessor', type=str, required=True)
+        parser.add_argument('--engineering_metadata', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            print("="*80)
+            print("PART 2: ENCODING & FEATURE CREATION")
+            print("="*80)
+            
+            # Load data
+            print("[STEP 1/5] Loading imputed data...")
+            X = pd.read_parquet(args.imputed_X)
+            y = pd.read_parquet(args.aligned_y)
+            
+            with open(args.imputation_config, 'r') as f:
+                config = json.load(f)
+            
+            print(f"[INFO] X shape: {X.shape}, y shape: {y.shape}")
+            
+            # Add interaction config
+            create_interactions = str(args.create_interactions).lower() in ("1","true","t","yes","y")
+            config['create_interactions'] = create_interactions
+            config['interaction_degree'] = args.interaction_degree
+            config['max_interaction_features'] = args.max_interaction_features
+            
+            # Fit preprocessor
+            print("[STEP 2/5] Fitting preprocessor...")
+            pre = Preprocessor()
+            
+            target_cols = config['target_columns']
+            model_type = config['model_type']
+            
+            if isinstance(y, pd.DataFrame) and len(target_cols) > 1:
+                y_for_fit = y[target_cols[0]]
+            elif isinstance(y, pd.DataFrame):
+                y_for_fit = y[target_cols[0]]
+            else:
+                y_for_fit = y
+            
+            pre.fit(X, y=y_for_fit if model_type == 'classification' else None, config=config, model_type=model_type)
+            
+            # Transform
+            print("[STEP 3/5] Transforming features...")
+            X_engineered = pre.transform(X, training_mode=True)
+            print(f"[INFO] Engineered shape: {X_engineered.shape}")
+            
+            # Optimize dtypes
+            print("[STEP 4/5] Optimizing dtypes...")
+            for col in X_engineered.select_dtypes(include=[np.number]).columns:
+                try:
+                    X_engineered[col] = pd.to_numeric(X_engineered[col], downcast='float')
+                except:
+                    pass
+            
+            # Save outputs
+            print("[STEP 5/5] Saving outputs...")
+            ensure_dir_for(args.engineered_X)
+            ensure_dir_for(args.train_y)
+            ensure_dir_for(args.preprocessor)
+            ensure_dir_for(args.engineering_metadata)
+            
+            X_engineered.to_parquet(args.engineered_X, index=False)
+            y.to_parquet(args.train_y, index=False)
+            pre.save(args.preprocessor)
+            
+            # Metadata
+            metadata = {
+                'timestamp': datetime.utcnow().isoformat()+'Z',
+                'model_type': model_type,
+                'target_columns': target_cols,
+                'interactions_created': create_interactions,
+                'final_shape': {
+                    'rows': X_engineered.shape[0],
+                    'cols': X_engineered.shape[1]
+                },
+                'part1_config': config
+            }
+            
+            with open(args.engineering_metadata, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print("="*80)
+            print("PART 2 COMPLETE")
+            print(f"Final shape: {X_engineered.shape}")
+            print(f"Interactions: {create_interactions}")
+            print("="*80)
+            
+        except Exception as exc:
+            print("ERROR: " + str(exc), file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --imputed_X
+      - {inputPath: imputed_X}
+      - --aligned_y
+      - {inputPath: aligned_y}
+      - --imputation_config
+      - {inputPath: imputation_config}
+      - --create_interactions
+      - {inputValue: create_interactions}
+      - --interaction_degree
+      - {inputValue: interaction_degree}
+      - --max_interaction_features
+      - {inputValue: max_interaction_features}
+      - --engineered_X
+      - {outputPath: engineered_X}
+      - --train_y
+      - {outputPath: train_y}
+      - --preprocessor
+      - {outputPath: preprocessor}
+      - --engineering_metadata
+      - {outputPath: engineering_metadata}
