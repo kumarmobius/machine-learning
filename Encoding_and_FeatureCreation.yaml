@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v4.5
+name: Encoding and Feature Creation v4.6
 inputs:
   - name: imputed_X
     type: Dataset
@@ -141,37 +141,15 @@ implementation:
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
-        # Add this helper function at the top
-        def convert_to_serializable(obj):
-            if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
-                return int(obj)
-            elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
-                return float(obj)
-            elif isinstance(obj, (np.bool_, np.bool)):
-                return bool(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, pd.Series):
-                return obj.tolist()
-            elif isinstance(obj, pd.DataFrame):
-                return obj.to_dict()
-            elif isinstance(obj, dict):
-                return {key: convert_to_serializable(value) for key, value in obj.items()}
-            elif isinstance(obj, (list, tuple)):
-                return [convert_to_serializable(item) for item in obj]
-            else:
-                return obj
-        
-        # Then when saving metadata:
-        metadata_serializable = convert_to_serializable(metadata)
-        with open(args.engineering_metadata, 'w') as f:
-            json.dump(metadata_serializable, f, indent=2)
-
-            
-        def analyze_numeric_feature(series):
-            v = series.dropna()
-            if len(v) < 10:
-                return None
+        # ADVANCED NUMERIC TRANSFORMER SELECTION 
+        # Add this after imports
+        def safe_sqrt(x):
+            result = np.sqrt(x)
+            return result.flatten() if hasattr(result, 'flatten') and len(result.shape) > 1 else result
+                def analyze_numeric_feature(series):
+                    v = series.dropna()
+                    if len(v) < 10:
+                        return None
             
             stats_dict = {
                 'n_samples': len(v),
@@ -181,9 +159,9 @@ implementation:
                 'max': float(v.max()),
                 'skewness': float(v.skew()),
                 'kurtosis': float(v.kurtosis()),
-                'is_positive': (v.min() > 0),
-                'has_negatives': (v.min() < 0),
-                'has_zeros': (v.min() <= 0 <= v.max()),
+                'is_positive': bool(v.min() > 0),
+                'has_negatives': bool(v.min() < 0),
+                'has_zeros': bool(v.min() <= 0 <= v.max()),
                 'range': float(v.max() - v.min()),
                 'cv': float(v.std() / v.mean()) if v.mean() != 0 else float('inf'),
                 'q1': float(v.quantile(0.25)),
@@ -319,7 +297,7 @@ implementation:
             elif transform_type == 'logcp':
                 transformer = LogCpTransformer()
             elif transform_type == 'sqrt':
-                transformer = FunctionTransformer(np.sqrt)
+                transformer = FunctionTransformer(safe_sqrt)
             elif transform_type == 'reciprocal':
                 transformer = ReciprocalTransformer()
             elif transform_type == 'arcsin':
@@ -737,12 +715,7 @@ implementation:
                                 # Transform the column
                                 transformed = transformer.transform(df[[c]])
                                 if hasattr(transformed, 'shape') and transformed.shape[1] == 1:
-                                    # Handle both numpy arrays and DataFrames
-                                    if isinstance(transformed, np.ndarray):
-                                        df[c] = transformed.flatten()
-                                    else:
-                                        # DataFrame or 2D array
-                                        df[c] = transformed.iloc[:, 0] if hasattr(transformed, 'iloc') else transformed[:, 0]
+                                    df[c] = transformed.flatten()
                                 else:
                                     df[c] = transformed
                             except Exception as e:
