@@ -1,21 +1,168 @@
 name: Feature Engineering v2.1
 inputs:
-  - {name: cleaned_X, type: Dataset, description: "Cleaned features from Brick 1"}
-  - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
-  - {name: cleaning_metadata, type: Data, description: "Metadata from Brick 1"}
-  - {name: model_type, type: String, description: "classification or regression"}
-  - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none", optional: true, default: "none"}
-  - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
-  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer", optional: true, default: "5000"}
-  - {name: numeric_imputer, type: String, description: "auto|median|mean|constant|knn|iterative", optional: true, default: "auto"}
-  - {name: numeric_imputer_constant_value, type: Float, description: "Value for constant numeric imputation", optional: true, default: "-1"}
-  - {name: cat_imputer, type: String, description: "most_frequent|constant", optional: true, default: "most_frequent"}
-  - {name: cat_imputer_constant_value, type: String, description: "Value for constant categorical imputation", optional: true, default: "MISSING"}
-  - {name: rare_threshold, type: Float, description: "Rare label threshold", optional: true, default: "0.01"}
-  - {name: enable_string_similarity, type: String, description: "true/false for high-cardinality grouping", optional: true, default: "false"}
-  - {name: create_interactions, type: String, description: "true/false to create polynomial interactions", optional: true, default: "false"}
-  - {name: interaction_degree, type: Integer, description: "Polynomial degree for interactions", optional: true, default: "2"}
-  - {name: max_interaction_features, type: Integer, description: "Max interaction features to create", optional: true, default: "15"}
+  - name: cleaned_X
+    type: Dataset
+    description: "Cleaned feature dataset from Data Cleaning step (parquet format)"
+  
+  - name: cleaned_y
+    type: Dataset
+    description: "Target variable(s) from Data Cleaning step (parquet format). Can be single or multi-target."
+  
+  - name: cleaning_metadata
+    type: Data
+    description: "JSON metadata from Data Cleaning step containing column information and statistics"
+  
+  - name: model_type
+    type: String
+    description: |
+      Task type for preprocessing strategy:
+      • 'classification' - Uses target encoding for high-cardinality categoricals, stratified CV
+      • 'regression' - Uses count encoding, standard CV
+
+  - name: outlier_strategy
+    type: String
+    description: |
+      Method for handling outliers in numeric features:
+      • 'none' (default) - No outlier handling
+      • 'drop_iqr' - Remove rows where ANY numeric column is outside [Q1-fold*IQR, Q3+fold*IQR]
+      • 'winsorize' - Cap outliers at [Q1-fold*IQR, Q3+fold*IQR] boundaries
+      Note: Only applied during training (training_mode=True)
+    optional: true
+    default: "none"
+  
+  - name: outlier_fold
+    type: Float
+    description: |
+      IQR multiplier for outlier detection (typically 1.5 or 3.0):
+      • 1.5 (default) - Standard outlier detection (more aggressive)
+      • 3.0 - Extreme outlier detection only (more conservative)
+      • Custom values allowed for fine-tuning
+    optional: true
+    default: "1.5"
+  - name: max_knn_rows
+    type: Integer
+    description: |
+      Maximum dataset rows to use KNN imputation (computational limit):
+      • Above this threshold, switches to Iterative imputation
+      • Increase for better imputation on large datasets (with longer runtime)
+      • Decrease to speed up processing on large datasets
+    optional: true
+    default: "5000"
+  
+  - name: numeric_imputer
+    type: String
+    description: |
+      Imputation strategy for missing numeric values:
+      • 'auto' (default) - Smart selection based on data:
+          ├─ <2% missing → median
+          ├─ <25% missing + rows≤max_knn_rows → KNN
+          └─ otherwise → iterative
+      • 'median' - Fill with column median (fast, robust to outliers)
+      • 'mean' - Fill with column mean (faster, sensitive to outliers)
+      • 'constant' - Fill with specified constant value
+      • 'knn' - K-Nearest Neighbors imputation (slow, preserves correlations)
+      • 'iterative' - MICE algorithm imputation (slowest, most sophisticated)
+    optional: true
+    default: "auto"
+  
+  - name: numeric_imputer_constant_value
+    type: Float
+    description: |
+      Constant value for numeric imputation when numeric_imputer='constant':
+      • -1 (default) - Common choice to flag missing values
+      • 0 - For features where missing means absence
+      • 999 or -999 - Extreme values to explicitly mark missingness
+      • Any custom float value
+    optional: true
+    default: "-1"
+  - name: cat_imputer
+    type: String
+    description: |
+      Imputation strategy for missing categorical values:
+      • 'most_frequent' (default) - Fill with mode (most common category)
+      • 'constant' - Fill with specified constant string
+      Common patterns:
+      ├─ Use 'most_frequent' when missing is random
+      └─ Use 'constant' when missing has meaning (e.g., 'Unknown', 'Not_Provided')
+    optional: true
+    default: "most_frequent"
+  
+  - name: cat_imputer_constant_value
+    type: String
+    description: |
+      Constant string for categorical imputation when cat_imputer='constant':
+      • 'MISSING' (default) - Generic missing indicator
+      • 'Unknown' - More descriptive missing label
+      • 'Not_Provided' - Explicit user-driven missingness
+      • 'NA' or 'None' - Short missing indicators
+      • Any custom string value
+    optional: true
+    default: "MISSING"
+  - name: rare_threshold
+    type: Float
+    description: |
+      Fraction threshold for collapsing rare categories into '__RARE__':
+      • 0.01 (default) - Categories appearing in <1% of rows are collapsed
+      • 0.05 - More aggressive (5% threshold)
+      • 0.001 - Less aggressive (0.1% threshold)
+      • 0 - No rare label collapsing
+      Helps prevent:
+      ├─ Overfitting on rare categories
+      ├─ High-dimensional one-hot encoding
+      └─ Issues with unseen categories in test data
+    optional: true
+    default: "0.01"
+  
+  - name: enable_string_similarity
+    type: String
+    description: |
+      Group similar category names using fuzzy string matching:
+      • 'false' (default) - No grouping, keep categories as-is
+      • 'true' - Group similar strings (e.g., 'New York', 'new york', 'NY' → 'New York')
+      Uses token_sort_ratio with 90% similarity threshold
+      Useful for:
+      ├─ Inconsistent data entry (capitalization, spacing)
+      ├─ Abbreviations vs full names
+      └─ Typos and variations
+      Warning: Only for high-cardinality (>20 unique) categoricals
+    optional: true
+    default: "false"
+  - name: create_interactions
+    type: String
+    description: |
+      Create polynomial interaction features from numeric columns:
+      • 'false' (default) - No interactions created
+      • 'true' - Generate interactions between top variance features
+      Creates:
+      ├─ Multiplicative interactions (col1 × col2)
+      ├─ Division interactions (col1 ÷ col2)
+      └─ Squared terms (col²)
+      Note: Only applied during training (training_mode=True)
+      Warning: Increases feature count and training time
+    optional: true
+    default: "false"
+  
+  - name: interaction_degree
+    type: Integer
+    description: |
+      Polynomial degree for interaction features:
+      • 2 (default) - Pairwise interactions and squares (col1×col2, col²)
+      • 1 - No polynomial terms (not recommended if create_interactions=true)
+      Higher degrees create more features but risk overfitting
+    optional: true
+    default: "2"
+  
+  - name: max_interaction_features
+    type: Integer
+    description: |
+      Maximum number of interaction features to create:
+      • 15 (default) - Balanced feature creation
+      • 5-10 - Conservative (fewer features, less overfitting risk)
+      • 20-50 - Aggressive (more features, higher model capacity)
+      Algorithm selects top variance features first
+      Prevents feature explosion in high-dimensional data
+    optional: true
+    default: "15"
 outputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features parquet"}
   - {name: train_y, type: Dataset, description: "Target parquet (aligned after outlier removal)"}
