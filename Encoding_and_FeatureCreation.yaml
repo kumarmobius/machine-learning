@@ -261,7 +261,7 @@ implementation:
                 transform_reason.append(f"bounded_0_1_range")
             
             # 6. Check for count data (non-negative integers)
-            elif stats['min'] >= 0 and series.apply(float.is_integer).all():
+            elif stats['min'] >= 0 and series.apply(lambda x: float(x).is_integer()).all():
                 transform_type = 'sqrt'  # Square root for count data (variance stabilizing)
                 transform_reason.append(f"count_data")
             
