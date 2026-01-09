@@ -141,10 +141,8 @@ implementation:
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
-        # ADVANCED NUMERIC TRANSFORMER SELECTION
         # Add this helper function at the top
         def convert_to_serializable(obj):
-            """Convert numpy/pandas types to JSON-serializable types."""
             if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
                 return int(obj)
             elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
