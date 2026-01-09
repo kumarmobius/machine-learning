@@ -1,4 +1,4 @@
-name: Feature Engineering v2
+name: Feature Engineering v2.1
 inputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features from Brick 1"}
   - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
@@ -698,12 +698,44 @@ implementation:
                 elif enc_type == 'target_kfold':
                     encoder_summary[col]['n_categories'] = len(cfg.get('target_mapping', {}))
             
+            # Collect imputation summary
+            imputation_summary = {
+                'numeric': {
+                    'strategy': args.numeric_imputer,
+                    'constant_value': args.numeric_imputer_constant_value if args.numeric_imputer == 'constant' else None,
+                    'columns_imputed': {}
+                },
+                'categorical': {
+                    'strategy': args.cat_imputer,
+                    'constant_value': args.cat_imputer_constant_value if args.cat_imputer == 'constant' else None,
+                    'columns_imputed': {}
+                }
+            }
+            
+            # Record which columns used which imputation
+            for col in pre.num_cols:
+                cfg = pre.col_config.get(col, {})
+                if cfg.get('missing_frac', 0) > 0:
+                    imputation_summary['numeric']['columns_imputed'][col] = {
+                        'method': cfg.get('imputer', ('none', None))[0],
+                        'missing_frac': cfg.get('missing_frac', 0)
+                    }
+            
+            for col in pre.cat_cols:
+                cfg = pre.col_config.get(col, {})
+                if cfg.get('missing_frac', 0) > 0:
+                    imputation_summary['categorical']['columns_imputed'][col] = {
+                        'method': cfg.get('cat_imputer', ('none', None))[0],
+                        'missing_frac': cfg.get('missing_frac', 0)
+                    }
+            
             metadata = {
                 'timestamp': datetime.utcnow().isoformat()+'Z',
                 'model_type': model_type,
                 'target_columns': target_cols,
                 'n_targets': len(target_cols),
                 'config': config,
+                'imputation_summary': imputation_summary,
                 'num_cols': pre.num_cols,
                 'cat_cols': pre.cat_cols,
                 'encoder_summary': encoder_summary,
@@ -767,6 +799,7 @@ implementation:
       - {inputValue: cat_imputer_constant_value}
       - --rare_threshold
       - {inputValue: rare_threshold}
+      - --enable_string_similarity              
       - {inputValue: enable_string_similarity}
       - --create_interactions
       - {inputValue: create_interactions}
