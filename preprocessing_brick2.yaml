@@ -1,4 +1,4 @@
-name: Feature Engineering v1.2.
+name: Feature Engineering v2
 inputs:
   - {name: cleaned_X, type: Dataset, description: "Cleaned features from Brick 1"}
   - {name: cleaned_y, type: Dataset, description: "Target labels from Brick 1"}
@@ -7,6 +7,10 @@ inputs:
   - {name: outlier_strategy, type: String, description: "drop_iqr | winsorize | none", optional: true, default: "none"}
   - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule", optional: true, default: "1.5"}
   - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer", optional: true, default: "5000"}
+  - {name: numeric_imputer, type: String, description: "auto|median|mean|constant|knn|iterative", optional: true, default: "auto"}
+  - {name: numeric_imputer_constant_value, type: Float, description: "Value for constant numeric imputation", optional: true, default: "-1"}
+  - {name: cat_imputer, type: String, description: "most_frequent|constant", optional: true, default: "most_frequent"}
+  - {name: cat_imputer_constant_value, type: String, description: "Value for constant categorical imputation", optional: true, default: "MISSING"}
   - {name: rare_threshold, type: Float, description: "Rare label threshold", optional: true, default: "0.01"}
   - {name: enable_string_similarity, type: String, description: "true/false for high-cardinality grouping", optional: true, default: "false"}
   - {name: create_interactions, type: String, description: "true/false to create polynomial interactions", optional: true, default: "false"}
@@ -217,21 +221,52 @@ implementation:
                     cfg['skew']=float(s.dropna().skew()) if s.dropna().shape[0]>2 else 0.0
                     cfg['kurtosis']=float(s.dropna().kurtosis()) if s.dropna().shape[0]>3 else 0.0
                     
+                    # Get user-specified imputation strategy
+                    numeric_imputer_strategy = self.global_metadata['config'].get('numeric_imputer', 'auto')
+                    constant_value = self.global_metadata['config'].get('numeric_imputer_constant_value', -1)
+                    
                     if missing_frac==0:
                         cfg['imputer']=('none',None)
-                    elif missing_frac<0.02:
-                        imp=SimpleImputer(strategy='median')
-                        imp.fit(np.array(s).reshape(-1,1))
-                        cfg['imputer']=('simple_median',imp)
-                    else:
-                        if nrows<=self.global_metadata['config'].get('max_knn_rows',5000) and missing_frac<0.25:
+                    elif numeric_imputer_strategy == 'auto':
+                        # Auto mode: select based on data characteristics
+                        if missing_frac<0.02:
+                            imp=SimpleImputer(strategy='median')
+                            imp.fit(np.array(s).reshape(-1,1))
+                            cfg['imputer']=('simple_median',imp)
+                        elif missing_frac<0.25 and nrows<=self.global_metadata['config'].get('max_knn_rows',5000):
                             cfg['imputer']=('knn',{'n_neighbors':5})
                         else:
                             cfg['imputer']=('iterative',{'max_iter':10,'random_state':0})
+                    elif numeric_imputer_strategy == 'median':
+                        imp=SimpleImputer(strategy='median')
+                        imp.fit(np.array(s).reshape(-1,1))
+                        cfg['imputer']=('simple_median',imp)
+                    elif numeric_imputer_strategy == 'mean':
+                        imp=SimpleImputer(strategy='mean')
+                        imp.fit(np.array(s).reshape(-1,1))
+                        cfg['imputer']=('simple_mean',imp)
+                    elif numeric_imputer_strategy == 'constant':
+                        imp=SimpleImputer(strategy='constant', fill_value=constant_value)
+                        imp.fit(np.array(s).reshape(-1,1))
+                        cfg['imputer']=('simple_constant',imp)
+                    elif numeric_imputer_strategy == 'knn':
+                        cfg['imputer']=('knn',{'n_neighbors':5})
+                    elif numeric_imputer_strategy == 'iterative':
+                        cfg['imputer']=('iterative',{'max_iter':10,'random_state':0})
+                    else:
+                        # Fallback to median
+                        imp=SimpleImputer(strategy='median')
+                        imp.fit(np.array(s).reshape(-1,1))
+                        cfg['imputer']=('simple_median',imp)
+                    
                     cfg['scaler_choice']='auto'
                     self.col_config[c]=cfg
                 
                 # Configure categorical columns
+                # Configure categorical columns
+                cat_imputer_strategy = self.global_metadata['config'].get('cat_imputer', 'most_frequent')
+                cat_constant_value = self.global_metadata['config'].get('cat_imputer_constant_value', 'MISSING')
+                
                 for c in self.cat_cols:
                     s = df[c].astype(object)
                     cfg = {}
@@ -239,6 +274,24 @@ implementation:
                     cfg['missing_frac'] = float(s.isna().mean())
                     cfg['high_card'] = cfg['n_unique'] > max(50, 0.05*nrows)
                     cfg['rare_threshold_frac'] = self.global_metadata['config'].get('rare_threshold', 0.01)
+                    
+                    # Configure categorical imputation
+                    if cfg['missing_frac'] > 0:
+                        if cat_imputer_strategy == 'most_frequent':
+                            imp = SimpleImputer(strategy='most_frequent')
+                            imp.fit(df[[c]].astype(str))
+                            cfg['cat_imputer'] = ('most_frequent', imp)
+                        elif cat_imputer_strategy == 'constant':
+                            imp = SimpleImputer(strategy='constant', fill_value=cat_constant_value)
+                            imp.fit(df[[c]].astype(str))
+                            cfg['cat_imputer'] = ('constant', imp)
+                        else:
+                            # Default to most_frequent
+                            imp = SimpleImputer(strategy='most_frequent')
+                            imp.fit(df[[c]].astype(str))
+                            cfg['cat_imputer'] = ('most_frequent', imp)
+                    else:
+                        cfg['cat_imputer'] = ('none', None)
                     
                     enc_name, enc_obj, _ = choose_categorical_encoder(
                         c, s, target_series=y, train_mode=True, model_type=model_type
@@ -353,9 +406,11 @@ implementation:
                     df[self.num_cols]=pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
 
                 # Simple median imputation
+                # Simple imputation (median, mean, constant)
                 for c in self.num_cols:
                     cfg=self.col_config[c]
-                    if cfg['imputer'][0]=='simple_median':
+                    imputer_type = cfg['imputer'][0]
+                    if imputer_type in ('simple_median', 'simple_mean', 'simple_constant'):
                         imp=cfg['imputer'][1]
                         df[c]=imp.transform(df[[c]])
                 
@@ -399,6 +454,16 @@ implementation:
                             max_features=cfg_global.get('max_interaction_features', 15)
                         )
                         print(f"[INFO] DataFrame shape after interactions: {df.shape}")
+                
+                # Apply categorical imputation BEFORE encoding
+                for c in [cc for cc in self.cat_cols if cc in df.columns]:
+                    cfg = self.col_config.get(c, {})
+                    cat_imputer_info = cfg.get('cat_imputer', ('none', None))
+                    
+                    if cat_imputer_info[0] != 'none':
+                        imp = cat_imputer_info[1]
+                        if imp is not None:
+                            df[c] = imp.transform(df[[c]].astype(str)).reshape(-1)
                 
                 # Encode categorical columns
                 target_cols = self.global_metadata.get('target_cols') or []
@@ -491,6 +556,10 @@ implementation:
         parser.add_argument('--outlier_strategy', type=str, default="drop_iqr")
         parser.add_argument('--outlier_fold', type=float, default=1.5)
         parser.add_argument('--max_knn_rows', type=int, default=5000)
+        parser.add_argument('--numeric_imputer', type=str, default='auto')
+        parser.add_argument('--numeric_imputer_constant_value', type=float, default=-1)
+        parser.add_argument('--cat_imputer', type=str, default='most_frequent')
+        parser.add_argument('--cat_imputer_constant_value', type=str, default='MISSING')
         parser.add_argument('--rare_threshold', type=float, default=0.01)
         parser.add_argument('--enable_string_similarity', type=str, default="false")
         parser.add_argument('--create_interactions', type=str, default="false")
@@ -529,6 +598,10 @@ implementation:
                 'outlier_strategy': args.outlier_strategy,
                 'outlier_fold': args.outlier_fold,
                 'max_knn_rows': args.max_knn_rows,
+                'numeric_imputer': args.numeric_imputer,
+                'numeric_imputer_constant_value': args.numeric_imputer_constant_value,
+                'cat_imputer': args.cat_imputer,
+                'cat_imputer_constant_value': args.cat_imputer_constant_value,
                 'rare_threshold': args.rare_threshold,
                 'enable_string_similarity': enable_string_sim,
                 'create_interactions': create_interactions,
@@ -684,9 +757,16 @@ implementation:
       - {inputValue: outlier_fold}
       - --max_knn_rows
       - {inputValue: max_knn_rows}
+      - --numeric_imputer
+      - {inputValue: numeric_imputer}
+      - --numeric_imputer_constant_value
+      - {inputValue: numeric_imputer_constant_value}
+      - --cat_imputer
+      - {inputValue: cat_imputer}
+      - --cat_imputer_constant_value
+      - {inputValue: cat_imputer_constant_value}
       - --rare_threshold
       - {inputValue: rare_threshold}
-      - --enable_string_similarity
       - {inputValue: enable_string_similarity}
       - --create_interactions
       - {inputValue: create_interactions}
