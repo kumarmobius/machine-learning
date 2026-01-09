@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v4.1
+name: Encoding and Feature Creation v4.2
 inputs:
   - name: imputed_X
     type: Dataset
@@ -108,13 +108,9 @@ implementation:
     command:
     - sh
     - -c
-    - |
-      # Install feature-engine (other packages should already be in the image)
-      PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location \
-        'feature-engine==1.7.1' \
-        'scikit-learn==1.5.1' \
-        'scipy==1.13.0'
-      exec "$0" "$@"
+    - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+      'pandas==2.2.2' || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet
+      --no-warn-script-location 'feature-engine' --user) && "$0" "$@"
       - python3
       - -u
       - -c
