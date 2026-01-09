@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v2.2
+name: Encoding and Feature Creation v3
 inputs:
   - name: imputed_X
     type: Dataset
@@ -30,11 +30,41 @@ inputs:
     optional: true
     default: "15"
 
+  - name: encoding_strategy
+    type: String
+    description: "Global encoding strategy: 'auto' (smart selection), 'ohe' (force OneHot), 'target_kfold' (force Target Encoding), 'count' (force Count Encoding), 'ordinal' (force Ordinal Encoding)"
+    optional: true
+    default: "auto"
+  
+  - name: ohe_max_categories
+    type: Integer
+    description: "Maximum unique categories for OneHot Encoding. Columns with more unique values will use alternative encoding."
+    optional: true
+    default: "30"
+  
+  - name: target_enc_smoothing
+    type: Float
+    description: "Smoothing parameter for target encoding (higher = more smoothing to global mean)"
+    optional: true
+    default: "10.0"
+  
+  - name: target_enc_folds
+    type: Integer
+    description: "Number of folds for out-of-fold target encoding"
+    optional: true
+    default: "5"
+  
+  - name: rare_threshold
+    type: Float
+    description: "Threshold for rare category grouping (0.01 = 1%). Categories with frequency < threshold are grouped."
+    optional: true
+    default: "0.01"
+
 outputs:
   - {name: engineered_X, type: Dataset, description: "Final engineered features"}
   - {name: train_y, type: Dataset, description: "Final aligned targets"}
   - {name: preprocessor, type: Data, description: "Fitted preprocessor pickle"}
-  - {name: engineering_metadata, type: Data, description: "Complete metadata JSON"}
+  - {name: engineering_metadata, type: Data, description: "Complete metadata JSON with per-column encoding details"}
 
 implementation:
   container:
@@ -73,46 +103,152 @@ implementation:
                 return RobustScaler()
             return StandardScaler()
 
-        def choose_categorical_encoder(col, series, target_series=None, model_type='classification'):
+        def choose_categorical_encoder(col, series, target_series=None, model_type='classification',
+                                      encoding_strategy='auto', ohe_max_categories=30, rare_threshold=0.01):
             nunique = series.nunique(dropna=True)
-            if nunique <= 2:
-                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-            elif nunique <= 10:
-                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-            elif nunique <= 50:
-                if target_series is not None and model_type == 'classification':
+            total = len(series.dropna())
+            
+            # Apply rare category grouping
+            if rare_threshold > 0 and total > 0:
+                value_counts = series.value_counts(normalize=True)
+                rare_categories = value_counts[value_counts < rare_threshold].index.tolist()
+                if rare_categories:
+                    series = series.copy()
+                    series[series.isin(rare_categories)] = '__RARE__'
+                    nunique = series.nunique(dropna=True)
+            
+            # Force encoding strategy if specified
+            if encoding_strategy == 'ohe':
+                if nunique <= ohe_max_categories:
+                    return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop=None)
+                else:
+                    print(f"[WARNING] Column '{col}' has {nunique} categories (> {ohe_max_categories}). Using count encoding instead.")
+                    return 'count', None
+            
+            elif encoding_strategy == 'target_kfold':
+                if target_series is not None:
                     return 'target_kfold', None
                 else:
+                    print(f"[WARNING] No target for column '{col}'. Using count encoding instead.")
                     return 'count', None
+            
+            elif encoding_strategy == 'count':
+                return 'count', None
+            
+            elif encoding_strategy == 'ordinal':
+                if nunique <= 50:
+                    return 'ordinal', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                else:
+                    print(f"[WARNING] Column '{col}' has {nunique} categories (>50). Using count encoding instead.")
+                    return 'count', None
+            
+            # Auto strategy (default)
+            if nunique <= 2:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop=None)
+            
+            elif nunique <= 10:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop=None)
+            
+            elif nunique <= ohe_max_categories:
+                if target_series is not None:
+                    # For binary/multi-class classification and regression
+                    return 'target_kfold', None
+                else:
+                    return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop=None)
+            
             else:
-                if target_series is not None and model_type == 'classification':
+                # High cardinality
+                if target_series is not None:
                     return 'target_kfold', None
                 else:
                     return 'count', None
 
-        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42):
+        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42, model_type='classification'):
             X_col = df[col].astype(object).fillna('__NA__')
-            global_mean = float(y.mean())
-            oof = pd.Series(index=df.index, dtype=float)
-            try:
-                kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-                splits = list(kf.split(df, y))
-            except:
-                kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-                splits = list(kf.split(df))
-            for train_idx, val_idx in splits:
-                train_means = y.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
-                oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
-            counts = X_col.value_counts()
-            smooth_map = {}
-            for cat, cnt in counts.items():
-                if cnt > 0:
-                    cat_mean = float(y[X_col == cat].mean())
-                    alpha = cnt / (cnt + smoothing)
-                    smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
+            
+            if model_type == 'classification' and len(y.unique()) > 2:
+                # Multi-class: encode each class probability
+                classes = sorted(y.unique())
+                oof_maps = {}
+                for cls in classes:
+                    y_binary = (y == cls).astype(int)
+                    global_mean = float(y_binary.mean())
+                    
+                    # Create OOF predictions
+                    cls_oof = pd.Series(index=df.index, dtype=float)
+                    try:
+                        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                        splits = list(kf.split(df, y_binary))
+                    except:
+                        kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                        splits = list(kf.split(df))
+                    
+                    for train_idx, val_idx in splits:
+                        train_means = y_binary.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
+                        cls_oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
+                    
+                    # Apply smoothing
+                    counts = X_col.value_counts()
+                    smooth_map = {}
+                    for cat, cnt in counts.items():
+                        if cnt > 0:
+                            cat_mean = float(y_binary[X_col == cat].mean())
+                            alpha = cnt / (cnt + smoothing)
+                            smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
+                        else:
+                            smooth_map[cat] = global_mean
+                    
+                    oof_maps[cls] = {
+                        'oof': cls_oof.fillna(global_mean),
+                        'mapping': smooth_map,
+                        'global_mean': global_mean
+                    }
+                
+                return oof_maps
+            
+            else:
+                # Binary classification or regression
+                if model_type == 'classification':
+                    y_encoded = y.astype(int) if len(y.unique()) == 2 else y
                 else:
-                    smooth_map[cat] = global_mean
-            return oof.fillna(global_mean), smooth_map, global_mean
+                    y_encoded = y
+                
+                global_mean = float(y_encoded.mean())
+                oof = pd.Series(index=df.index, dtype=float)
+                
+                try:
+                    if model_type == 'classification' and len(y.unique()) <= 10:
+                        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                        splits = list(kf.split(df, y))
+                    else:
+                        kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                        splits = list(kf.split(df))
+                except:
+                    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                    splits = list(kf.split(df))
+                
+                for train_idx, val_idx in splits:
+                    train_means = y_encoded.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
+                    oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
+                
+                # Apply smoothing
+                counts = X_col.value_counts()
+                smooth_map = {}
+                for cat, cnt in counts.items():
+                    if cnt > 0:
+                        cat_mean = float(y_encoded[X_col == cat].mean())
+                        alpha = cnt / (cnt + smoothing)
+                        smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
+                    else:
+                        smooth_map[cat] = global_mean
+                
+                return {
+                    'single': {
+                        'oof': oof.fillna(global_mean),
+                        'mapping': smooth_map,
+                        'global_mean': global_mean
+                    }
+                }
 
         def add_polynomial_features(df, numeric_cols, degree=2, max_features=20):
             if len(numeric_cols) < 2:
@@ -144,63 +280,140 @@ implementation:
             return df
 
         class Preprocessor:
-            def __init__(self):
+            def __init__(self, encoding_strategy='auto', ohe_max_categories=30, 
+                        target_enc_smoothing=10.0, target_enc_folds=5, rare_threshold=0.01):
                 self.col_config = {}
                 self.metadata = {}
                 self.imputation_fitted = False
+                self.encoding_strategy = encoding_strategy
+                self.ohe_max_categories = ohe_max_categories
+                self.target_enc_smoothing = target_enc_smoothing
+                self.target_enc_folds = target_enc_folds
+                self.rare_threshold = rare_threshold
             
             def fit(self, df, y=None, config=None, model_type='classification'):
                 self.metadata = config or {}
                 self.metadata['model_type'] = model_type
+                self.metadata['encoding_config'] = {
+                    'strategy': self.encoding_strategy,
+                    'ohe_max_categories': self.ohe_max_categories,
+                    'target_enc_smoothing': self.target_enc_smoothing,
+                    'target_enc_folds': self.target_enc_folds,
+                    'rare_threshold': self.rare_threshold
+                }
+                
                 num_cols = self.metadata['num_cols']
                 cat_cols = self.metadata['cat_cols']
                 target_cols = self.metadata['target_columns']
                 datetime_cols = self.metadata.get('datetime_cols', [])
                 
-                # Store imputation info from Part 1
+                # Store imputation info
                 self.imputation_fitted = True
                 self.numeric_imputation_methods = self.metadata.get('numeric_imputation_methods', {})
                 
-                print(f"[INFO] Datetime columns treated as numeric: {datetime_cols}")
+                print(f"[INFO] Encoding strategy: {self.encoding_strategy}")
+                print(f"[INFO] OHE max categories: {self.ohe_max_categories}")
+                print(f"[INFO] Target encoding smoothing: {self.target_enc_smoothing}")
+                print(f"[INFO] Rare category threshold: {self.rare_threshold}")
                 
-                # Scale numeric columns (including converted datetime columns)
-                print("[INFO] Fitting scalers...")
+                # Scale numeric columns
+                print("[INFO] Fitting scalers for numeric columns...")
                 for c in num_cols:
                     if c in df.columns:
                         scaler = choose_scaler_for_series(df[c])
                         scaler.fit(df[[c]].fillna(df[c].median()))
-                        self.col_config[c] = {'scaler': scaler}
+                        self.col_config[c] = {
+                            'type': 'numeric',
+                            'scaler': scaler,
+                            'scaler_type': type(scaler).__name__
+                        }
                 
                 # Encode categorical columns
-                print("[INFO] Fitting encoders...")
+                print("[INFO] Fitting encoders for categorical columns...")
+                encoding_summary = {}
+                
                 for c in cat_cols:
                     if c not in df.columns or c in target_cols:
                         continue
                     
-                    cfg = self.metadata['cat_config'].get(c, {})
-                    s = df[c].astype(object)
-                    enc_type, enc_obj = choose_categorical_encoder(c, s, target_series=y, model_type=model_type)
+                    # Prepare series with rare category handling
+                    s = df[c].astype(object).fillna('__NA__')
+                    if self.rare_threshold > 0 and len(s) > 0:
+                        value_counts = s.value_counts(normalize=True)
+                        rare_categories = value_counts[value_counts < self.rare_threshold].index.tolist()
+                        if rare_categories:
+                            s = s.copy()
+                            s[s.isin(rare_categories)] = '__RARE__'
+                    
+                    # Choose encoder
+                    enc_type, enc_obj = choose_categorical_encoder(
+                        c, s, target_series=y, model_type=model_type,
+                        encoding_strategy=self.encoding_strategy,
+                        ohe_max_categories=self.ohe_max_categories,
+                        rare_threshold=self.rare_threshold
+                    )
+                    
+                    cfg = {
+                        'type': 'categorical',
+                        'encoder_type': enc_type,
+                        'original_nunique': int(s.nunique(dropna=True)),
+                        'rare_categories_grouped': len(rare_categories) if 'rare_categories' in locals() else 0
+                    }
                     
                     if enc_type == 'onehot':
-                        enc_obj.fit(df[[c]].astype(str))
-                        cfg['encoder_type'] = enc_type
+                        enc_obj.fit(s.to_frame())
                         cfg['encoder_obj'] = enc_obj
-                        cfg['ohe_columns'] = [f"{c}__{cat}" for cat in enc_obj.categories_[0]]
+                        cfg['categories'] = [cat for cat in enc_obj.categories_[0]]
+                        cfg['n_categories'] = len(cfg['categories'])
+                        cfg['ohe_columns'] = [f"{c}__{cat}" for cat in cfg['categories']]
                     
                     elif enc_type == 'target_kfold' and y is not None:
-                        oof, test_map, gmean = fit_target_encoder_kfold(df, c, y, n_splits=5, smoothing=1.0)
-                        cfg['encoder_type'] = enc_type
-                        cfg['oof_encoding'] = oof
-                        cfg['target_mapping'] = test_map
-                        cfg['target_global_mean'] = float(gmean)
+                        target_maps = fit_target_encoder_kfold(
+                            df, c, y, 
+                            n_splits=self.target_enc_folds,
+                            smoothing=self.target_enc_smoothing,
+                            random_state=42,
+                            model_type=model_type
+                        )
+                        
+                        if 'single' in target_maps:
+                            cfg['target_mapping'] = target_maps['single']['mapping']
+                            cfg['target_global_mean'] = target_maps['single']['global_mean']
+                            if training_mode:
+                                cfg['oof_encoding'] = target_maps['single']['oof']
+                        else:
+                            # Multi-class
+                            cfg['multi_class_mappings'] = {}
+                            for cls, cls_data in target_maps.items():
+                                cfg['multi_class_mappings'][str(cls)] = {
+                                    'mapping': cls_data['mapping'],
+                                    'global_mean': cls_data['global_mean']
+                                }
+                                if training_mode:
+                                    cfg[f'oof_encoding_class_{cls}'] = cls_data['oof']
+                    
+                    elif enc_type == 'ordinal':
+                        enc_obj.fit(s.to_frame())
+                        cfg['encoder_obj'] = enc_obj
+                        cfg['categories'] = [cat for cat in enc_obj.categories_[0]]
+                        cfg['n_categories'] = len(cfg['categories'])
                     
                     elif enc_type == 'count':
-                        counts = df[c].astype(object).value_counts().to_dict()
-                        cfg['encoder_type'] = enc_type
+                        counts = s.value_counts().to_dict()
                         cfg['count_map'] = counts
+                        cfg['max_count'] = max(counts.values()) if counts else 0
+                        cfg['min_count'] = min(counts.values()) if counts else 0
                     
                     self.col_config[c] = cfg
+                    encoding_summary[c] = enc_type
                 
+                # Print encoding summary
+                print("[INFO] Encoding Summary:")
+                for col, enc_type in encoding_summary.items():
+                    nunique = self.col_config[col]['original_nunique']
+                    print(f"  {col}: {enc_type} (nunique={nunique})")
+                
+                self.metadata['encoding_summary'] = encoding_summary
                 return self
             
             def transform(self, df, training_mode=False):
@@ -216,7 +429,7 @@ implementation:
                 # Verify no missing values in numeric columns
                 missing_numeric = [c for c in num_cols if c in df.columns and df[c].isna().any()]
                 if missing_numeric and not training_mode:
-                    print(f"[WARNING] Found missing values in: {missing_numeric}. Apply basic imputation...")
+                    print(f"[WARNING] Found missing values in: {missing_numeric}. Applying median imputation...")
                     for c in missing_numeric:
                         df[c] = df[c].fillna(df[c].median())
                 
@@ -247,23 +460,56 @@ implementation:
                     cfg = self.col_config[c]
                     enc_type = cfg.get('encoder_type')
                     
+                    # Apply rare category grouping
+                    s = df[c].astype(object).fillna('__NA__')
+                    if self.rare_threshold > 0 and len(s) > 0:
+                        if training_mode:
+                            # Use training distribution to identify rare categories
+                            value_counts = s.value_counts(normalize=True)
+                            rare_categories = value_counts[value_counts < self.rare_threshold].index.tolist()
+                            s[s.isin(rare_categories)] = '__RARE__'
+                        elif 'categories' in cfg and '__RARE__' in cfg.get('categories', []):
+                            # In transform mode, map to __RARE__ if category not seen in training
+                            known_categories = set(cfg.get('categories', []))
+                            s[~s.isin(known_categories)] = '__RARE__'
+                    
                     if enc_type == 'onehot':
                         ohe = cfg['encoder_obj']
-                        arr = ohe.transform(df[[c]].astype(str))
+                        arr = ohe.transform(s.to_frame())
                         df_ohe = pd.DataFrame(arr, columns=cfg['ohe_columns'], index=df.index)
                         df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
                     
                     elif enc_type == 'target_kfold':
                         if training_mode and 'oof_encoding' in cfg:
                             df[c] = cfg['oof_encoding'].reindex(df.index, fill_value=cfg['target_global_mean']).astype(float)
+                        elif training_mode and 'multi_class_mappings' in cfg:
+                            # For multi-class, use first class encoding (or could create multiple columns)
+                            first_cls = list(cfg['multi_class_mappings'].keys())[0]
+                            mapping = cfg['multi_class_mappings'][first_cls]['mapping']
+                            gmean = cfg['multi_class_mappings'][first_cls]['global_mean']
+                            df[c] = s.map(lambda x: mapping.get(x, gmean)).astype(float)
                         else:
-                            mapping = cfg.get('target_mapping', {})
-                            gmean = cfg.get('target_global_mean', 0.0)
-                            df[c] = df[c].map(lambda x: mapping.get(x, gmean)).astype(float)
+                            if 'target_mapping' in cfg:
+                                mapping = cfg['target_mapping']
+                                gmean = cfg['target_global_mean']
+                                df[c] = s.map(lambda x: mapping.get(x, gmean)).astype(float)
+                            elif 'multi_class_mappings' in cfg:
+                                first_cls = list(cfg['multi_class_mappings'].keys())[0]
+                                mapping = cfg['multi_class_mappings'][first_cls]['mapping']
+                                gmean = cfg['multi_class_mappings'][first_cls]['global_mean']
+                                df[c] = s.map(lambda x: mapping.get(x, gmean)).astype(float)
+                            else:
+                                df[c] = 0.0  # Fallback
+                    
+                    elif enc_type == 'ordinal':
+                        ordinal = cfg['encoder_obj']
+                        # Handle unknown categories
+                        s_encoded = ordinal.transform(s.to_frame())
+                        df[c] = s_encoded.flatten()
                     
                     elif enc_type == 'count':
                         cnt_map = cfg.get('count_map', {})
-                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0)).astype(float)
+                        df[c] = s.map(lambda x: cnt_map.get(x, 0)).astype(float)
                 
                 df.replace([np.inf, -np.inf], np.nan, inplace=True)
                 return df
@@ -284,6 +530,11 @@ implementation:
         parser.add_argument('--create_interactions', type=str, default="false")
         parser.add_argument('--interaction_degree', type=int, default=2)
         parser.add_argument('--max_interaction_features', type=int, default=15)
+        parser.add_argument('--encoding_strategy', type=str, default="auto")
+        parser.add_argument('--ohe_max_categories', type=int, default=30)
+        parser.add_argument('--target_enc_smoothing', type=float, default=10.0)
+        parser.add_argument('--target_enc_folds', type=int, default=5)
+        parser.add_argument('--rare_threshold', type=float, default=0.01)
         parser.add_argument('--engineered_X', type=str, required=True)
         parser.add_argument('--train_y', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
@@ -292,7 +543,7 @@ implementation:
 
         try:
             print("="*80)
-            print("PART 2: ENCODING & FEATURE CREATION")
+            print("PART 2: ENCODING & FEATURE CREATION WITH FULL CONTROL")
             print("="*80)
             
             # Load data
@@ -313,7 +564,13 @@ implementation:
             
             # Fit preprocessor
             print("[STEP 2/5] Fitting preprocessor...")
-            pre = Preprocessor()
+            pre = Preprocessor(
+                encoding_strategy=args.encoding_strategy,
+                ohe_max_categories=args.ohe_max_categories,
+                target_enc_smoothing=args.target_enc_smoothing,
+                target_enc_folds=args.target_enc_folds,
+                rare_threshold=args.rare_threshold
+            )
             
             target_cols = config['target_columns']
             model_type = config['model_type']
@@ -325,7 +582,7 @@ implementation:
             else:
                 y_for_fit = y
             
-            pre.fit(X, y=y_for_fit if model_type == 'classification' else None, config=config, model_type=model_type)
+            pre.fit(X, y=y_for_fit, config=config, model_type=model_type)
             
             # Transform
             print("[STEP 3/5] Transforming features...")
@@ -351,26 +608,65 @@ implementation:
             y.to_parquet(args.train_y, index=False)
             pre.save(args.preprocessor)
             
-            # Metadata
+            # Create comprehensive metadata
             metadata = {
                 'timestamp': datetime.utcnow().isoformat()+'Z',
                 'model_type': model_type,
                 'target_columns': target_cols,
+                'encoding_configuration': {
+                    'strategy': args.encoding_strategy,
+                    'ohe_max_categories': args.ohe_max_categories,
+                    'target_enc_smoothing': args.target_enc_smoothing,
+                    'target_enc_folds': args.target_enc_folds,
+                    'rare_threshold': args.rare_threshold
+                },
                 'interactions_created': create_interactions,
+                'interaction_config': {
+                    'degree': args.interaction_degree,
+                    'max_features': args.max_interaction_features
+                },
                 'final_shape': {
                     'rows': X_engineered.shape[0],
                     'cols': X_engineered.shape[1]
                 },
+                'column_encoding_details': {},
+                'encoding_summary': pre.metadata.get('encoding_summary', {}),
                 'part1_config': config
             }
+            
+            # Add per-column encoding details
+            for col, cfg in pre.col_config.items():
+                metadata['column_encoding_details'][col] = {
+                    'type': cfg.get('type', 'unknown'),
+                    'encoder_type': cfg.get('encoder_type', 'none'),
+                    'original_nunique': cfg.get('original_nunique', 0),
+                    'rare_categories_grouped': cfg.get('rare_categories_grouped', 0)
+                }
+                if cfg.get('type') == 'numeric':
+                    metadata['column_encoding_details'][col]['scaler_type'] = cfg.get('scaler_type', 'unknown')
+                elif cfg.get('type') == 'categorical':
+                    if 'n_categories' in cfg:
+                        metadata['column_encoding_details'][col]['n_categories'] = cfg['n_categories']
             
             with open(args.engineering_metadata, 'w') as f:
                 json.dump(metadata, f, indent=2)
             
             print("="*80)
-            print("PART 2 COMPLETE")
-            print(f"Final shape: {X_engineered.shape}")
-            print(f"Interactions: {create_interactions}")
+            print("PART 2 COMPLETE - ENCODING SUMMARY")
+            print("="*80)
+            print(f"Final shape: {X_engineered.shape[0]} rows × {X_engineered.shape[1]} columns")
+            print(f"Encoding strategy: {args.encoding_strategy}")
+            print(f"Interactions created: {create_interactions}")
+            
+            # Print encoding distribution
+            enc_counts = {}
+            for col, enc_type in metadata['encoding_summary'].items():
+                enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
+            
+            print("Encoding distribution:")
+            for enc_type, count in enc_counts.items():
+                print(f"  {enc_type}: {count} columns")
+            
             print("="*80)
             
         except Exception as exc:
@@ -390,6 +686,16 @@ implementation:
       - {inputValue: interaction_degree}
       - --max_interaction_features
       - {inputValue: max_interaction_features}
+      - --encoding_strategy
+      - {inputValue: encoding_strategy}
+      - --ohe_max_categories
+      - {inputValue: ohe_max_categories}
+      - --target_enc_smoothing
+      - {inputValue: target_enc_smoothing}
+      - --target_enc_folds
+      - {inputValue: target_enc_folds}
+      - --rare_threshold
+      - {inputValue: rare_threshold}
       - --engineered_X
       - {outputPath: engineered_X}
       - --train_y
