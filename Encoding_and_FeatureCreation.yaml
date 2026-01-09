@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v2.1
+name: Encoding and Feature Creation v2.2
 inputs:
   - name: imputed_X
     type: Dataset
@@ -155,12 +155,15 @@ implementation:
                 num_cols = self.metadata['num_cols']
                 cat_cols = self.metadata['cat_cols']
                 target_cols = self.metadata['target_columns']
+                datetime_cols = self.metadata.get('datetime_cols', [])
                 
                 # Store imputation info from Part 1
                 self.imputation_fitted = True
                 self.numeric_imputation_methods = self.metadata.get('numeric_imputation_methods', {})
                 
-                # Scale numeric columns
+                print(f"[INFO] Datetime columns treated as numeric: {datetime_cols}")
+                
+                # Scale numeric columns (including converted datetime columns)
                 print("[INFO] Fitting scalers...")
                 for c in num_cols:
                     if c in df.columns:
