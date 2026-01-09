@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v3.1
+name: Encoding and Feature Creation v4
 inputs:
   - name: imputed_X
     type: Dataset
@@ -59,6 +59,42 @@ inputs:
     description: "Threshold for rare category grouping (0.01 = 1%). Categories with frequency < threshold are grouped."
     optional: true
     default: "0.01"
+  
+  - name: numeric_transform_strategy
+    type: String
+    description: "Numeric transformation strategy: 'auto' (smart selection), 'standard', 'robust', 'minmax', 'log', 'logcp', 'sqrt', 'reciprocal', 'arcsin', 'power', 'boxcox', 'yeojohnson', 'quantile', 'none'"
+    optional: true
+    default: "auto"
+  
+  - name: transform_positive_only
+    type: String
+    description: "Apply transformations only to positive-valued features: 'true' or 'false'"
+    optional: true
+    default: "true"
+  
+  - name: skewness_threshold
+    type: Float
+    description: "Skewness threshold for applying transformations (absolute value)"
+    optional: true
+    default: "0.5"
+  
+  - name: kurtosis_threshold
+    type: Float
+    description: "Kurtosis threshold for applying robust scaling"
+    optional: true
+    default: "3.0"
+  
+  - name: outlier_threshold
+    type: Float
+    description: "Outlier threshold for applying robust scaling (fraction of outliers)"
+    optional: true
+    default: "0.01"
+  
+  - name: positive_offset
+    type: Float
+    description: "Offset added to ensure positivity for log/boxcox transforms"
+    optional: true
+    default: "1e-6"
 
 outputs:
   - {name: engineered_X, type: Dataset, description: "Final engineered features"}
@@ -74,35 +110,202 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, traceback, gzip
+        import argparse, os, sys, json, traceback, gzip, math
         from datetime import datetime
         from itertools import combinations
         import pandas as pd, numpy as np
-        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
+        from sklearn.preprocessing import (StandardScaler, RobustScaler, MinMaxScaler, 
+                                         PowerTransformer, OneHotEncoder, OrdinalEncoder,
+                                         QuantileTransformer, KBinsDiscretizer, FunctionTransformer)
         from sklearn.pipeline import Pipeline
         from sklearn.model_selection import StratifiedKFold, KFold
         import cloudpickle
+        from scipy import stats
+        from scipy.special import boxcox, inv_boxcox
+        
+        # Import feature-engine transformers
+        from feature_engine.transformation import (
+            LogTransformer, LogCpTransformer, ReciprocalTransformer,
+            ArcsinTransformer, PowerTransformer as FEPowerTransformer,
+            BoxCoxTransformer, YeoJohnsonTransformer
+        )
         
         def ensure_dir_for(p):
             d=os.path.dirname(p)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
-
-        def choose_scaler_for_series(s):
-            v=s.dropna()
-            if v.empty or v.std(ddof=0)==0: 
-                return StandardScaler()
-            skew=float(v.skew())
-            kurt=float(v.kurtosis()) if len(v)>3 else 0.0
-            extreme_frac=float(((v - v.mean()).abs() > 3*v.std(ddof=0)).mean())
-            if (v.min()>=0.0 and v.max()<=1.0): 
-                return MinMaxScaler()
-            if abs(skew)>=1.0: 
-                return Pipeline([('power',PowerTransformer(method='yeo-johnson')),('std',StandardScaler())])
-            if extreme_frac>0.01 or abs(kurt)>10: 
-                return RobustScaler()
-            return StandardScaler()
-
+        # ADVANCED NUMERIC TRANSFORMER SELECTION        
+        def analyze_numeric_feature(series):
+            v = series.dropna()
+            if len(v) < 10:
+                return None
+            
+            stats_dict = {
+                'n_samples': len(v),
+                'mean': float(v.mean()),
+                'std': float(v.std()),
+                'min': float(v.min()),
+                'max': float(v.max()),
+                'skewness': float(v.skew()),
+                'kurtosis': float(v.kurtosis()),
+                'is_positive': (v.min() > 0),
+                'has_negatives': (v.min() < 0),
+                'has_zeros': (v.min() <= 0 <= v.max()),
+                'range': float(v.max() - v.min()),
+                'cv': float(v.std() / v.mean()) if v.mean() != 0 else float('inf'),
+                'q1': float(v.quantile(0.25)),
+                'median': float(v.median()),
+                'q3': float(v.quantile(0.75)),
+                'iqr': float(v.quantile(0.75) - v.quantile(0.25))
+            }
+            
+            # Check for outliers using IQR method
+            lower_bound = stats_dict['q1'] - 1.5 * stats_dict['iqr']
+            upper_bound = stats_dict['q3'] + 1.5 * stats_dict['iqr']
+            outliers = v[(v < lower_bound) | (v > upper_bound)]
+            stats_dict['outlier_fraction'] = len(outliers) / len(v)
+            stats_dict['outlier_count'] = len(outliers)
+            
+            # Check distribution shape
+            stats_dict['is_normal'] = (abs(stats_dict['skewness']) < 0.5 and 
+                                      abs(stats_dict['kurtosis']) < 3.0)
+            stats_dict['is_highly_skewed'] = abs(stats_dict['skewness']) > 1.0
+            stats_dict['is_heavy_tailed'] = stats_dict['kurtosis'] > 3.0
+            
+            return stats_dict
+        
+        def choose_numeric_transformer(series, strategy='auto', positive_only=True, 
+                                      skew_thresh=0.5, kurt_thresh=3.0, outlier_thresh=0.01,
+                                      positive_offset=1e-6):            
+            # If user specified a specific strategy, use it
+            if strategy != 'auto':
+                if strategy == 'standard':
+                    return 'standard', StandardScaler(), 'user_specified'
+                elif strategy == 'robust':
+                    return 'robust', RobustScaler(), 'user_specified'
+                elif strategy == 'minmax':
+                    return 'minmax', MinMaxScaler(), 'user_specified'
+                elif strategy == 'log':
+                    return 'log', LogTransformer(), 'user_specified'
+                elif strategy == 'logcp':
+                    return 'logcp', LogCpTransformer(), 'user_specified'
+                elif strategy == 'sqrt':
+                    return 'sqrt', FunctionTransformer(np.sqrt), 'user_specified'
+                elif strategy == 'reciprocal':
+                    return 'reciprocal', ReciprocalTransformer(), 'user_specified'
+                elif strategy == 'arcsin':
+                    return 'arcsin', ArcsinTransformer(), 'user_specified'
+                elif strategy == 'power':
+                    return 'power', FEPowerTransformer(), 'user_specified'
+                elif strategy == 'boxcox':
+                    return 'boxcox', BoxCoxTransformer(), 'user_specified'
+                elif strategy == 'yeojohnson':
+                    return 'yeojohnson', YeoJohnsonTransformer(), 'user_specified'
+                elif strategy == 'quantile':
+                    return 'quantile', QuantileTransformer(output_distribution='normal'), 'user_specified'
+                elif strategy == 'none':
+                    return 'none', None, 'user_specified'
+                else:
+                    print(f"[WARNING] Unknown strategy '{strategy}', using 'auto'")
+                    # Fall through to auto strategy
+            
+            # AUTO STRATEGY - Intelligent selection based on data characteristics
+            stats = analyze_numeric_feature(series)
+            if stats is None:
+                return 'standard', StandardScaler(), 'insufficient_data'
+            
+            # Initialize decision factors
+            transform_type = 'standard'
+            transform_reason = []
+            
+            # Decision Tree for Transform Selection:
+            
+            # 1. Check for heavy outliers (>5% of data)
+            if stats['outlier_fraction'] > 0.05:
+                transform_type = 'robust'
+                transform_reason.append(f"high_outliers_{stats['outlier_fraction']:.1%}")
+            
+            # 2. Check for moderate outliers AND heavy tails
+            elif stats['outlier_fraction'] > outlier_thresh and stats['kurtosis'] > kurt_thresh:
+                transform_type = 'robust'
+                transform_reason.append(f"outliers_heavy_tails")
+            
+            # 3. Check for highly skewed positive data
+            elif abs(stats['skewness']) > 1.5 and stats['is_positive']:
+                if stats['has_zeros']:
+                    transform_type = 'logcp'  # Log(x + 1) for data with zeros
+                    transform_reason.append(f"highly_skewed_with_zeros_skew{stats['skewness']:.2f}")
+                else:
+                    transform_type = 'log'  # Natural log for strictly positive
+                    transform_reason.append(f"highly_skewed_positive_skew{stats['skewness']:.2f}")
+            
+            # 4. Check for moderately skewed data
+            elif abs(stats['skewness']) > skew_thresh:
+                if stats['is_positive']:
+                    transform_type = 'boxcox'  # Box-Cox for positive skewed
+                    transform_reason.append(f"moderately_skewed_positive_skew{stats['skewness']:.2f}")
+                else:
+                    transform_type = 'yeojohnson'  # Yeo-Johnson for data with negatives/zeros
+                    transform_reason.append(f"moderately_skewed_with_negatives_skew{stats['skewness']:.2f}")
+            
+            # 5. Check for bounded data (0-1 range)
+            elif stats['min'] >= 0 and stats['max'] <= 1:
+                transform_type = 'arcsin'  # Arcsin for proportions
+                transform_reason.append(f"bounded_0_1_range")
+            
+            # 6. Check for count data (non-negative integers)
+            elif stats['min'] >= 0 and series.apply(float.is_integer).all():
+                transform_type = 'sqrt'  # Square root for count data (variance stabilizing)
+                transform_reason.append(f"count_data")
+            
+            # 7. Check for ratio data (values > 0, often with large range)
+            elif stats['min'] > 0 and stats['max'] / stats['min'] > 100:
+                transform_type = 'log'  # Log for ratios
+                transform_reason.append(f"large_ratio_range_{stats['max']/stats['min']:.0f}x")
+            
+            # 8. Check for data with extreme kurtosis (heavy tails)
+            elif abs(stats['kurtosis']) > 10:
+                transform_type = 'quantile'  # Quantile transform for heavy tails
+                transform_reason.append(f"extreme_kurtosis_{stats['kurtosis']:.2f}")
+            
+            # 9. Check for reciprocal relationship (inverse)
+            elif stats['min'] > 0 and stats['skewness'] < -1.0:
+                transform_type = 'reciprocal'  # Reciprocal for negatively skewed positive data
+                transform_reason.append(f"negative_skew_reciprocal_skew{stats['skewness']:.2f}")
+            
+            # Create transformer based on selected type
+            transformer = None
+            if transform_type == 'standard':
+                transformer = StandardScaler()
+            elif transform_type == 'robust':
+                transformer = RobustScaler()
+            elif transform_type == 'minmax':
+                transformer = MinMaxScaler()
+            elif transform_type == 'log':
+                transformer = LogTransformer()
+            elif transform_type == 'logcp':
+                transformer = LogCpTransformer()
+            elif transform_type == 'sqrt':
+                transformer = FunctionTransformer(np.sqrt)
+            elif transform_type == 'reciprocal':
+                transformer = ReciprocalTransformer()
+            elif transform_type == 'arcsin':
+                transformer = ArcsinTransformer()
+            elif transform_type == 'power':
+                transformer = FEPowerTransformer()
+            elif transform_type == 'boxcox':
+                transformer = BoxCoxTransformer()
+            elif transform_type == 'yeojohnson':
+                transformer = YeoJohnsonTransformer()
+            elif transform_type == 'quantile':
+                transformer = QuantileTransformer(output_distribution='normal', random_state=42)
+            elif transform_type == 'none':
+                transformer = None
+            
+            reason_str = "_".join(transform_reason) if transform_reason else "normal_distribution"
+            return transform_type, transformer, reason_str
+        
+        
         def choose_categorical_encoder(col, series, target_series=None, model_type='classification',
                                       encoding_strategy='auto', ohe_max_categories=30, rare_threshold=0.01):
             nunique = series.nunique(dropna=True)
@@ -281,7 +484,10 @@ implementation:
 
         class Preprocessor:
             def __init__(self, encoding_strategy='auto', ohe_max_categories=30, 
-                        target_enc_smoothing=10.0, target_enc_folds=5, rare_threshold=0.01):
+                        target_enc_smoothing=10.0, target_enc_folds=5, rare_threshold=0.01,
+                        numeric_transform_strategy='auto', transform_positive_only=True,
+                        skewness_threshold=0.5, kurtosis_threshold=3.0, outlier_threshold=0.01,
+                        positive_offset=1e-6):
                 self.col_config = {}
                 self.metadata = {}
                 self.imputation_fitted = False
@@ -290,6 +496,12 @@ implementation:
                 self.target_enc_smoothing = target_enc_smoothing
                 self.target_enc_folds = target_enc_folds
                 self.rare_threshold = rare_threshold
+                self.numeric_transform_strategy = numeric_transform_strategy
+                self.transform_positive_only = transform_positive_only
+                self.skewness_threshold = skewness_threshold
+                self.kurtosis_threshold = kurtosis_threshold
+                self.outlier_threshold = outlier_threshold
+                self.positive_offset = positive_offset
             
             def fit(self, df, y=None, config=None, model_type='classification'):
                 self.metadata = config or {}
@@ -300,6 +512,14 @@ implementation:
                     'target_enc_smoothing': self.target_enc_smoothing,
                     'target_enc_folds': self.target_enc_folds,
                     'rare_threshold': self.rare_threshold
+                }
+                self.metadata['numeric_transform_config'] = {
+                    'strategy': self.numeric_transform_strategy,
+                    'transform_positive_only': self.transform_positive_only,
+                    'skewness_threshold': self.skewness_threshold,
+                    'kurtosis_threshold': self.kurtosis_threshold,
+                    'outlier_threshold': self.outlier_threshold,
+                    'positive_offset': self.positive_offset
                 }
                 
                 num_cols = self.metadata['num_cols']
@@ -312,21 +532,61 @@ implementation:
                 self.numeric_imputation_methods = self.metadata.get('numeric_imputation_methods', {})
                 
                 print(f"[INFO] Encoding strategy: {self.encoding_strategy}")
-                print(f"[INFO] OHE max categories: {self.ohe_max_categories}")
-                print(f"[INFO] Target encoding smoothing: {self.target_enc_smoothing}")
-                print(f"[INFO] Rare category threshold: {self.rare_threshold}")
+                print(f"[INFO] Numeric transform strategy: {self.numeric_transform_strategy}")
+                if self.numeric_transform_strategy == 'auto':
+                    print(f"[INFO] Auto transform thresholds - Skew: {self.skewness_threshold}, Kurtosis: {self.kurtosis_threshold}, Outliers: {self.outlier_threshold}")
                 
-                # Scale numeric columns
-                print("[INFO] Fitting scalers for numeric columns...")
+                # Transform and scale numeric columns
+                print("[INFO] Fitting numeric transformers...")
+                numeric_transform_summary = {}
+                
                 for c in num_cols:
                     if c in df.columns:
-                        scaler = choose_scaler_for_series(df[c])
-                        scaler.fit(df[[c]].fillna(df[c].median()))
+                        series = df[c]
+                        
+                        # Choose transformer based on strategy
+                        transform_type, transformer, transform_reason = choose_numeric_transformer(
+                            series=series,
+                            strategy=self.numeric_transform_strategy,
+                            positive_only=self.transform_positive_only,
+                            skew_thresh=self.skewness_threshold,
+                            kurt_thresh=self.kurtosis_threshold,
+                            outlier_thresh=self.outlier_threshold,
+                            positive_offset=self.positive_offset
+                        )
+                        
+                        # Fit transformer
+                        if transformer is not None:
+                            # Handle feature-engine transformers
+                            if hasattr(transformer, 'fit'):
+                                transformer.fit(df[[c]])
+                            else:
+                                # sklearn transformers
+                                transformer.fit(df[[c]].fillna(df[c].median()))
+                        
+                        # Store configuration
                         self.col_config[c] = {
                             'type': 'numeric',
-                            'scaler': scaler,
-                            'scaler_type': type(scaler).__name__
+                            'transform_type': transform_type,
+                            'transformer': transformer,
+                            'transform_reason': transform_reason,
+                            'statistics': analyze_numeric_feature(series)
                         }
+                        
+                        numeric_transform_summary[c] = {
+                            'transform': transform_type,
+                            'reason': transform_reason
+                        }
+                
+                # Print numeric transform summary
+                print("[INFO] Numeric Transform Summary:")
+                for col, info in numeric_transform_summary.items():
+                    stats = self.col_config[col]['statistics']
+                    if stats:
+                        skew = stats['skewness']
+                        kurt = stats['kurtosis']
+                        outliers = stats['outlier_fraction']
+                        print(f"  {col}: {info['transform']} (skew={skew:.2f}, kurt={kurt:.2f}, outliers={outliers:.1%}) - {info['reason']}")
                 
                 # Encode categorical columns
                 print("[INFO] Fitting encoders for categorical columns...")
@@ -379,7 +639,6 @@ implementation:
                         if 'single' in target_maps:
                             cfg['target_mapping'] = target_maps['single']['mapping']
                             cfg['target_global_mean'] = target_maps['single']['global_mean']
-                            
                             cfg['oof_encoding'] = target_maps['single']['oof']
                         else:
                             # Multi-class
@@ -389,7 +648,6 @@ implementation:
                                     'mapping': cls_data['mapping'],
                                     'global_mean': cls_data['global_mean']
                                 }
-                                
                                 cfg[f'oof_encoding_class_{cls}'] = cls_data['oof']
                     
                     elif enc_type == 'ordinal':
@@ -408,12 +666,13 @@ implementation:
                     encoding_summary[c] = enc_type
                 
                 # Print encoding summary
-                print("[INFO] Encoding Summary:")
+                print("[INFO] Categorical Encoding Summary:")
                 for col, enc_type in encoding_summary.items():
                     nunique = self.col_config[col]['original_nunique']
                     print(f"  {col}: {enc_type} (nunique={nunique})")
                 
                 self.metadata['encoding_summary'] = encoding_summary
+                self.metadata['numeric_transform_summary'] = numeric_transform_summary
                 return self
             
             def transform(self, df, training_mode=False):
@@ -433,12 +692,23 @@ implementation:
                     for c in missing_numeric:
                         df[c] = df[c].fillna(df[c].median())
                 
-                # Scale numeric columns
-                print("[INFO] Scaling numeric columns...")
+                # Transform numeric columns
+                print("[INFO] Transforming numeric columns...")
                 for c in num_cols:
                     if c in df.columns and c in self.col_config:
-                        scaler = self.col_config[c]['scaler']
-                        df[c] = scaler.transform(df[[c]].fillna(df[c].median())).reshape(-1)
+                        cfg = self.col_config[c]
+                        transformer = cfg.get('transformer')
+                        
+                        if transformer is not None:
+                            try:
+                                # Transform the column
+                                transformed = transformer.transform(df[[c]])
+                                if hasattr(transformed, 'shape') and transformed.shape[1] == 1:
+                                    df[c] = transformed.flatten()
+                                else:
+                                    df[c] = transformed
+                            except Exception as e:
+                                print(f"[WARNING] Failed to transform {c}: {e}. Using original values.")
                 
                 # Create interactions if training mode
                 if training_mode and self.metadata.get('create_interactions', False):
@@ -502,7 +772,6 @@ implementation:
                     
                     elif enc_type == 'ordinal':
                         ordinal = cfg['encoder_obj']
-                        # Handle unknown categories
                         s_encoded = ordinal.transform(s.to_frame())
                         df[c] = s_encoded.flatten()
                     
@@ -522,6 +791,7 @@ implementation:
                 with gzip.open(path, "rb") as f:
                     return cloudpickle.load(f)
 
+        # Main execution
         parser = argparse.ArgumentParser()
         parser.add_argument('--imputed_X', type=str, required=True)
         parser.add_argument('--aligned_y', type=str, required=True)
@@ -534,6 +804,12 @@ implementation:
         parser.add_argument('--target_enc_smoothing', type=float, default=10.0)
         parser.add_argument('--target_enc_folds', type=int, default=5)
         parser.add_argument('--rare_threshold', type=float, default=0.01)
+        parser.add_argument('--numeric_transform_strategy', type=str, default="auto")
+        parser.add_argument('--transform_positive_only', type=str, default="true")
+        parser.add_argument('--skewness_threshold', type=float, default=0.5)
+        parser.add_argument('--kurtosis_threshold', type=float, default=3.0)
+        parser.add_argument('--outlier_threshold', type=float, default=0.01)
+        parser.add_argument('--positive_offset', type=float, default=1e-6)
         parser.add_argument('--engineered_X', type=str, required=True)
         parser.add_argument('--train_y', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
@@ -542,7 +818,7 @@ implementation:
 
         try:
             print("="*80)
-            print("PART 2: ENCODING & FEATURE CREATION WITH FULL CONTROL")
+            print("PART 2: ADVANCED ENCODING & FEATURE ENGINEERING")
             print("="*80)
             
             # Load data
@@ -568,7 +844,13 @@ implementation:
                 ohe_max_categories=args.ohe_max_categories,
                 target_enc_smoothing=args.target_enc_smoothing,
                 target_enc_folds=args.target_enc_folds,
-                rare_threshold=args.rare_threshold
+                rare_threshold=args.rare_threshold,
+                numeric_transform_strategy=args.numeric_transform_strategy,
+                transform_positive_only=str(args.transform_positive_only).lower() in ("true", "1", "yes", "y"),
+                skewness_threshold=args.skewness_threshold,
+                kurtosis_threshold=args.kurtosis_threshold,
+                outlier_threshold=args.outlier_threshold,
+                positive_offset=args.positive_offset
             )
             
             target_cols = config['target_columns']
@@ -619,6 +901,14 @@ implementation:
                     'target_enc_folds': args.target_enc_folds,
                     'rare_threshold': args.rare_threshold
                 },
+                'numeric_transform_configuration': {
+                    'strategy': args.numeric_transform_strategy,
+                    'transform_positive_only': str(args.transform_positive_only).lower() in ("true", "1", "yes", "y"),
+                    'skewness_threshold': args.skewness_threshold,
+                    'kurtosis_threshold': args.kurtosis_threshold,
+                    'outlier_threshold': args.outlier_threshold,
+                    'positive_offset': args.positive_offset
+                },
                 'interactions_created': create_interactions,
                 'interaction_config': {
                     'degree': args.interaction_degree,
@@ -629,42 +919,64 @@ implementation:
                     'cols': X_engineered.shape[1]
                 },
                 'column_encoding_details': {},
+                'column_transform_details': {},
                 'encoding_summary': pre.metadata.get('encoding_summary', {}),
+                'transform_summary': pre.metadata.get('numeric_transform_summary', {}),
                 'part1_config': config
             }
             
             # Add per-column encoding details
             for col, cfg in pre.col_config.items():
+                col_type = cfg.get('type', 'unknown')
+                
+                if col_type == 'numeric':
+                    metadata['column_transform_details'][col] = {
+                        'transform_type': cfg.get('transform_type', 'none'),
+                        'transform_reason': cfg.get('transform_reason', 'unknown'),
+                        'statistics': cfg.get('statistics', {})
+                    }
+                
                 metadata['column_encoding_details'][col] = {
-                    'type': cfg.get('type', 'unknown'),
-                    'encoder_type': cfg.get('encoder_type', 'none'),
+                    'type': col_type,
+                    'encoder_type': cfg.get('encoder_type', 'none') if col_type == 'categorical' else 'numeric',
                     'original_nunique': cfg.get('original_nunique', 0),
                     'rare_categories_grouped': cfg.get('rare_categories_grouped', 0)
                 }
-                if cfg.get('type') == 'numeric':
-                    metadata['column_encoding_details'][col]['scaler_type'] = cfg.get('scaler_type', 'unknown')
-                elif cfg.get('type') == 'categorical':
-                    if 'n_categories' in cfg:
-                        metadata['column_encoding_details'][col]['n_categories'] = cfg['n_categories']
+                
+                if col_type == 'categorical' and 'n_categories' in cfg:
+                    metadata['column_encoding_details'][col]['n_categories'] = cfg['n_categories']
             
             with open(args.engineering_metadata, 'w') as f:
                 json.dump(metadata, f, indent=2)
             
             print("="*80)
-            print("PART 2 COMPLETE - ENCODING SUMMARY")
+            print("PART 2 COMPLETE - ADVANCED ENGINEERING SUMMARY")
             print("="*80)
             print(f"Final shape: {X_engineered.shape[0]} rows × {X_engineered.shape[1]} columns")
             print(f"Encoding strategy: {args.encoding_strategy}")
+            print(f"Numeric transform strategy: {args.numeric_transform_strategy}")
             print(f"Interactions created: {create_interactions}")
             
-            # Print encoding distribution
-            enc_counts = {}
-            for col, enc_type in metadata['encoding_summary'].items():
-                enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
+            # Print transform distribution
+            if 'transform_summary' in metadata:
+                transform_counts = {}
+                for col, info in metadata['transform_summary'].items():
+                    transform_type = info['transform']
+                    transform_counts[transform_type] = transform_counts.get(transform_type, 0) + 1
+                
+                print("Numeric Transform distribution:")
+                for trans_type, count in transform_counts.items():
+                    print(f"  {trans_type}: {count} columns")
             
-            print("Encoding distribution:")
-            for enc_type, count in enc_counts.items():
-                print(f"  {enc_type}: {count} columns")
+            # Print encoding distribution
+            if 'encoding_summary' in metadata:
+                enc_counts = {}
+                for col, enc_type in metadata['encoding_summary'].items():
+                    enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
+                
+                print("Categorical Encoding distribution:")
+                for enc_type, count in enc_counts.items():
+                    print(f"  {enc_type}: {count} columns")
             
             print("="*80)
             
@@ -695,6 +1007,18 @@ implementation:
       - {inputValue: target_enc_folds}
       - --rare_threshold
       - {inputValue: rare_threshold}
+      - --numeric_transform_strategy
+      - {inputValue: numeric_transform_strategy}
+      - --transform_positive_only
+      - {inputValue: transform_positive_only}
+      - --skewness_threshold
+      - {inputValue: skewness_threshold}
+      - --kurtosis_threshold
+      - {inputValue: kurtosis_threshold}
+      - --outlier_threshold
+      - {inputValue: outlier_threshold}
+      - --positive_offset
+      - {inputValue: positive_offset}
       - --engineered_X
       - {outputPath: engineered_X}
       - --train_y
