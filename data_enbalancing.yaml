@@ -1,0 +1,363 @@
+name: Data Balancing v1.0
+inputs:
+  - {name: engineered_X, type: Dataset, description: "Engineered features from Feature Engineering brick (parquet format). All categorical features should already be encoded."}
+  - {name: train_y, type: Dataset, description: "Target labels for classification (parquet format)"}
+  - {name: model_type, type: String, description: "Must be 'classification' - this brick only works for classification problems"}
+  - {name: enable_balancing, type: String, description: "Enable data balancing. Use 'true' to apply, 'false' for passthrough.", optional: true, default: "false"}
+  - {name: balancing_technique, type: String, description: "Balancing method: 'smote', 'adasyn', 'random_oversample', 'random_undersample', 'smote_tomek', 'class_weight', 'none'", optional: true, default: "smote"}
+  - {name: target_ratio, type: Float, description: "Desired minority:majority ratio (0.1 to 1.0). 1.0 = perfect balance. Ignored for 'class_weight' and 'none'.", optional: true, default: "1.0"}
+  - {name: random_state, type: String, description: "Random seed for reproducibility", optional: true, default: "42"}
+  - {name: k_neighbors, type: String, description: "Number of nearest neighbors for SMOTE/ADASYN (3-20)", optional: true, default: "5"}
+  - {name: minority_class, type: String, description: "Specify which class to balance: 'auto' for all minority classes, or class value (e.g., '1')", optional: true, default: "auto"}
+outputs:
+  - {name: balanced_X, type: Dataset, description: "Balanced features dataset (or original if balancing disabled)"}
+  - {name: balanced_y, type: Dataset, description: "Balanced target labels (or original if balancing disabled)"}
+  - {name: balancing_metadata, type: Data, description: "JSON metadata containing balancing statistics and configuration"}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, traceback, math
+        from datetime import datetime
+        import numpy as np
+        import pandas as pd
+        import warnings
+        from collections import Counter
+        from imblearn.over_sampling import SMOTE, ADASYN
+        from imblearn.under_sampling import RandomUnderSampler
+        from imblearn.combine import SMOTETomek
+        from sklearn.utils import class_weight
+        import cloudpickle
+        
+        warnings.filterwarnings('ignore')
+        
+        def ensure_dir_for(path: str) -> None:
+            d = os.path.dirname(path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+        
+        def load_data(x_path, y_path):
+            X = pd.read_parquet(x_path)
+            y = pd.read_parquet(y_path)
+            
+            # Handle y format
+            if isinstance(y, pd.DataFrame):
+                if y.shape[1] == 1:
+                    y = y.iloc[:, 0]
+                else:
+                    raise ValueError("Multi-label classification not supported. Please use single target column.")
+            
+            return X, y
+        
+        def analyze_class_distribution(y):
+            y_series = pd.Series(y) if not isinstance(y, pd.Series) else y
+            class_counts = Counter(y_series)
+            total_samples = len(y_series)
+            
+            distribution = {}
+            for cls, count in class_counts.items():
+                distribution[str(cls)] = {
+                    'count': int(count),
+                    'percentage': round(100 * count / total_samples, 2),
+                    'is_minority': count == min(class_counts.values())
+                }
+            
+            # Calculate imbalance ratio
+            sorted_counts = sorted(class_counts.values())
+            if len(sorted_counts) >= 2:
+                imbalance_ratio = sorted_counts[0] / sorted_counts[-1]
+            else:
+                imbalance_ratio = 1.0
+            
+            return {
+                'distribution': distribution,
+                'total_samples': total_samples,
+                'n_classes': len(class_counts),
+                'imbalance_ratio': round(imbalance_ratio, 4),
+                'is_imbalanced': imbalance_ratio < 0.5  # Custom threshold
+            }
+        
+        def apply_balancing(X, y, technique, target_ratio, random_state, k_neighbors, minority_class):
+            X_orig, y_orig = X.copy(), y.copy()
+            random_state = int(random_state)
+            k_neighbors = int(k_neighbors)
+            target_ratio = float(target_ratio)
+            
+            # Get class distribution
+            class_counts = Counter(y)
+            n_classes = len(class_counts)
+            
+            # For binary classification
+            if n_classes == 2:
+                minority_class_val = min(class_counts, key=class_counts.get)
+                majority_class_val = max(class_counts, key=class_counts.get)
+                
+                # Calculate sampling strategy
+                if technique in ['smote', 'adasyn', 'random_oversample']:
+                    # Oversampling minority
+                    n_minority = class_counts[minority_class_val]
+                    n_majority = class_counts[majority_class_val]
+                    desired_minority = int(n_majority * target_ratio)
+                    sampling_strategy = {minority_class_val: desired_minority}
+                elif technique in ['random_undersample']:
+                    # Undersampling majority
+                    n_minority = class_counts[minority_class_val]
+                    desired_majority = int(n_minority / target_ratio)
+                    sampling_strategy = {majority_class_val: desired_majority}
+                elif technique == 'smote_tomek':
+                    # SMOTE+Tomek
+                    sampling_strategy = target_ratio
+                else:
+                    sampling_strategy = 'auto'
+            else:
+                # Multi-class
+                if minority_class != 'auto' and minority_class in class_counts:
+                    # Balance specific class
+                    if technique in ['smote', 'adasyn', 'random_oversample']:
+                        n_target = class_counts[minority_class]
+                        max_class = max(class_counts.values())
+                        desired_target = int(max_class * target_ratio)
+                        sampling_strategy = {minority_class: desired_target}
+                    else:
+                        sampling_strategy = 'auto'
+                else:
+                    sampling_strategy = target_ratio  # Can be float or dict
+            
+            # Apply balancing technique
+            if technique == 'smote':
+                balancer = SMOTE(
+                    sampling_strategy=sampling_strategy,
+                    random_state=random_state,
+                    k_neighbors=min(k_neighbors, class_counts.get(minority_class_val, 5) - 1)
+                )
+                X_bal, y_bal = balancer.fit_resample(X, y)
+                
+            elif technique == 'adasyn':
+                balancer = ADASYN(
+                    sampling_strategy=sampling_strategy,
+                    random_state=random_state,
+                    n_neighbors=min(k_neighbors, class_counts.get(minority_class_val, 5) - 1)
+                )
+                X_bal, y_bal = balancer.fit_resample(X, y)
+                
+            elif technique == 'random_oversample':
+                from imblearn.over_sampling import RandomOverSampler
+                balancer = RandomOverSampler(
+                    sampling_strategy=sampling_strategy,
+                    random_state=random_state
+                )
+                X_bal, y_bal = balancer.fit_resample(X, y)
+                
+            elif technique == 'random_undersample':
+                balancer = RandomUnderSampler(
+                    sampling_strategy=sampling_strategy,
+                    random_state=random_state
+                )
+                X_bal, y_bal = balancer.fit_resample(X, y)
+                
+            elif technique == 'smote_tomek':
+                balancer = SMOTETomek(
+                    sampling_strategy=sampling_strategy,
+                    random_state=random_state,
+                    smote=SMOTE(k_neighbors=min(k_neighbors, class_counts.get(minority_class_val, 5) - 1))
+                )
+                X_bal, y_bal = balancer.fit_resample(X, y)
+                
+            elif technique == 'class_weight':
+                # Calculate class weights
+                classes = np.unique(y)
+                weights = class_weight.compute_class_weight(
+                    'balanced',
+                    classes=classes,
+                    y=y
+                )
+                class_weights = dict(zip(classes, weights))
+                X_bal, y_bal = X.copy(), y.copy()
+                balancer = {'technique': 'class_weight', 'weights': class_weights}
+                return X_bal, y_bal, balancer
+                
+            elif technique == 'none':
+                X_bal, y_bal = X.copy(), y.copy()
+                balancer = {'technique': 'none'}
+                return X_bal, y_bal, balancer
+                
+            else:
+                raise ValueError(f"Unknown balancing technique: {technique}")
+            
+            return X_bal, y_bal, balancer
+        
+        def main():
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--engineered_X", type=str, required=True)
+            parser.add_argument("--train_y", type=str, required=True)
+            parser.add_argument("--model_type", type=str, required=True)
+            parser.add_argument("--enable_balancing", type=str, default="false")
+            parser.add_argument("--balancing_technique", type=str, default="smote")
+            parser.add_argument("--target_ratio", type=float, default=1.0)
+            parser.add_argument("--random_state", type=str, default="42")
+            parser.add_argument("--k_neighbors", type=str, default="5")
+            parser.add_argument("--minority_class", type=str, default="auto")
+            parser.add_argument("--balanced_X", type=str, required=True)
+            parser.add_argument("--balanced_y", type=str, required=True)
+            parser.add_argument("--balancing_metadata", type=str, required=True)
+            args = parser.parse_args()
+            
+            try:
+                print("=" * 80)
+                print("DATA BALANCING FOR CLASSIFICATION")
+                print("=" * 80)
+                
+                # Validate model type
+                model_type = args.model_type.strip().lower()
+                if model_type != "classification":
+                    raise ValueError(f"This brick only supports classification. Got model_type='{model_type}'")
+                
+                enable_balancing = str(args.enable_balancing).lower() in ("true", "1", "yes", "y")
+                
+                # Load data
+                print("[STEP 1/4] Loading data...")
+                X, y = load_data(args.engineered_X, args.train_y)
+                print(f"  Features shape: {X.shape}")
+                print(f"  Target shape: {y.shape if hasattr(y, 'shape') else len(y)}")
+                
+                # Analyze initial distribution
+                print("[STEP 2/4] Analyzing class distribution...")
+                dist_analysis = analyze_class_distribution(y)
+                print(f"  Number of classes: {dist_analysis['n_classes']}")
+                print(f"  Total samples: {dist_analysis['total_samples']}")
+                print(f"  Imbalance ratio: {dist_analysis['imbalance_ratio']}")
+                print(f"  Is imbalanced: {dist_analysis['is_imbalanced']}")
+                
+                for cls, info in dist_analysis['distribution'].items():
+                    print(f"  Class {cls}: {info['count']} samples ({info['percentage']}%)")
+                
+                # Apply balancing if enabled
+                if enable_balancing:
+                    print("[STEP 3/4] Applying balancing...")
+                    print(f"  Technique: {args.balancing_technique}")
+                    print(f"  Target ratio: {args.target_ratio}")
+                    print(f"  Random state: {args.random_state}")
+                    
+                    X_bal, y_bal, balancer = apply_balancing(
+                        X=X,
+                        y=y,
+                        technique=args.balancing_technique,
+                        target_ratio=args.target_ratio,
+                        random_state=args.random_state,
+                        k_neighbors=args.k_neighbors,
+                        minority_class=args.minority_class
+                    )
+                    
+                    # Analyze balanced distribution
+                    bal_analysis = analyze_class_distribution(y_bal)
+                    print(f"  Original samples: {dist_analysis['total_samples']}")
+                    print(f"  Balanced samples: {bal_analysis['total_samples']}")
+                    print(f"  Samples added: {bal_analysis['total_samples'] - dist_analysis['total_samples']}")
+                    
+                else:
+                    print("[STEP 3/4] Balancing disabled - using original data")
+                    X_bal, y_bal = X.copy(), y.copy()
+                    balancer = {'technique': 'none', 'enabled': False}
+                    bal_analysis = dist_analysis
+                
+                # Prepare metadata
+                print("[STEP 4/4] Saving outputs...")
+                metadata = {
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'model_type': model_type,
+                    'balancing_enabled': enable_balancing,
+                    'configuration': {
+                        'balancing_technique': args.balancing_technique,
+                        'target_ratio': args.target_ratio,
+                        'random_state': int(args.random_state),
+                        'k_neighbors': int(args.k_neighbors),
+                        'minority_class': args.minority_class
+                    },
+                    'original_distribution': dist_analysis,
+                    'balanced_distribution': bal_analysis,
+                    'statistics': {
+                        'original_shape': {'rows': X.shape[0], 'cols': X.shape[1]},
+                        'balanced_shape': {'rows': X_bal.shape[0], 'cols': X_bal.shape[1]},
+                        'samples_added': bal_analysis['total_samples'] - dist_analysis['total_samples'],
+                        'imbalance_improvement': round(dist_analysis['imbalance_ratio'] - bal_analysis['imbalance_ratio'], 4)
+                    },
+                    'balancer_info': balancer if 'technique' in balancer else {'technique': args.balancing_technique}
+                }
+                
+                # Save balanced data
+                ensure_dir_for(args.balanced_X)
+                if isinstance(X_bal, pd.DataFrame):
+                    X_bal.to_parquet(args.balanced_X, index=False)
+                else:
+                    pd.DataFrame(X_bal).to_parquet(args.balanced_X, index=False)
+                
+                ensure_dir_for(args.balanced_y)
+                if isinstance(y_bal, pd.DataFrame):
+                    y_bal.to_parquet(args.balanced_y, index=False)
+                elif isinstance(y_bal, pd.Series):
+                    y_bal.to_frame().to_parquet(args.balanced_y, index=False)
+                else:
+                    pd.DataFrame(y_bal).to_parquet(args.balanced_y, index=False)
+                
+                # Save metadata
+                ensure_dir_for(args.balancing_metadata)
+                with open(args.balancing_metadata, 'w') as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+                
+                # Final summary
+                print("=" * 80)
+                print("DATA BALANCING COMPLETE")
+                print("=" * 80)
+                print(f"Original data: {X.shape[0]} samples, {dist_analysis['n_classes']} classes")
+                print(f"Balanced data: {X_bal.shape[0]} samples")
+                print(f"Technique: {args.balancing_technique if enable_balancing else 'none'}")
+                
+                if enable_balancing:
+                    print("Class distribution improvement:")
+                    for cls in dist_analysis['distribution']:
+                        orig_pct = dist_analysis['distribution'][cls]['percentage']
+                        bal_pct = bal_analysis['distribution'].get(cls, {}).get('percentage', orig_pct)
+                        print(f"  Class {cls}: {orig_pct}% → {bal_pct}%")
+                
+                print(f"Output files:")
+                print(f"  • Balanced features: {args.balanced_X}")
+                print(f"  • Balanced targets: {args.balanced_y}")
+                print(f"  • Metadata: {args.balancing_metadata}")
+                print("=" * 80)
+                
+            except Exception as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                traceback.print_exc()
+                sys.exit(1)
+        
+        if __name__ == "__main__":
+            main()
+    args:
+      - --engineered_X
+      - {inputPath: engineered_X}
+      - --train_y
+      - {inputPath: train_y}
+      - --model_type
+      - {inputValue: model_type}
+      - --enable_balancing
+      - {inputValue: enable_balancing}
+      - --balancing_technique
+      - {inputValue: balancing_technique}
+      - --target_ratio
+      - {inputValue: target_ratio}
+      - --random_state
+      - {inputValue: random_state}
+      - --k_neighbors
+      - {inputValue: k_neighbors}
+      - --minority_class
+      - {inputValue: minority_class}
+      - --balanced_X
+      - {outputPath: balanced_X}
+      - --balanced_y
+      - {outputPath: balanced_y}
+      - --balancing_metadata
+      - {outputPath: balancing_metadata}
