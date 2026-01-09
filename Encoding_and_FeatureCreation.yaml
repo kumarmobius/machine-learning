@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v4.6
+name: Encoding and Feature Creation v4.7
 inputs:
   - name: imputed_X
     type: Dataset
@@ -143,13 +143,13 @@ implementation:
                 os.makedirs(d, exist_ok=True)
         # ADVANCED NUMERIC TRANSFORMER SELECTION 
         # Add this after imports
+        def analyze_numeric_feature(series):
+            v = series.dropna()
+            if len(v) < 10:
+                return None
         def safe_sqrt(x):
             result = np.sqrt(x)
             return result.flatten() if hasattr(result, 'flatten') and len(result.shape) > 1 else result
-                def analyze_numeric_feature(series):
-                    v = series.dropna()
-                    if len(v) < 10:
-                        return None
             
             stats_dict = {
                 'n_samples': len(v),
