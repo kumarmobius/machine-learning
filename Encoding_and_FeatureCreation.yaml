@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v3
+name: Encoding and Feature Creation v3.1
 inputs:
   - name: imputed_X
     type: Dataset
@@ -379,8 +379,8 @@ implementation:
                         if 'single' in target_maps:
                             cfg['target_mapping'] = target_maps['single']['mapping']
                             cfg['target_global_mean'] = target_maps['single']['global_mean']
-                            if training_mode:
-                                cfg['oof_encoding'] = target_maps['single']['oof']
+                            
+                            cfg['oof_encoding'] = target_maps['single']['oof']
                         else:
                             # Multi-class
                             cfg['multi_class_mappings'] = {}
@@ -389,8 +389,8 @@ implementation:
                                     'mapping': cls_data['mapping'],
                                     'global_mean': cls_data['global_mean']
                                 }
-                                if training_mode:
-                                    cfg[f'oof_encoding_class_{cls}'] = cls_data['oof']
+                                
+                                cfg[f'oof_encoding_class_{cls}'] = cls_data['oof']
                     
                     elif enc_type == 'ordinal':
                         enc_obj.fit(s.to_frame())
@@ -483,7 +483,6 @@ implementation:
                         if training_mode and 'oof_encoding' in cfg:
                             df[c] = cfg['oof_encoding'].reindex(df.index, fill_value=cfg['target_global_mean']).astype(float)
                         elif training_mode and 'multi_class_mappings' in cfg:
-                            # For multi-class, use first class encoding (or could create multiple columns)
                             first_cls = list(cfg['multi_class_mappings'].keys())[0]
                             mapping = cfg['multi_class_mappings'][first_cls]['mapping']
                             gmean = cfg['multi_class_mappings'][first_cls]['global_mean']
