@@ -1,0 +1,353 @@
+name: Imputation and Cleaning v2.1
+inputs:
+  - name: cleaned_X
+    type: Dataset
+    description: "Cleaned feature dataset from Data Cleaning step (parquet format)"
+  
+  - name: cleaned_y
+    type: Dataset
+    description: "Target variable(s) from Data Cleaning step (parquet format)"
+  
+  - name: cleaning_metadata
+    type: Data
+    description: "JSON metadata from Data Cleaning step"
+  
+  - name: model_type
+    type: String
+    description: "Task type: 'classification' or 'regression'"
+
+  - name: outlier_strategy
+    type: String
+    description: "'none', 'drop_iqr', or 'winsorize'"
+    optional: true
+    default: "none"
+  
+  - name: outlier_fold
+    type: Float
+    description: "IQR multiplier (1.5 standard, 3.0 extreme)"
+    optional: true
+    default: "1.5"
+  
+  - name: max_knn_rows
+    type: Integer
+    description: "Max rows for KNN imputation"
+    optional: true
+    default: "5000"
+  
+  - name: numeric_imputer
+    type: String
+    description: "'auto', 'median', 'mean', 'constant', 'knn', or 'iterative'"
+    optional: true
+    default: "auto"
+  
+  - name: numeric_imputer_constant_value
+    type: Float
+    description: "Constant value for numeric imputation"
+    optional: true
+    default: "-1"
+  
+  - name: cat_imputer
+    type: String
+    description: "'most_frequent' or 'constant'"
+    optional: true
+    default: "most_frequent"
+  
+  - name: cat_imputer_constant_value
+    type: String
+    description: "Constant value for categorical imputation"
+    optional: true
+    default: "MISSING"
+
+  - name: rare_threshold
+    type: Float
+    description: "Fraction threshold for rare category collapsing"
+    optional: true
+    default: "0.01"
+  
+  - name: enable_string_similarity
+    type: String
+    description: "'true' or 'false' - Group similar category names"
+    optional: true
+    default: "false"
+
+outputs:
+  - {name: imputed_X, type: Dataset, description: "Imputed features parquet"}
+  - {name: aligned_y, type: Dataset, description: "Target aligned with X after outlier removal"}
+  - {name: imputation_config, type: Data, description: "JSON config for encoding step"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, traceback
+        from datetime import datetime
+        import pandas as pd, numpy as np
+        from sklearn.impute import SimpleImputer, KNNImputer
+        from sklearn.experimental import enable_iterative_imputer
+        from sklearn.impute import IterativeImputer
+        from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+        
+        def ensure_dir_for(p):
+            d=os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def collapse_rare_labels(series, threshold_frac=0.01):
+            counts=series.value_counts(dropna=False)
+            n=len(series)
+            rare = set(counts[counts <= max(1,int(threshold_frac*n))].index)
+            return series.map(lambda x: "__RARE__" if x in rare else x), rare
+
+        def string_similarity_group(series, score_threshold=90):
+            vals=[v for v in pd.Series(series.dropna().unique()).astype(str)]
+            mapping={}; used=set()
+            for v in vals:
+                if v in used: continue
+                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
+                group=[m[0] for m in matches]
+                for g in group: mapping[g]=v; used.add(g)
+            return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
+
+        def drop_outliers_iqr(df, numeric_cols, fold=1.5):
+            if not numeric_cols: return df,0,pd.Series(True,index=df.index)
+            q1 = df[numeric_cols].quantile(0.25, numeric_only=True)
+            q3 = df[numeric_cols].quantile(0.75, numeric_only=True)
+            iqr = q3 - q1
+            lower = (q1 - fold * iqr).to_dict()
+            upper = (q3 + fold * iqr).to_dict()
+            mask = pd.Series(True, index=df.index)
+            for c in numeric_cols:
+                s = df[c]
+                lo = lower.get(c, None); hi = upper.get(c, None)
+                cond = pd.Series(True, index=df.index)
+                if lo is not None: cond = cond & s.ge(lo)
+                if hi is not None: cond = cond & s.le(hi)
+                cond = cond.reindex(df.index).fillna(True)
+                mask = mask & cond
+            before=len(df)
+            df2 = df.loc[mask].copy()
+            removed = before - len(df2)
+            df2.reset_index(drop=True, inplace=True)
+            return df2, removed, mask
+
+        def winsorize_df(df, numeric_cols, fold=1.5):
+            if not numeric_cols: return df,0
+            q1=df[numeric_cols].quantile(0.25, numeric_only=True)
+            q3=df[numeric_cols].quantile(0.75, numeric_only=True)
+            iqr=q3-q1
+            lower=(q1 - fold*iqr).to_dict()
+            upper=(q3 + fold*iqr).to_dict()
+            df2=df.copy()
+            for c in numeric_cols:
+                lo = lower.get(c, None); hi = upper.get(c, None)
+                if lo is not None or hi is not None:
+                    df2[c]=df2[c].clip(lower=lo, upper=hi)
+            return df2,0
+
+        parser=argparse.ArgumentParser()
+        parser.add_argument('--cleaned_X', type=str, required=True)
+        parser.add_argument('--cleaned_y', type=str, required=True)
+        parser.add_argument('--cleaning_metadata', type=str, required=True)
+        parser.add_argument('--model_type', type=str, required=True)
+        parser.add_argument('--outlier_strategy', type=str, default="none")
+        parser.add_argument('--outlier_fold', type=float, default=1.5)
+        parser.add_argument('--max_knn_rows', type=int, default=5000)
+        parser.add_argument('--numeric_imputer', type=str, default='auto')
+        parser.add_argument('--numeric_imputer_constant_value', type=float, default=-1)
+        parser.add_argument('--cat_imputer', type=str, default='most_frequent')
+        parser.add_argument('--cat_imputer_constant_value', type=str, default='MISSING')
+        parser.add_argument('--rare_threshold', type=float, default=0.01)
+        parser.add_argument('--enable_string_similarity', type=str, default="false")
+        parser.add_argument('--imputed_X', type=str, required=True)
+        parser.add_argument('--aligned_y', type=str, required=True)
+        parser.add_argument('--imputation_config', type=str, required=True)
+        args=parser.parse_args()
+
+        try:
+            print("="*80)
+            print("PART 1: IMPUTATION & CLEANING")
+            print("="*80)
+            
+            # Load data
+            print("[STEP 1/6] Loading data...")
+            X = pd.read_parquet(args.cleaned_X)
+            y = pd.read_parquet(args.cleaned_y)
+            print(f"[INFO] X shape: {X.shape}, y shape: {y.shape}")
+            
+            with open(args.cleaning_metadata, 'r') as f:
+                cleaning_meta = json.load(f)
+            target_cols = cleaning_meta['target_columns']
+            
+            # Identify column types
+            num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+            cat_cols = [c for c in X.columns if c not in num_cols]
+            print(f"[INFO] Numeric: {len(num_cols)}, Categorical: {len(cat_cols)}")
+            
+            # Clean inf/nan strings
+            print("[STEP 2/6] Cleaning data...")
+            X.replace(["NaN","nan","None","null","INF","-INF","Inf","-Inf","inf","-inf"], np.nan, inplace=True)
+            for c in num_cols:
+                X[c] = pd.to_numeric(X[c], errors='coerce')
+            
+            # Handle outliers
+            print("[STEP 3/6] Handling outliers...")
+            outliers_removed = 0
+            kept_mask = pd.Series(True, index=X.index)
+            
+            if args.outlier_strategy == 'drop_iqr':
+                X, outliers_removed, kept_mask = drop_outliers_iqr(X, num_cols, fold=args.outlier_fold)
+                y = y.loc[kept_mask].reset_index(drop=True)
+                print(f"[INFO] Dropped {outliers_removed} outlier rows")
+            elif args.outlier_strategy == 'winsorize':
+                X, _ = winsorize_df(X, num_cols, fold=args.outlier_fold)
+                print(f"[INFO] Winsorized outliers")
+            
+            # Numeric imputation
+            print("[STEP 4/6] Imputing numeric columns...")
+            col_imputation_methods = {}
+            
+            for c in num_cols:
+                missing_frac = X[c].isna().mean()
+                if missing_frac == 0:
+                    col_imputation_methods[c] = 'none'
+                    continue
+                
+                strategy = args.numeric_imputer
+                if strategy == 'auto':
+                    if missing_frac < 0.02:
+                        strategy = 'median'
+                    elif missing_frac < 0.25 and len(X) <= args.max_knn_rows:
+                        strategy = 'knn'
+                    else:
+                        strategy = 'iterative'
+                
+                col_imputation_methods[c] = strategy
+                
+                if strategy in ['median', 'mean']:
+                    imp = SimpleImputer(strategy=strategy)
+                    X[c] = imp.fit_transform(X[[c]]).reshape(-1)
+                elif strategy == 'constant':
+                    imp = SimpleImputer(strategy='constant', fill_value=args.numeric_imputer_constant_value)
+                    X[c] = imp.fit_transform(X[[c]]).reshape(-1)
+            
+            # KNN imputation for selected columns
+            knn_cols = [c for c, m in col_imputation_methods.items() if m == 'knn']
+            if knn_cols:
+                print(f"[INFO] KNN imputation for {len(knn_cols)} columns")
+                knn = KNNImputer(n_neighbors=5)
+                X[knn_cols] = knn.fit_transform(X[knn_cols])
+            
+            # Iterative imputation for selected columns
+            iter_cols = [c for c, m in col_imputation_methods.items() if m == 'iterative']
+            if iter_cols:
+                print(f"[INFO] Iterative imputation for {len(iter_cols)} columns")
+                iter_imp = IterativeImputer(max_iter=10, random_state=0)
+                X[iter_cols] = iter_imp.fit_transform(X[iter_cols])
+            
+            # Categorical imputation
+            print("[STEP 5/6] Imputing categorical columns...")
+            enable_string_sim = str(args.enable_string_similarity).lower() in ("1","true","t","yes","y")
+            
+            cat_config = {}
+            for c in cat_cols:
+                s = X[c].astype(object)
+                cfg = {
+                    'n_unique': int(s.nunique(dropna=True)),
+                    'missing_frac': float(s.isna().mean())
+                }
+                
+                # Impute missing values
+                if cfg['missing_frac'] > 0:
+                    if args.cat_imputer == 'most_frequent':
+                        imp = SimpleImputer(strategy='most_frequent')
+                        X[c] = imp.fit_transform(X[[c]].astype(str)).reshape(-1)
+                    elif args.cat_imputer == 'constant':
+                        imp = SimpleImputer(strategy='constant', fill_value=args.cat_imputer_constant_value)
+                        X[c] = imp.fit_transform(X[[c]].astype(str)).reshape(-1)
+                
+                # Collapse rare labels
+                collapsed, rare_set = collapse_rare_labels(X[c], threshold_frac=args.rare_threshold)
+                X[c] = collapsed
+                cfg['rare_values'] = list(rare_set)
+                
+                # String similarity grouping
+                if enable_string_sim and cfg['n_unique'] > 20:
+                    grouped, mapping = string_similarity_group(X[c], score_threshold=90)
+                    X[c] = grouped
+                    cfg['string_similarity_map'] = mapping
+                
+                cat_config[c] = cfg
+            
+            # Save outputs
+            print("[STEP 6/6] Saving outputs...")
+            ensure_dir_for(args.imputed_X)
+            ensure_dir_for(args.aligned_y)
+            ensure_dir_for(args.imputation_config)
+            
+            X.to_parquet(args.imputed_X, index=False)
+            y.to_parquet(args.aligned_y, index=False)
+            
+            config = {
+                'timestamp': datetime.utcnow().isoformat()+'Z',
+                'model_type': args.model_type,
+                'target_columns': target_cols,
+                'num_cols': num_cols,
+                'cat_cols': cat_cols,
+                'cat_config': cat_config,
+                'numeric_imputation_methods': col_imputation_methods,
+                'outliers_removed': outliers_removed,
+                'outlier_strategy': args.outlier_strategy,
+                'shape': {'rows': X.shape[0], 'cols': X.shape[1]},
+                'cleaning_metadata': cleaning_meta
+            }
+            
+            with open(args.imputation_config, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            print("="*80)
+            print("PART 1 COMPLETE")
+            print(f"Output shape: {X.shape}")
+            print(f"Outliers removed: {outliers_removed}")
+            print("="*80)
+            
+        except Exception as exc:
+            print("ERROR: " + str(exc), file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --cleaned_X
+      - {inputPath: cleaned_X}
+      - --cleaned_y
+      - {inputPath: cleaned_y}
+      - --cleaning_metadata
+      - {inputPath: cleaning_metadata}
+      - --model_type
+      - {inputValue: model_type}
+      - --outlier_strategy
+      - {inputValue: outlier_strategy}
+      - --outlier_fold
+      - {inputValue: outlier_fold}
+      - --max_knn_rows
+      - {inputValue: max_knn_rows}
+      - --numeric_imputer
+      - {inputValue: numeric_imputer}
+      - --numeric_imputer_constant_value
+      - {inputValue: numeric_imputer_constant_value}
+      - --cat_imputer
+      - {inputValue: cat_imputer}
+      - --cat_imputer_constant_value
+      - {inputValue: cat_imputer_constant_value}
+      - --rare_threshold
+      - {inputValue: rare_threshold}
+      - --enable_string_similarity
+      - {inputValue: enable_string_similarity}
+      - --imputed_X
+      - {outputPath: imputed_X}
+      - --aligned_y
+      - {outputPath: aligned_y}
+      - --imputation_config
+      - {outputPath: imputation_config}
