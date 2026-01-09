@@ -1,4 +1,4 @@
-name: Data Balancing v1.0
+name: Data Balancing v1.1
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Feature Engineering brick (parquet format). All categorical features should already be encoded."}
   - {name: train_y, type: Dataset, description: "Target labels for classification (parquet format)"}
@@ -214,7 +214,9 @@ implementation:
                 # Validate model type
                 model_type = args.model_type.strip().lower()
                 if model_type != "classification":
-                    raise ValueError(f"This brick only supports classification. Got model_type='{model_type}'")
+                    print(f"[INFO] Model type is '{model_type}', not 'classification'")
+                    print("[INFO] Data balancing only applicable for classification. Using passthrough mode.")
+                    enable_balancing = False 
                 
                 enable_balancing = str(args.enable_balancing).lower() in ("true", "1", "yes", "y")
                 
