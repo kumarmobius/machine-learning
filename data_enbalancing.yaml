@@ -1,4 +1,4 @@
-name: Data Balancing v2
+name: Data Balancing v2.1
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Feature Engineering brick (parquet format). All categorical features should already be encoded."}
   - {name: train_y, type: Dataset, description: "Target labels for classification (parquet format)"}
@@ -6,8 +6,8 @@ inputs:
   - {name: enable_balancing, type: String, description: "Enable data balancing. Use 'true' to apply, 'false' for passthrough.", optional: true, default: "false"}
   - {name: balancing_technique, type: String, description: "Balancing method: 'smote', 'adasyn', 'random_oversample', 'random_undersample', 'smote_tomek', 'class_weight', 'none'", optional: true, default: "smote"}
   - {name: target_ratio, type: Float, description: "Desired minority:majority ratio (0.1 to 1.0). 1.0 = perfect balance. Ignored for 'class_weight' and 'none'.", optional: true, default: "1.0"}
-  - {name: random_state, type: String, description: "Random seed for reproducibility", optional: true, default: "42"}
-  - {name: k_neighbors, type: String, description: "Number of nearest neighbors for SMOTE/ADASYN (3-20)", optional: true, default: "5"}
+  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "42"}
+  - {name: k_neighbors, type: Integer, description: "Number of nearest neighbors for SMOTE/ADASYN (3-20)", optional: true, default: "5"}
   - {name: minority_class, type: String, description: "Specify which class to balance: 'auto' for all minority classes, or class value (e.g., '1')", optional: true, default: "auto"}
 outputs:
   - {name: balanced_X, type: Dataset, description: "Balanced features dataset (or original if balancing disabled)"}
@@ -81,11 +81,22 @@ implementation:
                 'is_imbalanced': imbalance_ratio < 0.5  # Custom threshold
             }
         
+        def safe_int(value, default=None):
+            try:
+                if value is None:
+                    return default
+                # Handle both string and integer inputs
+                return int(value)
+            except (ValueError, TypeError):
+                return default
+        
         def apply_balancing(X, y, technique, target_ratio, random_state, k_neighbors, minority_class):
             X_orig, y_orig = X.copy(), y.copy()
-            random_state = int(random_state)
-            k_neighbors = int(k_neighbors)
-            target_ratio = float(target_ratio)
+            
+            # Convert parameters with safe handling
+            random_state = safe_int(random_state, 42)
+            k_neighbors = safe_int(k_neighbors, 5)
+            target_ratio = float(target_ratio) if target_ratio else 1.0
             
             # Get class distribution
             class_counts = Counter(y)
@@ -198,8 +209,8 @@ implementation:
             parser.add_argument("--enable_balancing", type=str, default="false")
             parser.add_argument("--balancing_technique", type=str, default="smote")
             parser.add_argument("--target_ratio", type=float, default=1.0)
-            parser.add_argument("--random_state", type=str, default="42")
-            parser.add_argument("--k_neighbors", type=str, default="5")
+            parser.add_argument("--random_state", type=int, default=42)
+            parser.add_argument("--k_neighbors", type=int, default=5)
             parser.add_argument("--minority_class", type=str, default="auto")
             parser.add_argument("--balanced_X", type=str, required=True)
             parser.add_argument("--balanced_y", type=str, required=True)
@@ -312,8 +323,8 @@ implementation:
                         'enable_balancing_input': enable_balancing_input,
                         'balancing_technique': args.balancing_technique,
                         'target_ratio': args.target_ratio,
-                        'random_state': int(args.random_state),
-                        'k_neighbors': int(args.k_neighbors),
+                        'random_state': args.random_state,
+                        'k_neighbors': args.k_neighbors,
                         'minority_class': args.minority_class
                     },
                     'original_distribution': dist_analysis,
