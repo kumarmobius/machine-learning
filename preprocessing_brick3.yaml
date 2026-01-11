@@ -1,4 +1,4 @@
-name: Feature Selection v7
+name: Feature Selection v7.1
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features dataset from Feature Engineering brick (parquet format)"}
   - {name: train_y, type: Dataset, description: "Target labels dataset corresponding to engineered features (parquet format)"}
@@ -11,26 +11,25 @@ inputs:
   
   # Target correlation filter parameters
   - {name: enable_target_corr_filter, type: String, description: "Enable supervised filtering based on correlation with target. Drops numeric features with low correlation to target. Use 'true' for regression problems or when target relationship is linear.", optional: true, default: "false"}
-  - {name: target_corr_threshold, type: String, description: "Minimum absolute correlation value to keep a feature. Features with |correlation| < threshold are dropped. Range: 0.0 to 1.0. Lower values keep more features.", optional: true, default: "0.01"}
+  - {name: target_corr_threshold, type: Float, description: "Minimum absolute correlation value to keep a feature. Features with |correlation| < threshold are dropped. Range: 0.0 to 1.0. Lower values keep more features.", optional: true, default: "0.01"}
   - {name: corr_method, type: String, description: "Correlation calculation method for numeric features. 'pearson' for linear relationships, 'spearman' for monotonic relationships. Spearman is more robust to outliers.", optional: true, default: "spearman"}
   
   # Feature-to-feature correlation filter
-  - {name: feature_corr_threshold, type: String, description: "Threshold for removing highly correlated features. Features with correlation > threshold are considered redundant. Range: 0.0 to 1.0. Higher values keep more correlated features.", optional: true, default: "0.95"}
+  - {name: feature_corr_threshold, type: Float, description: "Threshold for removing highly correlated features. Features with correlation > threshold are considered redundant. Range: 0.0 to 1.0. Higher values keep more correlated features.", optional: true, default: "0.95"}
   
   # Variance filter
-  - {name: variance_threshold, type: String, description: "Minimum variance threshold for near-zero variance filter. Features with variance < threshold are removed. Use 0.0 to disable. Typical values: 1e-5 to 1e-8.", optional: true, default: "1e-5"}
+  - {name: variance_threshold, type: Float, description: "Minimum variance threshold for near-zero variance filter. Features with variance < threshold are removed. Use 0.0 to disable. Typical values: 1e-5 to 1e-8.", optional: true, default: "1e-5"}
   
   # Feature ranking and selection
-  - {name: max_features, type: String, description: "Maximum number of features to keep after selection. Use '0' for automatic selection based on sqrt(n_features). Use positive integer to set exact limit.", optional: true, default: "0"}
+  - {name: max_features, type: Integer, description: "Maximum number of features to keep after selection. Use '0' for automatic selection based on sqrt(n_features). Use positive integer to set exact limit.", optional: true, default: "0"}
   - {name: selection_method, type: String, description: "Method for ranking features: 'mi' for Mutual Information (works for both linear and nonlinear relationships), 'variance' for variance-based ranking (simpler but less accurate).", optional: true, default: "mi"}
   
   # Handling of non-numeric features
   - {name: keep_non_numeric, type: String, description: "Whether to preserve non-numeric features during target correlation filtering. Use 'true' to keep categorical/string features, 'false' to only process numeric features.", optional: true, default: "true"}
   
   # Advanced options
-  - {name: random_state, type: String, description: "Random seed for reproducible feature selection. Use any integer value for consistent results across runs.", optional: true, default: "42"}
+  - {name: random_state, type: Integer, description: "Random seed for reproducible feature selection. Use any integer value for consistent results across runs.", optional: true, default: "42"}
   - {name: use_mrmr, type: String, description: "Use Minimum Redundancy Maximum Relevance algorithm instead of simple MI ranking. More computationally expensive but may produce better feature subsets.", optional: true, default: "false"}
-
 outputs:
   - {name: train_X, type: Dataset, description: "Final selected features dataset in parquet format. Contains only the features selected by the feature selection pipeline."}
   - {name: train_y, type: Dataset, description: "Target labels dataset (pass-through from input) in parquet format. Unchanged from input."}
@@ -336,14 +335,14 @@ implementation:
         parser.add_argument('--enable_feature_selection', type=str, default="false")
         parser.add_argument('--model_type', type=str, required=True)
         parser.add_argument('--enable_target_corr_filter', type=str, default="false")
-        parser.add_argument('--target_corr_threshold', type=str, default="0.01")
+        parser.add_argument('--target_corr_threshold', type=float, default="0.01")
         parser.add_argument('--corr_method', type=str, default="spearman")
-        parser.add_argument('--variance_threshold', type=str, default="1e-5")
-        parser.add_argument('--feature_corr_threshold', type=str, default="0.95")
-        parser.add_argument('--max_features', type=str, default="0")
+        parser.add_argument('--variance_threshold', type=float, default="1e-5")
+        parser.add_argument('--feature_corr_threshold', type=float, default="0.95")
+        parser.add_argument('--max_features', type=int, default="0")
         parser.add_argument('--selection_method', type=str, default="mi")
         parser.add_argument('--keep_non_numeric', type=str, default="true")
-        parser.add_argument('--random_state', type=str, default="42")
+        parser.add_argument('--random_state', type=int, default="42")
         parser.add_argument('--use_mrmr', type=str, default="false")
         parser.add_argument('--train_X', type=str, required=True)
         parser.add_argument('--train_y_out', type=str, required=True)
