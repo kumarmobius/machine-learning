@@ -1,4 +1,4 @@
-name: SVM and KNN Trigger V1
+name: SVM and KNN Trigger
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -19,7 +19,7 @@ inputs:
   - {name: execution_id, type: Integer, optional: true}
   - {name: model_name, type: String, description: "Model to train: knn | decisiontree | extratrees | svc | linearsvc | nusvc | svr | linearsvr", optional: true, default: "decisiontree"}
   - {name: enable_balancing, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
-  - {name: balancing_method, type: String, description: "class_weight, sample_weight, or none (classification only)", optional: true, default: "class_weight"}
+  - {name: balancing_technique, type: String, description: "class_weight, sample_weight, or none (classification only)", optional: true, default: "class_weight"}
   - {name: n_neighbors, type: Integer, description: "Number of neighbors (for KNN). Used only when model_name=knn", optional: true, default: "5"}
   - {name: dt_max_depth, type: Integer, description: "Max depth for DecisionTree (None for automatic). Used only when model_name=decisiontree", optional: true, default: "5"}
   - {name: n_estimators, type: Integer, description: "Number of estimators (for tree ensembles)", optional: true, default: "100"}
@@ -73,7 +73,7 @@ implementation:
         parser.add_argument('--execution_id', type=int)
         parser.add_argument('--model_name', default="decisiontree")
         parser.add_argument('--enable_balancing', default="true")
-        parser.add_argument('--balancing_method', default="class_weight")
+        parser.add_argument('--balancing_technique', default="class_weight")
         parser.add_argument('--n_neighbors', type=int, default=5)
         parser.add_argument('--dt_max_depth', type=int, default=5)
         parser.add_argument('--n_estimators', type=int, default=100)
@@ -137,8 +137,8 @@ implementation:
             parameters["model_name"] = args.model_name
         if args.enable_balancing:
             parameters["enable_balancing"] = args.enable_balancing
-        if args.balancing_method:
-            parameters["balancing_method"] = args.balancing_method
+        if args.balancing_technique:
+            parameters["balancing_technique"] = args.balancing_technique
         if args.n_neighbors:
             parameters["n_neighbors"] = args.n_neighbors
         if args.dt_max_depth:
@@ -261,7 +261,7 @@ implementation:
       - --target_column
       - {inputValue: target_column}
       - --preprocessor_metadata_cdn
-      - {inputValue: preprocessor_metadata_cdn}
+      - {inputPath: preprocessor_metadata_cdn}
       - --cleaning_metadata_cdn
       - {inputValue: cleaning_metadata_cdn}
       - --feature_selector_cdn
@@ -286,8 +286,8 @@ implementation:
       - {inputValue: model_name}
       - --enable_balancing
       - {inputValue: enable_balancing}
-      - --balancing_method
-      - {inputValue: balancing_method}
+      - --balancing_technique
+      - {inputValue: balancing_technique}
       - --n_neighbors
       - {inputValue: n_neighbors}
       - --dt_max_depth
