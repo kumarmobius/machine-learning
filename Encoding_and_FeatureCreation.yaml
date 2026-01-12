@@ -1,4 +1,4 @@
-name: Encoding and Feature Creation v4.7
+name: Encoding and Feature Creation v4.5
 inputs:
   - name: imputed_X
     type: Dataset
@@ -377,16 +377,81 @@ implementation:
                 else:
                     return 'count', None
 
+        def safe_mean_calculation(series):
+            try:
+                # Try numeric conversion first
+                numeric_series = pd.to_numeric(series, errors='coerce')
+                if numeric_series.isna().any():
+                    # If some values couldn't be converted, use the valid ones
+                    valid_values = numeric_series.dropna()
+                    if len(valid_values) > 0:
+                        return float(valid_values.mean())
+                    else:
+                        return 0.0
+                else:
+                    return float(numeric_series.mean())
+            except Exception:
+                return 0.0
+        
         def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=1.0, random_state=42, model_type='classification'):
             X_col = df[col].astype(object).fillna('__NA__')
             
+            # SAFETY CHECK 1: If target has issues, use fallback encoding
+            try:
+                # Check if target is valid
+                if model_type == 'regression':
+                    # For regression, target should be numeric
+                    y_test = pd.to_numeric(y, errors='coerce')
+                    if y_test.isna().any():
+                        print(f"[WARNING] Column '{col}': Target contains non-numeric values for regression task")
+                        print(f"[WARNING] Using count encoding as fallback instead of target encoding")
+                        # Fallback to count encoding
+                        counts = X_col.value_counts().to_dict()
+                        return {
+                            'single': {
+                                'oof': pd.Series(X_col.map(counts).fillna(0), index=df.index),
+                                'mapping': counts,
+                                'global_mean': 0
+                            }
+                        }
+                    y = y_test  # Use the cleaned numeric version
+                else:
+                    # For classification, ensure we have reasonable number of classes
+                    y_unique = y.unique()
+                    # If too many unique values, it might be mislabeled numeric data
+                    if len(y_unique) > 100:
+                        print(f"[WARNING] Column '{col}': Too many unique classes ({len(y_unique)}) for classification")
+                        print(f"[WARNING] Using count encoding as fallback")
+                        counts = X_col.value_counts().to_dict()
+                        return {
+                            'single': {
+                                'oof': pd.Series(X_col.map(counts).fillna(0), index=df.index),
+                                'mapping': counts,
+                                'global_mean': 0
+                            }
+                        }
+            except Exception as e:
+                print(f"[WARNING] Column '{col}': Error checking target: {e}")
+                print(f"[WARNING] Using count encoding as fallback")
+                counts = X_col.value_counts().to_dict()
+                return {
+                    'single': {
+                        'oof': pd.Series(X_col.map(counts).fillna(0), index=df.index),
+                        'mapping': counts,
+                        'global_mean': 0
+                    }
+                }
+            
+            # Continue with original logic if checks pass
             if model_type == 'classification' and len(y.unique()) > 2:
                 # Multi-class: encode each class probability
                 classes = sorted(y.unique())
                 oof_maps = {}
                 for cls in classes:
                     y_binary = (y == cls).astype(int)
-                    global_mean = float(y_binary.mean())
+                    
+                    # Use safe mean calculation
+                    global_mean = safe_mean_calculation(y_binary)
                     
                     # Create OOF predictions
                     cls_oof = pd.Series(index=df.index, dtype=float)
@@ -398,7 +463,12 @@ implementation:
                         splits = list(kf.split(df))
                     
                     for train_idx, val_idx in splits:
-                        train_means = y_binary.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
+                        # Safely calculate train means
+                        train_data = pd.DataFrame({
+                            'X': X_col.iloc[train_idx],
+                            'y': y_binary.iloc[train_idx]
+                        })
+                        train_means = train_data.groupby('X')['y'].apply(safe_mean_calculation).to_dict()
                         cls_oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
                     
                     # Apply smoothing
@@ -406,7 +476,7 @@ implementation:
                     smooth_map = {}
                     for cat, cnt in counts.items():
                         if cnt > 0:
-                            cat_mean = float(y_binary[X_col == cat].mean())
+                            cat_mean = safe_mean_calculation(y_binary[X_col == cat])
                             alpha = cnt / (cnt + smoothing)
                             smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
                         else:
@@ -423,11 +493,25 @@ implementation:
             else:
                 # Binary classification or regression
                 if model_type == 'classification':
-                    y_encoded = y.astype(int) if len(y.unique()) == 2 else y
+                    if len(y.unique()) == 2:
+                        # Binary classification
+                        try:
+                            y_encoded = y.astype(int)
+                        except:
+                            # If can't convert to int, map to 0/1
+                            unique_vals = y.unique()
+                            if len(unique_vals) == 2:
+                                mapping = {unique_vals[0]: 0, unique_vals[1]: 1}
+                                y_encoded = y.map(mapping)
+                            else:
+                                y_encoded = y.astype(str).astype('category').cat.codes
+                    else:
+                        y_encoded = y.astype(str).astype('category').cat.codes
                 else:
+                    # Regression - already converted to numeric above
                     y_encoded = y
                 
-                global_mean = float(y_encoded.mean())
+                global_mean = safe_mean_calculation(y_encoded)
                 oof = pd.Series(index=df.index, dtype=float)
                 
                 try:
@@ -442,7 +526,12 @@ implementation:
                     splits = list(kf.split(df))
                 
                 for train_idx, val_idx in splits:
-                    train_means = y_encoded.iloc[train_idx].groupby(X_col.iloc[train_idx]).mean()
+                    # Safely calculate train means
+                    train_data = pd.DataFrame({
+                        'X': X_col.iloc[train_idx],
+                        'y': y_encoded.iloc[train_idx]
+                    })
+                    train_means = train_data.groupby('X')['y'].apply(safe_mean_calculation).to_dict()
                     oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: train_means.get(v, global_mean))
                 
                 # Apply smoothing
@@ -450,7 +539,7 @@ implementation:
                 smooth_map = {}
                 for cat, cnt in counts.items():
                     if cnt > 0:
-                        cat_mean = float(y_encoded[X_col == cat].mean())
+                        cat_mean = safe_mean_calculation(y_encoded[X_col == cat])
                         alpha = cnt / (cnt + smoothing)
                         smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
                     else:
@@ -463,7 +552,6 @@ implementation:
                         'global_mean': global_mean
                     }
                 }
-
         def add_polynomial_features(df, numeric_cols, degree=2, max_features=20):
             if len(numeric_cols) < 2:
                 return df
