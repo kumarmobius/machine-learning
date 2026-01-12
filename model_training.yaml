@@ -1,4 +1,4 @@
-name: Supervised Training v1.0
+name: Supervised Training v1.1
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
@@ -65,8 +65,29 @@ implementation:
             return str(s).strip().lower() in ("1","true","t","yes","y")
         
         def load_parquet_df(path):
-            logger.info(f"Loading parquet file: {path}")
-            return pd.read_parquet(path)
+            try:
+                print(f"[INFO] Trying to read as Parquet: {path}")
+                return pd.read_parquet(path)
+            except Exception as e_parquet:
+                print(f"[WARN] Parquet read failed: {e_parquet}")
+        
+            try:
+                print(f"[INFO] Trying to read as CSV: {path}")
+                return pd.read_csv(path)
+            except Exception as e_csv:
+                print(f"[WARN] CSV read failed: {e_csv}")
+        
+            try:
+                print(f"[INFO] Trying to read as Excel: {path}")
+                return pd.read_excel(path)
+            except Exception as e_excel:
+                print(f"[WARN] Excel read failed: {e_excel}")
+        
+            raise ValueError(
+                f"Failed to read dataset '{path}'. "
+                f"Tried Parquet, CSV, and Excel formats."
+            )
+
         
         def try_load_metadata(path):
             if not path or not os.path.exists(path):
