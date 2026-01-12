@@ -1,4 +1,4 @@
-name: Supervised Training
+name: Supervised Training v1
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
@@ -508,7 +508,7 @@ implementation:
                     "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "model": model_name,
                     "balancing_enabled": bool_from_str(args.enable_balancing),
-                    "balancing_method": args.balancing_technique,
+                    "balancing_technique": args.balancing_technique,
                     "label_info": map_info,
                     "training_time_seconds": fit_time
                 })
@@ -739,7 +739,7 @@ implementation:
       - --enable_balancing
       - {inputValue: enable_balancing}
       - --balancing_method
-      - {inputValue: balancing_method}
+      - {inputValue: balancing_technique}
       - --target_column
       - {inputValue: target_column}
       - --preprocess_metadata
