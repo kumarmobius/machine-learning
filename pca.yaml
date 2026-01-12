@@ -7,7 +7,7 @@ inputs:
   - {name: component_selection_method, type: String, description: "Method for automatic component selection: 'kaiser' (λ≥1), 'lambda' (custom eigenvalue threshold), 'variance' (cumulative variance threshold)", optional: true, default: "kaiser"}
   - {name: selection_threshold, type: Float, description: "Threshold for component selection: 1.0 for Kaiser, eigenvalue for lambda, 0-1 for variance", optional: true, default: "1.0"}
   - {name: kernel, type: String, description: "Kernel for Kernel PCA: 'rbf', 'poly', 'linear', 'sigmoid', 'cosine'", optional: true, default: "rbf"}
-  - {name: random_state, type: String, description: "Random seed for reproducibility", optional: true, default: "42"}
+  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "42"}
 outputs:
   - {name: transformed_X, type: Dataset, description: "PCA-transformed dataset with principal components (parquet)"}
   - {name: pca_model, type: Data, description: "Trained PCA model (cloudpickle)"}
@@ -275,7 +275,7 @@ implementation:
         parser.add_argument("--component_selection_method", type=str, default="kaiser")
         parser.add_argument("--selection_threshold", type=float, default=1.0)
         parser.add_argument("--kernel", type=str, default="rbf")
-        parser.add_argument("--random_state", type=str, default="42")
+        parser.add_argument("--random_state", type=int, default="42")
         parser.add_argument("--transformed_X", type=str, required=True)
         parser.add_argument("--pca_model", type=str, required=True)
         parser.add_argument("--pca_metadata", type=str, required=True)
@@ -287,7 +287,7 @@ implementation:
             print("=" * 80)
             
             enable_pca = str(args.enable_pca).lower() in ("true", "1", "yes", "y")
-            random_state = int(args.random_state)
+            random_state = args.random_state
             
             if not enable_pca:
                 # Passthrough mode
