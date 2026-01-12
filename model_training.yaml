@@ -1,9 +1,10 @@
-name: Supervised Training V1
+name: Supervised Training V2
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
-  - {name: enbalance, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
+  - {name: enable_balancing, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
+  - {name: balancing_method, type: String, description: "class_weight, sample_weight, or none (classification only)", optional: true, default: "class_weight"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
   - {name: model_name, type: String, description: "Model to train: knn | decisiontree | extratrees | svc | linearsvc | nusvc | svr | linearsvr", optional: true, default: "decisiontree"}
@@ -91,7 +92,8 @@ implementation:
         ap.add_argument('--X_data', type=str, required=True)
         ap.add_argument('--y_data', type=str, required=True)
         ap.add_argument('--model_type', type=str, default="classification")
-        ap.add_argument('--enbalance', type=str, default="true")
+        ap.add_argument('--enable_balancing', type=str, default="true")
+        ap.add_argument('--balancing_method', type=str, default="class_weight")
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
         ap.add_argument('--model_name', type=str, default="decisiontree")
@@ -120,6 +122,7 @@ implementation:
             logger.info("="*80)
             logger.info("PRODUCTION MODEL TRAINING STARTED")
             logger.info(f"Model: {args.model_name}, Type: {args.model_type}")
+            logger.info(f"Enable balancing: {args.enable_balancing}, Method: {args.balancing_method}")
             logger.info("="*80)
             
             # Load data
@@ -204,7 +207,8 @@ implementation:
                 },
                 "training_parameters": {
                     "model_type": args.model_type,
-                    "enbalance": args.enbalance,
+                    "enable_balancing": args.enable_balancing,
+                    "balancing_method": args.balancing_method,
                     "target_column": args.target_column,
                     "model_name": args.model_name,
                     "n_neighbors": args.n_neighbors,
@@ -274,15 +278,33 @@ implementation:
                     y_prepared = y_prepared[valid_mask].reset_index(drop=True)
                     logger.warning(f"Dropped {dropped} invalid rows")
                 
-                # Sample weights for imbalance
+                # Initialize balancing parameters
+                use_class_weight = False
                 sample_weight = None
-                if bool_from_str(args.enbalance):
-                    logger.info("Computing sample weights for class imbalance handling")
-                    try:
-                        sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
-                        model_config["training_parameters"]["class_weight"] = "balanced"
-                    except Exception as e:
-                        logger.warning(f"Could not compute sample weights: {e}")
+                
+                # Apply balancing only if enabled and for classification
+                if bool_from_str(args.enable_balancing) and task == "classification":
+                    balancing_method = args.balancing_method.strip().lower()
+                    
+                    if balancing_method == "class_weight":
+                        logger.info("Using class_weight='balanced' for imbalance handling")
+                        use_class_weight = True
+                        model_config["training_parameters"]["class_weight_used"] = "balanced"
+                        
+                    elif balancing_method == "sample_weight":
+                        logger.info("Computing sample weights for imbalance handling")
+                        try:
+                            sample_weight = compute_sample_weight(class_weight='balanced', y=y_prepared)
+                            model_config["training_parameters"]["sample_weight_used"] = True
+                            logger.info(f"Sample weights computed: shape {sample_weight.shape}")
+                        except Exception as e:
+                            logger.warning(f"Could not compute sample weights: {e}")
+                            sample_weight = None
+                    
+                    elif balancing_method == "none":
+                        logger.info("Balancing disabled as per configuration")
+                    else:
+                        logger.warning(f"Unknown balancing_method: {balancing_method}, defaulting to 'none'")
                 
                 # Model selection and configuration
                 if model_name == "knn":
@@ -305,17 +327,20 @@ implementation:
                     max_depth = None if args.dt_max_depth.strip().lower() in ("", "none", "null") else int(args.dt_max_depth)
                     early_stopping = bool_from_str(args.early_stopping)
                     logger.info(f"Training DecisionTreeClassifier (max_depth={max_depth}, early_stopping={early_stopping})")
-                    class_weight = 'balanced' if bool_from_str(args.enbalance) else None
+                    
+                    # Apply class_weight if requested and method is class_weight
+                    class_weight_param = 'balanced' if (use_class_weight and balancing_method == "class_weight") else None
+                    
                     clf = DecisionTreeClassifier(
                         max_depth=max_depth,
                         min_samples_leaf=int(args.min_samples_leaf),
-                        class_weight=class_weight,
+                        class_weight=class_weight_param,
                         random_state=args.random_state
                     )
                     model_config["hyperparameters"] = {
                         "max_depth": max_depth,
                         "min_samples_leaf": int(args.min_samples_leaf),
-                        "class_weight": class_weight,
+                        "class_weight": class_weight_param,
                         "criterion": "gini",
                         "splitter": "best",
                         "min_samples_split": 2,
@@ -327,20 +352,23 @@ implementation:
                 
                 elif model_name == "extratrees":
                     logger.info(f"Training ExtraTreesClassifier (n_estimators={args.n_estimators})")
-                    class_weight = 'balanced' if bool_from_str(args.enbalance) else None
+                    
+                    # Apply class_weight if requested and method is class_weight
+                    class_weight_param = 'balanced' if (use_class_weight and balancing_method == "class_weight") else None
+                    
                     clf = ExtraTreesClassifier(
                         n_estimators=int(args.n_estimators),
                         min_samples_leaf=int(args.min_samples_leaf),
                         n_jobs=int(args.n_jobs),
                         random_state=args.random_state,
-                        class_weight=class_weight,
+                        class_weight=class_weight_param,
                         bootstrap=True
                     )
                     model_config["hyperparameters"] = {
                         "n_estimators": int(args.n_estimators),
                         "min_samples_leaf": int(args.min_samples_leaf),
                         "n_jobs": int(args.n_jobs),
-                        "class_weight": class_weight,
+                        "class_weight": class_weight_param,
                         "criterion": "gini",
                         "max_depth": None,
                         "min_samples_split": 2,
@@ -357,7 +385,9 @@ implementation:
                     C = float(args.svm_C)
                     gamma = args.svm_gamma
                     nu = float(args.svm_nu)
-                    class_weight = 'balanced' if bool_from_str(args.enbalance) else None
+                    
+                    # Apply class_weight if requested and method is class_weight
+                    class_weight_param = 'balanced' if (use_class_weight and balancing_method == "class_weight") else None
                     
                     logger.info(f"Training SVM classifier ({model_name}) with kernel={kernel}, C={C}, gamma={gamma}")
                     
@@ -368,7 +398,7 @@ implementation:
                             C=C,
                             gamma=gamma_val,
                             probability=svm_prob,
-                            class_weight=class_weight,
+                            class_weight=class_weight_param,
                             random_state=args.random_state,
                             max_iter=args.max_iter_svm
                         )
@@ -380,14 +410,14 @@ implementation:
                             C=C,
                             gamma=gamma_val,
                             probability=svm_prob,
-                            class_weight=class_weight,
+                            class_weight=class_weight_param,
                             random_state=args.random_state,
                             max_iter=args.max_iter_svm
                         )
                     else:  # linearsvc
                         clf = LinearSVC(
                             C=C,
-                            class_weight=class_weight,
+                            class_weight=class_weight_param,
                             random_state=args.random_state,
                             max_iter=args.max_iter_svm,
                             dual='auto'
@@ -400,7 +430,7 @@ implementation:
                         "gamma": gamma,
                         "nu": nu if model_name == "nusvc" else None,
                         "probability": svm_prob,
-                        "class_weight": class_weight,
+                        "class_weight": class_weight_param,
                         "max_iter": args.max_iter_svm,
                         "decision_function_shape": "ovr",
                         "shrinking": True,
@@ -433,10 +463,11 @@ implementation:
                     logger.info("Fitting model to training data")
                     fit_start = time.time()
                     
-                    # Try to pass sample_weight; many sklearn estimators accept it
-                    try:
+                    # Pass sample_weight to fit() if sample_weight method is selected
+                    if sample_weight is not None and balancing_method == "sample_weight":
+                        logger.info("Using sample_weight in model.fit()")
                         clf.fit(X, y_prepared, sample_weight=sample_weight)
-                    except TypeError:
+                    else:
                         clf.fit(X, y_prepared)
                     
                     fit_time = time.time() - fit_start
@@ -476,7 +507,8 @@ implementation:
                     "recall_train": float(recall_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "model": model_name,
-                    "balanced": bool_from_str(args.enbalance),
+                    "balancing_enabled": bool_from_str(args.enable_balancing),
+                    "balancing_method": args.balancing_method,
                     "label_info": map_info,
                     "training_time_seconds": fit_time
                 })
@@ -704,8 +736,10 @@ implementation:
       - {inputPath: y_data}
       - --model_type
       - {inputValue: model_type}
-      - --enbalance
-      - {inputValue: enbalance}
+      - --enable_balancing
+      - {inputValue: enable_balancing}
+      - --balancing_method
+      - {inputValue: balancing_method}
       - --target_column
       - {inputValue: target_column}
       - --preprocess_metadata
