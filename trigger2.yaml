@@ -1,4 +1,4 @@
-name: SVM and KNN Trigger v2
+name: SVM and KNN Trigger v3
 inputs:
   - {name: bearer_token, type: string, description: "Path to file containing bearer token"}
   - {name: domain, type: String, description: "Base domain, e.g. https://ig.gov-cloud.ai"}
@@ -32,6 +32,8 @@ inputs:
   - {name: cv_folds, type: Integer, description: "Number of folds for cross-validation", optional: true, default: "5"}
   - {name: max_iter_svm, type: Integer, description: "Maximum iterations for SVM convergence", optional: true, default: "10000"}
   - {name: early_stopping, type: String, description: "Enable early stopping for tree models (true/false)", optional: true, default: "false"}
+  - {name: enable_balancing, type: String, description: "Enable class balancing (true/false)", optional: true, default: "false"}
+  - {name: balancing_technique, type: String, description: "Balancing technique to use (smote|adasyn|random_oversample|random_undersample)", optional: true, default: "smote"}
 
 outputs:
   - {name: trigger_response, type: String, description: "Raw response from pipeline trigger API"}
@@ -84,6 +86,8 @@ implementation:
         parser.add_argument('--cv_folds', type=int, default=5)
         parser.add_argument('--max_iter_svm', type=int, default=10000)
         parser.add_argument('--early_stopping', default="false")
+        parser.add_argument('--enable_balancing', default="false")
+        parser.add_argument('--balancing_technique', default="smote")
         parser.add_argument('--trigger_response', required=True)
         args = parser.parse_args()
 
@@ -159,6 +163,12 @@ implementation:
             parameters["max_iter_svm"] = args.max_iter_svm
         if args.early_stopping:
             parameters["early_stopping"] = args.early_stopping
+        
+        # Add balancing parameters
+        if args.enable_balancing:
+            parameters["enable_balancing"] = args.enable_balancing
+        if args.balancing_technique:
+            parameters["balancing_technique"] = args.balancing_technique
 
         # Build payload - exactly matching the working curl structure
         payload = {
@@ -304,5 +314,9 @@ implementation:
       - {inputValue: max_iter_svm}
       - --early_stopping
       - {inputValue: early_stopping}
+      - --enable_balancing
+      - {inputValue: enable_balancing}
+      - --balancing_technique
+      - {inputValue: balancing_technique}
       - --trigger_response
       - {outputPath: trigger_response}
