@@ -1,4 +1,4 @@
-name: Supervised Training v1
+name: Supervised Training v1.0
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
@@ -738,7 +738,7 @@ implementation:
       - {inputValue: model_type}
       - --enable_balancing
       - {inputValue: enable_balancing}
-      - --balancing_method
+      - --balancing_technique
       - {inputValue: balancing_technique}
       - --target_column
       - {inputValue: target_column}
