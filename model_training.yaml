@@ -1,10 +1,10 @@
-name: Supervised Training V2
+name: Supervised Training
 inputs:
   - {name: X_data, type: Dataset, description: "Parquet file for features (DataFrame)"}
   - {name: y_data, type: Dataset, description: "Parquet file for target (Series or single-column DataFrame) - already encoded"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: enable_balancing, type: String, description: "true/false for class imbalance handling (classification only)", optional: true, default: "true"}
-  - {name: balancing_method, type: String, description: "class_weight, sample_weight, or none (classification only)", optional: true, default: "class_weight"}
+  - {name: balancing_technique, type: String, description: "class_weight, sample_weight, or none (classification only)", optional: true, default: "class_weight"}
   - {name: target_column, type: String, description: "Optional. Column name inside y parquet if it has multiple columns", optional: true, default: ""}
   - {name: preprocess_metadata, type: Data, description: "Optional metadata from preprocessing (for reference)", optional: true}
   - {name: model_name, type: String, description: "Model to train: knn | decisiontree | extratrees | svc | linearsvc | nusvc | svr | linearsvr", optional: true, default: "decisiontree"}
@@ -93,7 +93,7 @@ implementation:
         ap.add_argument('--y_data', type=str, required=True)
         ap.add_argument('--model_type', type=str, default="classification")
         ap.add_argument('--enable_balancing', type=str, default="true")
-        ap.add_argument('--balancing_method', type=str, default="class_weight")
+        ap.add_argument('--balancing_technique', type=str, default="class_weight")
         ap.add_argument('--target_column', type=str, default="")
         ap.add_argument('--preprocess_metadata', type=str, default="")
         ap.add_argument('--model_name', type=str, default="decisiontree")
@@ -122,7 +122,7 @@ implementation:
             logger.info("="*80)
             logger.info("PRODUCTION MODEL TRAINING STARTED")
             logger.info(f"Model: {args.model_name}, Type: {args.model_type}")
-            logger.info(f"Enable balancing: {args.enable_balancing}, Method: {args.balancing_method}")
+            logger.info(f"Enable balancing: {args.enable_balancing}, Method: {args.balancing_technique}")
             logger.info("="*80)
             
             # Load data
@@ -208,7 +208,7 @@ implementation:
                 "training_parameters": {
                     "model_type": args.model_type,
                     "enable_balancing": args.enable_balancing,
-                    "balancing_method": args.balancing_method,
+                    "balancing_technique": args.balancing_technique,
                     "target_column": args.target_column,
                     "model_name": args.model_name,
                     "n_neighbors": args.n_neighbors,
@@ -284,7 +284,7 @@ implementation:
                 
                 # Apply balancing only if enabled and for classification
                 if bool_from_str(args.enable_balancing) and task == "classification":
-                    balancing_method = args.balancing_method.strip().lower()
+                    balancing_method = args.balancing_technique.strip().lower()
                     
                     if balancing_method == "class_weight":
                         logger.info("Using class_weight='balanced' for imbalance handling")
@@ -508,7 +508,7 @@ implementation:
                     "f1_train": float(f1_score(y_prepared, y_pred, average='weighted', zero_division=0)),
                     "model": model_name,
                     "balancing_enabled": bool_from_str(args.enable_balancing),
-                    "balancing_method": args.balancing_method,
+                    "balancing_method": args.balancing_technique,
                     "label_info": map_info,
                     "training_time_seconds": fit_time
                 })
