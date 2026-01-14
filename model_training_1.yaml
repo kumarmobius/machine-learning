@@ -1,4 +1,4 @@
-name: Stacking and Voting V10.3
+name: Stacking and Voting V10.4
 inputs:
   - {name: X_data, type: Dataset}
   - {name: y_data, type: Dataset}
@@ -864,12 +864,12 @@ implementation:
                             try:
                                 if task == "classification":
                                     try:
-                                        vote = VotingClassifier(estimators=safe_estimators, voting="hard", n_jobs=-1)
+                                        vote = VotingClassifier(estimators=safe_estimators, voting="soft", n_jobs=-1)
                                         with warnings.catch_warnings():
                                             warnings.simplefilter("ignore")
                                             vote.fit(X, y_series)
                                     except Exception:
-                                        vote = VotingClassifier(estimators=safe_estimators, voting="hard", n_jobs=-1)
+                                        vote = VotingClassifier(estimators=safe_estimators, voting="soft", n_jobs=-1)
                                         with warnings.catch_warnings():
                                             warnings.simplefilter("ignore")
                                             vote.fit(X, y_series)
