@@ -1,4 +1,4 @@
-name: Data Balancing v2.1
+name: Data Balancing v3
 inputs:
   - {name: engineered_X, type: Dataset, description: "Engineered features from Feature Engineering brick (parquet format). All categorical features should already be encoded."}
   - {name: train_y, type: Dataset, description: "Target labels for classification (parquet format)"}
@@ -138,6 +138,17 @@ implementation:
                 else:
                     sampling_strategy = target_ratio  # Can be float or dict
             
+            # Initialize balancer_info dictionary with serializable data
+            balancer_info = {
+                'technique': technique,
+                'parameters': {
+                    'target_ratio': target_ratio,
+                    'random_state': random_state,
+                    'k_neighbors': k_neighbors,
+                    'minority_class': minority_class
+                }
+            }
+            
             # Apply balancing technique
             if technique == 'smote':
                 balancer = SMOTE(
@@ -146,6 +157,7 @@ implementation:
                     k_neighbors=min(k_neighbors, class_counts.get(minority_class_val, 5) - 1)
                 )
                 X_bal, y_bal = balancer.fit_resample(X, y)
+                balancer_info['sampling_strategy'] = str(sampling_strategy)
                 
             elif technique == 'adasyn':
                 balancer = ADASYN(
@@ -154,6 +166,7 @@ implementation:
                     n_neighbors=min(k_neighbors, class_counts.get(minority_class_val, 5) - 1)
                 )
                 X_bal, y_bal = balancer.fit_resample(X, y)
+                balancer_info['sampling_strategy'] = str(sampling_strategy)
                 
             elif technique == 'random_oversample':
                 from imblearn.over_sampling import RandomOverSampler
@@ -162,6 +175,7 @@ implementation:
                     random_state=random_state
                 )
                 X_bal, y_bal = balancer.fit_resample(X, y)
+                balancer_info['sampling_strategy'] = str(sampling_strategy)
                 
             elif technique == 'random_undersample':
                 balancer = RandomUnderSampler(
@@ -169,6 +183,7 @@ implementation:
                     random_state=random_state
                 )
                 X_bal, y_bal = balancer.fit_resample(X, y)
+                balancer_info['sampling_strategy'] = str(sampling_strategy)
                 
             elif technique == 'smote_tomek':
                 balancer = SMOTETomek(
@@ -177,6 +192,7 @@ implementation:
                     smote=SMOTE(k_neighbors=min(k_neighbors, class_counts.get(minority_class_val, 5) - 1))
                 )
                 X_bal, y_bal = balancer.fit_resample(X, y)
+                balancer_info['sampling_strategy'] = str(sampling_strategy)
                 
             elif technique == 'class_weight':
                 # Calculate class weights
@@ -186,20 +202,19 @@ implementation:
                     classes=classes,
                     y=y
                 )
-                class_weights = dict(zip(classes, weights))
+                class_weights = {str(cls): float(w) for cls, w in zip(classes, weights)}
                 X_bal, y_bal = X.copy(), y.copy()
-                balancer = {'technique': 'class_weight', 'weights': class_weights}
-                return X_bal, y_bal, balancer
+                balancer_info['weights'] = class_weights
+                return X_bal, y_bal, balancer_info
                 
             elif technique == 'none':
                 X_bal, y_bal = X.copy(), y.copy()
-                balancer = {'technique': 'none'}
-                return X_bal, y_bal, balancer
+                return X_bal, y_bal, balancer_info
                 
             else:
                 raise ValueError(f"Unknown balancing technique: {technique}")
             
-            return X_bal, y_bal, balancer
+            return X_bal, y_bal, balancer_info
         
         def main():
             parser = argparse.ArgumentParser()
