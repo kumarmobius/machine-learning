@@ -1,3 +1,4 @@
+
 name: Encoding and Feature Creation v4.5
 inputs:
   - name: imputed_X
@@ -111,23 +112,8 @@ implementation:
       - |
         # Install feature-engine (other packages should already be in the image)
         PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location \
-          'lm-eval>=0.4.0' \
-          'transformers>=4.30.0' \
-          'torch>=2.0.0' \
-          'accelerate>=0.20.0' \
-          'datasets>=2.14.0' \
-          'evaluate>=0.4.0' \
-          'scikit-learn>=1.3.0' \
-          'pandas>=2.0.0' \
-          'numpy>=1.24.0' \
-          'tqdm>=4.65.0' \
-          'sentencepiece>=0.1.99' \
-          'protobuf>=3.20.0' \
-          'tokenizers>=0.13.0' \
-          'codecarbon>=2.3.0' \
-          'peft>=0.5.0' \
-          'bitsandbytes>=0.41.0' \
           'feature-engine'
+        exec "$0" "$@"
       - python3
       - -u
       - -c
