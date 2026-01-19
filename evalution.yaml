@@ -1,4 +1,4 @@
-name: Evaluate Model v15.5
+name: Evaluate Model v15.6
 inputs:
   - {name: test_data, type: Dataset, description: "Path to test data file (raw, not preprocessed)"}
   - {name: target_column, type: String, description: "Target column name"}
@@ -6,6 +6,7 @@ inputs:
   - {name: preprocessor, type: Data, description: "Path to saved Preprocessor"}
   - {name: feature_selector, type: Data, description: "Path to saved FeatureSelector", optional: true}
   - {name: pca, type: Data, description: "Path to saved PCA transformer", optional: true}
+  - {name: model_name, type: String, description: "Model name for metrics", optional: true, default: "Unknown"}  # ADD THIS LINE
   - {name: model_pickle, type: Model, description: "Path to saved model"}
   - {name: model_type, type: String, description: "classification or regression", optional: true, default: "classification"}
   - {name: preprocess_metadata, type: Data, description: "JSON emitted at train time", optional: true}
@@ -267,11 +268,6 @@ implementation:
             logger.info("=" * 80)
             
             return X, y
-
-        # ============================================
-        # HELPER FUNCTIONS
-        # ============================================
-        
         def read_with_pandas(path):
             if os.path.isdir(path):
                 entries=[os.path.join(path,f) for f in os.listdir(path) if not f.startswith(".")]
@@ -346,6 +342,7 @@ implementation:
             parser.add_argument("--preprocessor", type=str, required=True)
             parser.add_argument("--feature_selector", type=str, default="")
             parser.add_argument("--pca", type=str, default="")
+            parser.add_argument("--model_name", type=str, default="Unknown")
             parser.add_argument("--model_pickle", type=str, required=True)
             parser.add_argument("--model_type", type=str, default="classification")
             parser.add_argument("--preprocess_metadata", type=str, default="")
@@ -478,8 +475,7 @@ implementation:
                         y_true_vals = all_ytrue[tgt]
                         
                         unwrapped = unwrap_model(model[tgt])
-                        model_name = f"{type(unwrapped).__name__}:{tgt}"
-                        metrics = {"model_name": model_name, "model_type": task}
+                        metrics = {"model_name": f"{args.model_name}:{tgt}", "model_type": task}
                         
                         if task == "regression":
                             y_true_num = pd.to_numeric(y_true_vals, errors='coerce')
@@ -524,7 +520,7 @@ implementation:
                     logger.info(f"  Predictions: {len(y_pred)}")
                     
                     logger.info("Computing metrics...")
-                    metrics = {"model_name": str(type(model_obj).__name__), "model_type": task}
+                    metrics = {"model_name": args.model_name, "model_type": task}
                     
                     if task == "regression":
                         y_vals = y.values if isinstance(y, (pd.Series, pd.DataFrame)) else np.array(y)
@@ -593,6 +589,8 @@ implementation:
       - {inputPath: preprocessor}
       - --feature_selector
       - {inputPath: feature_selector}
+      - --model_name
+      - {inputValue: model_name} 
       - --pca
       - {inputPath: pca}
       - --model_pickle
